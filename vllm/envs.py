@@ -309,7 +309,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
-    VLLM_DETERMINISTIC_MOE_ALIGN: bool = True
+    VLLM_DETERMINISTIC_MOE_ALIGN: bool = False
     VLLM_DISABLE_MULTI_STREAM_PARALLEL: bool = False
     VLLM_MHC_POST_FUSE_SQRSUM: bool = False
     VLLM_MHC_PRENORM_SHARD: bool = False
@@ -2211,15 +2211,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION", "0"))
     ),
     # Deterministic moe_align_block_size (stable sort instead of FCFS atomics).
-    # The Marlin MoE GEMM is permutation-sensitive at the ulp level, so the
-    # atomic ordering makes temp=0 outputs non-reproducible (#50576). Set to 0
-    # to restore the historical CUDA kernel path. Cost note from the sm80
-    # branch (8xA100 TP8): the stable sort adds ~15 ms cold TTFT@8K and
-    # ~0.6 ms/token ITL there; we keep it ON because batch>1 corruption
-    # (#50576) traces back to batch-composition-dependent numerics and this
-    # is one of the pinned sources. Set 0 to trade determinism for latency.
+    # The CUDA kernel orders tokens within an expert by atomic claim order, so
+    # the Marlin MoE GEMM's row partition, and hence ulp-level rounding, can
+    # vary run to run at temp=0. The replacement launches ~57 kernels per MoE
+    # layer instead of 1 (~75 us/layer under CUDA graphs; ~20% of DSv4 decode
+    # on A100) and does not make outputs reproducible on its own, since other
+    # batch- and schedule-dependent kernels remain. Set 1 to opt in.
     "VLLM_DETERMINISTIC_MOE_ALIGN": lambda: bool(
-        int(os.getenv("VLLM_DETERMINISTIC_MOE_ALIGN", "1"))
+        int(os.getenv("VLLM_DETERMINISTIC_MOE_ALIGN", "0"))
     ),
     # Debug kill-switch: force execute_in_parallel/maybe_execute_in_parallel
     # to run serially on the default stream (no aux-stream overlap).
