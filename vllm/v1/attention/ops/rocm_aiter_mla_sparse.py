@@ -3608,6 +3608,11 @@ def _decode_partial_iters(
     return main_iters + extra_iters
 
 
+# Split-K decode partial kernel warps. 8 on CUDA: A100 TP4 DSv4 single-stream
+# decode measures ~7% more steps/s than 4 (16 is worse). ROCm keeps the tuned 4.
+_DECODE_PARTIAL_NUM_WARPS = 8 if current_platform.is_cuda() else 4
+
+
 def _decode_num_splits(
     num_queries: int,
     heads_blocks: int,
@@ -3867,6 +3872,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
             avg_extra_len,
             block_k,
         )
+    elif envs.VLLM_DSV4_FIXED_DECODE_SPLITS > 0:
+        num_splits = min(envs.VLLM_DSV4_FIXED_DECODE_SPLITS, 16)
     else:
         # Average per-query segment lengths, read sync-free from the ragged
         # index sizes, let the split heuristic avoid over-splitting.
@@ -3978,7 +3985,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             BLOCK_K=block_k,
             NUM_SPLITS=num_splits,
             NUM_STAGES=1,
-            num_warps=4,
+            num_warps=_DECODE_PARTIAL_NUM_WARPS,
         )
 
     _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](

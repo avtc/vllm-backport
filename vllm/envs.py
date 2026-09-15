@@ -318,7 +318,7 @@ if TYPE_CHECKING:
     VLLM_INDEXER_QUERY_SHARD_QPATH: bool = False
     VLLM_SPARSE_PREFILL_EXACT_TILE: bool = False
     VLLM_SPARSE_RAGGED_FAST_SCAN: bool = False
-    VLLM_DSV4_FIXED_DECODE_SPLITS: int = 16
+    VLLM_DSV4_FIXED_DECODE_SPLITS: int = 0
     VLLM_DSV4_LOGITS_ROW_CHUNK: int = 128
     VLLM_MHC_FIXED_NUM_SPLIT: int = 0
     VLLM_TOKEN_BUCKET_PAD: bool = True
@@ -2291,18 +2291,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_FUSED_MARKOV": lambda: (
         os.environ.get("VLLM_DSPARK_FUSED_MARKOV", "1") == "1"
     ),
-    # Fix the DSv4 sparse-decode flash-decode split count to this value instead
-    # of the batch-adaptive heuristic. The heuristic picks splits from the
-    # total query count and batch-average KV lengths, so a request's reduction
-    # order (and hence bf16 rounding) depends on what else is in the batch;
-    # pinning the split count makes decode attention batch-invariant. Default
-    # 16 = index_topk(512) / BLOCK_K(32): every ragged row is bounded by
-    # index_topk, so 16 is the largest split count that still lowers the
-    # per-program iteration count -- best single-stream occupancy at equal
-    # invariance (measured perf-neutral at c8 on A6000 TP4). Set 0 to restore
-    # the adaptive heuristic.
+    # Fix the DSv4 split-K sparse-decode split count (capped at 16) instead of
+    # the batch-adaptive heuristic, which picks splits from the query count and
+    # batch-average KV lengths so a request's reduction order can depend on the
+    # rest of the batch. 0 (default) keeps the heuristic. Not applied on gfx950,
+    # which has its own split tuning.
     "VLLM_DSV4_FIXED_DECODE_SPLITS": lambda: int(
-        os.environ.get("VLLM_DSV4_FIXED_DECODE_SPLITS", "16")
+        os.environ.get("VLLM_DSV4_FIXED_DECODE_SPLITS", "0")
     ),
     # Row-chunk the SM80/SM86 sparse-indexer prefill logits (allover326's
     # long-context fix from #50576): compute the [M, N] fp32 logits transient
