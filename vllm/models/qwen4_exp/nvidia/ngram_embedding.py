@@ -394,6 +394,9 @@ class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
         )
 
 
+_FP8_STORAGE_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
 @triton.jit
 def _lookup_ple_embedding_from_pinned_kernel(
     weight_ptr,
@@ -507,10 +510,19 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            # The lookup is a pure row gather, so fp8 tables move as raw bytes:
+            # Triton cannot even take an fp8e4nv pointer on pre-SM89 (it rejects
+            # the dtype at compile time), and e4m3 is one byte per element, so
+            # the uint8 view keeps the row width and copies bit-exactly.
+            weight = self._uva_weight
+            out_view = output
+            if weight.dtype in _FP8_STORAGE_DTYPES:
+                weight = weight.view(torch.uint8)
+                out_view = out_view.view(torch.uint8)
             _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self._uva_weight,
+                weight,
                 flat_ids,
-                output,
+                out_view,
                 self.embedding_dim,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
