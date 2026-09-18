@@ -153,12 +153,14 @@ vllm serve /path/to/your/qwen3.8 \
   --enable-prompt-tokens-details \
   --enable-prefix-caching \
   --mamba-cache-mode=align \
+  --prefix-match-unit=16
 ```
 
 - `VLLM_PLE_CPU_OFFLOAD=1` keeps the 51B n-gram embedding (fp8, ~51 GiB) in pinned host RAM via a separate `PleOffloadWorker` process. Without it the TP-sharded embedding adds ~12.8 GiB per GPU and KV memory goes negative on 48 GB cards.
 - `--enable-expert-parallel` is required, not optional: with plain TP the 640-wide expert intermediate becomes 160 per rank, which is not a multiple of the 128x128 fp8 block, and vLLM then forces the Triton fp8 MoE kernel (no fp8 tensor cores on sm86). With EP the experts stay whole and the Marlin W8A16 backend is used.
 - LMCache: the unified KV block size is 800, so `--chunk-size` must be a multiple of 800 (use `--chunk-size 800 --separate-object-groups`), and add `--prefix-cache-retention-interval 800 --max-num-batched-tokens 800` to `vllm serve` (same MTP + align-mode rule as GLM-5.3-Flash).
 - AWQ W4A16 ([`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16), compressed-tensors `pack-quantized`, routed experts INT4 g128, everything else BF16): MTP speculative decoding works (the BF16 MTP draft is kept unquantized automatically). Verified on 4x A100-80GB: `VLLM_PLE_CPU_OFFLOAD=1 vllm serve wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --tensor-parallel-size 4 --enable-expert-parallel --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' --speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. This achieves up to 936 tps.
+- `--prefix-match-unit=16` is effectively mandatory. Prefix cache reuses whole blocks only, and this flag sets the block size; the remainder is never reused. It defaults to the mamba block size (800 here), and MTP drops one more block, so nothing under 1600 tokens can ever be reused and the hit rate reads a flat 0.0% no matter how often a prompt repeats. Setting it to 16 drops that floor to 32 tokens. The value must divide 800, so use 16 (or 25/40/50/80/100) -- 64 is rejected at startup. `--enable-mamba-fine-grained-prefix-cache` is optional on top; it only improves the worst-case hit.
 
 #### DeepSeek V4 Flash (Preview, 0731, Vision-Exp)
 
