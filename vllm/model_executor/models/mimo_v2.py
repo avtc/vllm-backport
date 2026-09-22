@@ -87,16 +87,18 @@ def _mimo_debug_norm(tag: str, layer_id: int, t: torch.Tensor) -> None:
         return
     _mimo_norm_debug_calls[layer_id] = calls + 1
     tf = t.detach().float()
-    logger.info(
-        "NORMDBG l%-3d %-9s %-16s mean=%+.4f std=%.4f absmax=%.3f nan=%s",
-        layer_id,
-        tag,
-        str(tuple(t.shape)),
-        tf.mean().item(),
-        tf.std().item(),
-        tf.abs().max().item(),
-        bool(torch.isnan(tf).any().item()),
+    line = (
+        f"l{layer_id:<3d} {tag:<9} shape={tuple(t.shape)} "
+        f"mean={tf.mean().item():+.4f} std={tf.std().item():.4f} "
+        f"absmax={tf.abs().max().item():.3f} "
+        f"nan={bool(torch.isnan(tf).any().item())}\n"
     )
+    logger.info("NORMDBG %s", line)
+    try:
+        with open(f"/tmp/mimo_normdbg_{os.getpid()}.log", "a") as f:
+            f.write(line)
+    except OSError:
+        pass
 
 
 class MiMoV2MLP(nn.Module):
@@ -410,6 +412,7 @@ class MiMoV2Attention(nn.Module):
             v = v.reshape(-1, self.num_kv_heads * self.head_dim)
 
         attn_output = self.attn(q, k, v)
+        _mimo_debug_norm("attnraw", self.layer_id, attn_output)
 
         if self._pad_v:
             attn_output = attn_output.view(-1, self.num_heads, self.head_dim)
