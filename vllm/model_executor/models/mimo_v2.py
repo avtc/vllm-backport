@@ -52,7 +52,6 @@ from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 
 from .interfaces import (
     EagleModelMixin,
@@ -295,57 +294,30 @@ class MiMoV2Attention(nn.Module):
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
 
         # Use DiffKV backend when V has a different head dim than K.
-        # Backends advertise support via is_supported_on_current_device
-        # (FA-DiffKV needs FA3/4; Triton-DiffKV cannot run its sinks +
-        # asymmetric-V path on sm<90). When no DiffKV backend claims support,
-        # fall back to the standard TritonAttentionBackend with V zero-padded
-        # v_head_dim->head_dim before attention and the padded tail sliced off
-        # the output (exact: discarded dims are provably output-independent).
-        # Users can force a choice via
+        # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall
+        # back to TRITON_ATTN_DIFFKV.  Users can force a choice via
         # `--attention-backend <FLASH_ATTN_DIFFKV|TRITON_ATTN_DIFFKV>`.
-        self._pad_v = False
         if self.v_head_dim != self.head_dim:
             requested = get_current_vllm_config().attention_config.backend
             if requested is not None and requested.name.endswith("_DIFFKV"):
-                attn_backend = requested.get_class()
-                attn_backend.set_head_size_v(self.v_head_dim)
-                attn_head_size_v = self.v_head_dim
-                logger.info_once("Using %s for attention.", attn_backend.get_name())
+                backend_enum = requested
             else:
-                supported = None
-                for enum in (
-                    AttentionBackendEnum.FLASH_ATTN_DIFFKV,
-                    AttentionBackendEnum.TRITON_ATTN_DIFFKV,
+                fa_backend = AttentionBackendEnum.FLASH_ATTN_DIFFKV.get_class()
+                assert hasattr(fa_backend, "is_supported_on_current_device")
+                if fa_backend.is_supported_on_current_device(
+                    head_size=self.head_dim,
+                    head_size_v=self.v_head_dim,
+                    has_sinks=self.attention_sink_bias is not None,
                 ):
-                    backend_cls = enum.get_class()
-                    if backend_cls.is_supported_on_current_device(
-                        head_size=self.head_dim,
-                        head_size_v=self.v_head_dim,
-                        has_sinks=self.attention_sink_bias is not None,
-                    ):
-                        supported = backend_cls
-                        break
-                if supported is not None:
-                    attn_backend = supported
-                    attn_backend.set_head_size_v(self.v_head_dim)
-                    attn_head_size_v = self.v_head_dim
-                    logger.info_once(
-                        "Using %s for attention.", attn_backend.get_name()
-                    )
+                    backend_enum = AttentionBackendEnum.FLASH_ATTN_DIFFKV
                 else:
-                    self._pad_v = True
-                    attn_backend = TritonAttentionBackend
-                    attn_head_size_v = self.head_dim
-                    logger.info_once(
-                        "No DiffKV backend supported on this device; using %s "
-                        "with V padded %d->%d.",
-                        attn_backend.get_name(),
-                        self.v_head_dim,
-                        self.head_dim,
-                    )
+                    backend_enum = AttentionBackendEnum.TRITON_ATTN_DIFFKV
+            attn_backend = backend_enum.get_class()
+            assert hasattr(attn_backend, "set_head_size_v")
+            attn_backend.set_head_size_v(self.v_head_dim)
+            logger.info_once("Using %s for attention.", attn_backend.get_name())
         else:
             attn_backend = None
-            attn_head_size_v = self.v_head_dim
 
         self.attn = Attention(
             self.num_heads,
@@ -359,7 +331,7 @@ class MiMoV2Attention(nn.Module):
             prefix=f"{prefix}.attn",
             sinks=self.attention_sink_bias,
             attn_backend=attn_backend,
-            head_size_v=attn_head_size_v,
+            head_size_v=self.v_head_dim,
         )
 
     def forward(
@@ -375,21 +347,7 @@ class MiMoV2Attention(nn.Module):
         if self.v_scale is not None:
             v = v * self.v_scale
 
-        if self._pad_v:
-            # Pad V to head_dim so K/V share a head size for the standard
-            # Triton backend, then slice the zero-padded tail off the output
-            # (exact).
-            v = v.view(-1, self.num_kv_heads, self.v_head_dim)
-            v = nn.functional.pad(v, (0, self.head_dim - self.v_head_dim))
-            v = v.reshape(-1, self.num_kv_heads * self.head_dim)
-
         attn_output = self.attn(q, k, v)
-
-        if self._pad_v:
-            attn_output = attn_output.view(-1, self.num_heads, self.head_dim)
-            attn_output = attn_output[..., : self.v_head_dim].reshape(
-                -1, self.num_heads * self.v_head_dim
-            )
 
         output, _ = self.o_proj(attn_output)
         return output
