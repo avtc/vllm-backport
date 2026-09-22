@@ -27,6 +27,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
     ModelOptQuantConfigBase,
@@ -190,6 +191,21 @@ def _compressed_tensors_quantizes_ple(
     )
 
 
+def _inc_quantizes_ple(quant_config: INCConfig, prefix: str) -> bool:
+    """Whether an INC/auto-round config leaves the PLE table quantized.
+
+    auto-round declares one global scheme plus per-layer overrides in
+    ``extra_config``, keyed by exact name or regex. Checkpoints that keep the
+    table readable list it there at 16 bits; ask the parser rather than
+    assuming either way.
+    """
+    table = nn.Embedding(1, 1)
+    return any(
+        quant_config.config_parser.resolve(table, name).quantized
+        for name in (prefix, f"{prefix}.shard_0")
+    )
+
+
 class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
     """Quantization interface shared by resident and pinned PLE tables."""
 
@@ -221,6 +237,14 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
                     "Qwen4Exp PLE embedding does not support compressed-tensors "
                     f"quantization of {prefix}; leave it unquantized (add it "
                     "to `ignore`)."
+                )
+            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        if isinstance(quant_config, INCConfig):
+            if _inc_quantizes_ple(quant_config, prefix):
+                raise NotImplementedError(
+                    "Qwen4Exp PLE embedding does not support INC/auto-round "
+                    f"quantization of {prefix}; keep the table at 16 bits with "
+                    'an `".*ple.*": {"bits": 16}` entry in `extra_config`.'
                 )
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if not isinstance(quant_config, Fp8Config):
