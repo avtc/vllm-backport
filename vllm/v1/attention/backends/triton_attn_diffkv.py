@@ -88,10 +88,11 @@ class TritonAttentionDiffKVBackend(TritonAttentionBackend):
         head_size_v: int,
         has_sinks: bool = False,
     ) -> bool:
-        # The sinks + asymmetric-V path computes incorrectly on sm<90
-        # (validated on A100/3090 with MiMo-V2.5/V2.6: garbled output). Callers
-        # fall back to a padded-head-size standard backend instead.
-        if has_sinks and head_size_v != head_size:
+        # The asymmetric-V path computes incorrectly on sm<90 (validated on
+        # A100/3090 with MiMo-V2.5/V2.6: garbled output, with or without SWA
+        # sinks). Callers fall back to a padded-head-size standard backend
+        # instead.
+        if head_size_v != head_size:
             cap = current_platform.get_device_capability()
             if cap is not None and cap.major < 9:
                 return False
