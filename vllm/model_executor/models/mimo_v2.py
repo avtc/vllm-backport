@@ -21,7 +21,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -296,17 +295,15 @@ class MiMoV2Attention(nn.Module):
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
 
         # Use DiffKV backend when V has a different head dim than K.
-        # sm<90 patch (validated on Ampere with MiMo-V2.5): FA3/4 DiffKV is
-        # Hopper-only, and the TRITON_ATTN_DIFFKV backend computes the
-        # asymmetric-V + SWA-sinks path incorrectly on Ampere, garbling the
-        # output. Route sm<90 through the standard TritonAttentionBackend with
-        # V zero-padded v_head_dim->head_dim before attention and the padded
-        # tail sliced off the output (exact: discarded dims are provably
-        # output-independent). Hopper+ keeps the native FA-DiffKV path; an
-        # explicit `--attention-backend *_DIFFKV` is still honored.
+        # Backends advertise support via is_supported_on_current_device
+        # (FA-DiffKV needs FA3/4; Triton-DiffKV cannot run its sinks +
+        # asymmetric-V path on sm<90). When no DiffKV backend claims support,
+        # fall back to the standard TritonAttentionBackend with V zero-padded
+        # v_head_dim->head_dim before attention and the padded tail sliced off
+        # the output (exact: discarded dims are provably output-independent).
+        # Users can force a choice via
+        # `--attention-backend <FLASH_ATTN_DIFFKV|TRITON_ATTN_DIFFKV>`.
         self._pad_v = False
-        _cap = current_platform.get_device_capability()
-        _is_hopper_plus = _cap is not None and _cap.major >= 9
         if self.v_head_dim != self.head_dim:
             requested = get_current_vllm_config().attention_config.backend
             if requested is not None and requested.name.endswith("_DIFFKV"):
@@ -315,21 +312,21 @@ class MiMoV2Attention(nn.Module):
                 attn_head_size_v = self.v_head_dim
                 logger.info_once("Using %s for attention.", attn_backend.get_name())
             else:
-                fa_backend = AttentionBackendEnum.FLASH_ATTN_DIFFKV.get_class()
-                assert hasattr(fa_backend, "is_supported_on_current_device")
-                if _is_hopper_plus and fa_backend.is_supported_on_current_device(
-                    head_size=self.head_dim,
-                    head_size_v=self.v_head_dim,
-                    has_sinks=self.attention_sink_bias is not None,
+                supported = None
+                for enum in (
+                    AttentionBackendEnum.FLASH_ATTN_DIFFKV,
+                    AttentionBackendEnum.TRITON_ATTN_DIFFKV,
                 ):
-                    attn_backend = fa_backend
-                    attn_backend.set_head_size_v(self.v_head_dim)
-                    attn_head_size_v = self.v_head_dim
-                    logger.info_once(
-                        "Using %s for attention.", attn_backend.get_name()
-                    )
-                elif _is_hopper_plus:
-                    attn_backend = AttentionBackendEnum.TRITON_ATTN_DIFFKV.get_class()
+                    backend_cls = enum.get_class()
+                    if backend_cls.is_supported_on_current_device(
+                        head_size=self.head_dim,
+                        head_size_v=self.v_head_dim,
+                        has_sinks=self.attention_sink_bias is not None,
+                    ):
+                        supported = backend_cls
+                        break
+                if supported is not None:
+                    attn_backend = supported
                     attn_backend.set_head_size_v(self.v_head_dim)
                     attn_head_size_v = self.v_head_dim
                     logger.info_once(
@@ -340,8 +337,9 @@ class MiMoV2Attention(nn.Module):
                     attn_backend = TritonAttentionBackend
                     attn_head_size_v = self.head_dim
                     logger.info_once(
-                        "sm<90: routing asymmetric-V attention through "
-                        "TritonAttentionBackend with V padded %d->%d.",
+                        "No DiffKV backend supported on this device; using %s "
+                        "with V padded %d->%d.",
+                        attn_backend.get_name(),
                         self.v_head_dim,
                         self.head_dim,
                     )

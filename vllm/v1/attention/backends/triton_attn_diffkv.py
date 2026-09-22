@@ -14,6 +14,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
@@ -79,6 +80,22 @@ class TritonAttentionDiffKVBackend(TritonAttentionBackend):
     @classmethod
     def set_head_size_v(cls, head_size_v: int) -> None:
         cls.head_size_v = head_size_v
+
+    @classmethod
+    def is_supported_on_current_device(
+        cls,
+        head_size: int,
+        head_size_v: int,
+        has_sinks: bool = False,
+    ) -> bool:
+        # The sinks + asymmetric-V path computes incorrectly on sm<90
+        # (validated on A100/3090 with MiMo-V2.5/V2.6: garbled output). Callers
+        # fall back to a padded-head-size standard backend instead.
+        if has_sinks and head_size_v != head_size:
+            cap = current_platform.get_device_capability()
+            if cap is not None and cap.major < 9:
+                return False
+        return True
 
     @staticmethod
     def get_name() -> str:
