@@ -104,6 +104,9 @@ def test_shard_fp8_qkv_proj_matches_reference(
 
     for rank in range(tp):
         w_r, s_r = _shard_fp8_qkv_proj(w, s, nh, nk, hd, vd, tp_rank=rank, tp_size=tp)
+        # Replica shards (tp > num_kv_heads) are zero-padded to whole 128-row
+        # scale blocks; the model loader truncates to the parameter size.
+        w_r = w_r[:exp_rows]
         assert tuple(w_r.shape) == (exp_rows, COLS)
         assert s_r.shape[0] == -(-exp_rows // BLOCK)
         s_exp = s_r.repeat_interleave(BLOCK, 0).repeat_interleave(BLOCK, 1)
