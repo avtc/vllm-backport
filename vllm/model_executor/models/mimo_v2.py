@@ -3,6 +3,8 @@
 from collections.abc import Iterable
 from itertools import islice
 
+import os
+
 import torch
 from torch import nn
 
@@ -71,6 +73,30 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+# Per-component activation statistics for debugging (VLLM_MIMO_DEBUG_NORMS=1).
+_MIMO_NORM_DEBUG = os.environ.get("VLLM_MIMO_DEBUG_NORMS", "0") == "1"
+_mimo_norm_debug_calls: dict[int, int] = {}
+
+
+def _mimo_debug_norm(tag: str, layer_id: int, t: torch.Tensor) -> None:
+    if not _MIMO_NORM_DEBUG:
+        return
+    calls = _mimo_norm_debug_calls.get(layer_id, 0)
+    if calls >= 3:
+        return
+    _mimo_norm_debug_calls[layer_id] = calls + 1
+    tf = t.detach().float()
+    logger.info(
+        "NORMDBG l%-3d %-9s %-16s mean=%+.4f std=%.4f absmax=%.3f nan=%s",
+        layer_id,
+        tag,
+        str(tuple(t.shape)),
+        tf.mean().item(),
+        tf.std().item(),
+        tf.abs().max().item(),
+        bool(torch.isnan(tf).any().item()),
+    )
 
 
 class MiMoV2MLP(nn.Module):
@@ -485,9 +511,11 @@ class MiMoV2FlashDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        _mimo_debug_norm("attn_out", self.layer_id, hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        _mimo_debug_norm("mlp_out", self.layer_id, hidden_states)
         return hidden_states, residual
 
     def is_moe_layer(self, layer_idx: int) -> bool:
@@ -731,6 +759,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer)
         ):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            _mimo_debug_norm("resid_out", idx + self.start_layer, hidden_states)
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
             )
