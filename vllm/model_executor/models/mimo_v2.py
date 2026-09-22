@@ -604,9 +604,15 @@ def _shard_fp8_qkv_proj(
         ks.append(w_g_deq[q_rows_per_group:k_end])
         vs.append(w_g_deq[k_end : k_end + v_rows_per_group])
 
-    # Combine into [Q_1, ..., Q_g, K_1, ..., K_g, V_1, ..., V_g] and quantize
-    # back to fp8.
+    # Combine into [Q_1, ..., Q_g, K_1, ..., K_g, V_1, ..., V_g].
     grouped = torch.cat([torch.cat(qs), torch.cat(ks), torch.cat(vs)], dim=0)
+    # scaled_quantize requires whole ``block``-row groups (e.g. TP8 replicas
+    # own 1856 rows = 14.5 blocks). Zero-pad the tail block; the caller
+    # truncates the returned weight to the parameter size, and the zero rows
+    # do not affect the real rows' block scales.
+    pad_rows = -grouped.shape[0] % block
+    if pad_rows:
+        grouped = torch.nn.functional.pad(grouped, (0, 0, 0, pad_rows))
     return scaled_quantize(
         grouped, GroupShape(block, block), w_full.dtype, compute_dtype=torch.float32
     )
