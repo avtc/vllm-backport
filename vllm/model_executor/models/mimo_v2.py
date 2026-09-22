@@ -83,7 +83,7 @@ def _mimo_debug_norm(tag: str, layer_id: int, t: torch.Tensor) -> None:
     if not _MIMO_NORM_DEBUG:
         return
     calls = _mimo_norm_debug_calls.get(layer_id, 0)
-    if calls >= 3:
+    if calls >= 12:
         return
     _mimo_norm_debug_calls[layer_id] = calls + 1
     tf = t.detach().float()
