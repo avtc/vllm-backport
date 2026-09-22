@@ -546,143 +546,118 @@ def _shard_fp8_qkv_proj(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shard the fp8 qkv_proj weights for ``tp_rank``.
 
-    The checkpoint stores the fused QKV as ``num_kv_heads`` contiguous groups
-    (one per KV head; ``n`` below), each ordered ``[Q | K | V]``:
+    Xiaomi exports the fused QKV pre-sharded for the quant-time tensor
+    parallel degree ``NB``: ``NB`` contiguous blocks where block ``i`` is
+    TP-rank ``i``'s ``[Q | K | V]`` end-to-end. Per block, Q has
+    ``(num_heads / NB) * head_dim`` rows, K has ``(num_kv_heads / NB) *
+    head_dim`` rows and V has ``(num_kv_heads / NB) * v_head_dim`` rows.
+    All known MiMo checkpoints (fp8 source, AWQ) are pre-sharded TP-4, so
+    NB=4; for full-attention layers (num_kv_heads == NB) this coincides
+    with one KV head per block, but e.g. the SWA layers (num_kv_heads=8)
+    carry two KV heads per block and must NOT be sliced per KV head.
 
-        [Q_1 | K_1 | V_1 | Q_2 | K_2 | V_2 | ... | Q_n | K_n | V_n]
+    Scale layouts (both observed in MiMo-V2.6-Flash-RL): per-block padded
+    (``NB * ceil(rows_per_block / block)`` scale rows; block rows are a
+    whole number of 128-row scale blocks for 192/128 head dims) or
+    globally packed (``ceil(total_rows / block)``). Dequantization is
+    row-wise, so both expand identically when blocks are scale-aligned.
 
-    Per group, Q has ``(num_heads / num_kv_heads) * head_dim`` rows, K has
-    ``head_dim`` rows, and V has ``v_head_dim`` rows.
-
-    Two fp8 block-scale layouts exist in the wild and both are supported,
-    detected from ``s_full.shape[0]``:
-
-    * per-group padded: ``num_kv_heads * ceil(rows_per_group / block)`` rows;
-      every group's scales are padded to whole blocks (the full-attention
-      layers of MiMo-V2.6-Flash: 4 groups x 3392 rows -> 4 x 27 = 108 rows).
-    * globally packed: ``ceil(total_rows / block)`` rows with no per-group
-      alignment, so a scale block may straddle a group boundary (the SWA
-      layers of MiMo-V2.6-Flash: 8 groups x 1856 rows -> 116 rows; a padded
-      layout would have 8 x 15 = 120).
-
-    Rank assignment: with ``tp_size <= num_kv_heads`` each rank owns
-    ``num_kv_heads / tp_size`` whole groups. With ``tp_size > num_kv_heads``
-    (e.g. TP8 against the 4 KV heads of the full-attention layers) each KV
-    group is replicated across ``tp_size / num_kv_heads`` ranks, and each of
-    those ranks takes a distinct contiguous slice of the group's Q rows;
-    ``QKVParallelLinear`` builds the matching per-rank parameter shapes via
-    ``num_kv_head_replicas``.
-
-    The forward expects the rank's rows de-interleaved into a single Q, K and
-    V block:
-
-        [Q_1 | Q_2 | ... | Q_g | K_1 | K_2 | ... | K_g | V_1 | V_2 | ... | V_g]
-
-    A plain chunk reaches that layout only when exactly one whole padded
-    group lands on one rank and there is no replication. Otherwise the rank's
-    rows are dequantized to float (dropping the block constraint: K is 192
-    rows = 1.5 blocks, so blocks straddle row boundaries under any
-    permutation), reordered, and re-quantized to fp8.
+    The serving shard concatenates the blocks' Q/K/V parts into
+    head-ordered ``all_q / all_k / all_v`` and slices for ``tp_rank``
+    (split K/V heads while ``num_kv_heads >= tp_size``, else replicate,
+    matching QKVParallelLinear's ``num_kv_head_replicas``). When
+    ``tp_size == NB`` a rank's slice is exactly one block, so weights and
+    scales shard by plain chunks without re-quantization; otherwise the
+    rank's rows are dequantized to float, reordered, and re-quantized to
+    fp8 (no block constraint survives a row permutation: K is 192 rows =
+    1.5 scale blocks).
     """
-    q_rows_per_group = (num_heads // num_kv_heads) * head_dim
-    k_rows_per_group = head_dim
-    v_rows_per_group = v_head_dim
-    rows_per_group = q_rows_per_group + k_rows_per_group + v_rows_per_group
-    total_rows = num_kv_heads * rows_per_group
+    nb = 4  # quant-time TP the fused qkv is pre-sharded for
+    if num_heads % nb != 0 or num_kv_heads % nb != 0:
+        raise ValueError(
+            f"fused qkv is pre-sharded for TP-{nb}; num_heads={num_heads} and "
+            f"num_kv_heads={num_kv_heads} must be divisible by {nb}."
+        )
+    q_rows_per_block = (num_heads // nb) * head_dim
+    k_rows_per_block = (num_kv_heads // nb) * head_dim
+    v_rows_per_block = (num_kv_heads // nb) * v_head_dim
+    rows_per_block = q_rows_per_block + k_rows_per_block + v_rows_per_block
+    total_rows = nb * rows_per_block
     w_cols = w_full.shape[1]
     if w_full.shape[0] != total_rows:
         raise ValueError(
             f"fp8 qkv_proj weight has {w_full.shape[0]} rows; expected "
-            f"{total_rows} (num_kv_heads={num_kv_heads}, "
-            f"rows_per_group={rows_per_group})."
+            f"{total_rows} (NB={nb} blocks x {rows_per_block} rows)."
         )
 
-    # Detect the scale layout (the two agree when rows_per_group % block == 0).
-    per_group_scale_rows = -(-rows_per_group // block)
-    padded_scale_rows = num_kv_heads * per_group_scale_rows
+    # Detect the scale layout (identical when rows_per_block % block == 0).
+    per_block_scale_rows = -(-rows_per_block // block)
+    padded_scale_rows = nb * per_block_scale_rows
     packed_scale_rows = -(-total_rows // block)
-    if s_full.shape[0] == padded_scale_rows:
-        scale_is_padded = True
-    elif s_full.shape[0] == packed_scale_rows:
-        scale_is_padded = False
-    else:
+    if s_full.shape[0] not in (padded_scale_rows, packed_scale_rows):
         raise ValueError(
             f"fp8 qkv_proj scale has {s_full.shape[0]} rows; expected the "
-            f"per-group padded layout ({padded_scale_rows} rows) or the "
+            f"per-block padded layout ({padded_scale_rows} rows) or the "
             f"globally packed layout ({packed_scale_rows} rows)."
         )
 
-    # Assign KV groups to this rank, replicating groups when TP exceeds the
-    # number of KV heads.
-    if tp_size <= num_kv_heads:
-        if num_kv_heads % tp_size != 0:
-            raise ValueError(
-                f"TP size ({tp_size}) must evenly divide the number of KV "
-                f"heads ({num_kv_heads})."
-            )
-        kv_replicas = 1
-        group_start = tp_rank * (num_kv_heads // tp_size)
-        group_end = group_start + num_kv_heads // tp_size
-        q_offset_in_group = 0
-    else:
-        if tp_size % num_kv_heads != 0:
-            raise ValueError(
-                f"TP size ({tp_size}) must be a multiple of the number of "
-                f"KV heads ({num_kv_heads}) for KV-head replication."
-            )
-        kv_replicas = tp_size // num_kv_heads
-        group_start = tp_rank // kv_replicas
-        group_end = group_start + 1
-        q_offset_in_group = (tp_rank % kv_replicas) * (
-            q_rows_per_group // kv_replicas
-        )
-    q_rows_per_rank = q_rows_per_group // kv_replicas
-
-    # Fast path: one whole padded group per rank and no replication — the
-    # rank's slice is already [Q | K | V] and block-aligned, so plain chunks
-    # shard it without re-quantization.
-    if group_end - group_start == 1 and kv_replicas == 1 and scale_is_padded:
-        w = w_full.chunk(tp_size, dim=0)[tp_rank]
-        s = s_full.chunk(tp_size, dim=0)[tp_rank]
+    if tp_size == nb:
+        # One whole pre-sharded block per rank: already [Q | K | V] for this
+        # rank and scale-aligned; plain chunks suffice (exact, no requant).
+        w = w_full.chunk(nb, dim=0)[tp_rank]
+        s = s_full.chunk(nb, dim=0)[tp_rank]
         return w, s
 
-    # Dequantize this rank's groups to float.
-    if scale_is_padded:
-        w_deq_groups = []
-        for g_idx in range(group_start, group_end):
-            row_start = g_idx * rows_per_group
-            scale_row_start = g_idx * per_group_scale_rows
-            s_g = s_full[scale_row_start : scale_row_start + per_group_scale_rows]
-            s_g_expanded = s_g.repeat_interleave(block, dim=0).repeat_interleave(
+    # Dequantize to float, row-wise over the whole tensor.
+    if s_full.shape[0] == padded_scale_rows:
+        w_deq_blocks = []
+        for b_idx in range(nb):
+            row_start = b_idx * rows_per_block
+            scale_row_start = b_idx * per_block_scale_rows
+            s_b = s_full[scale_row_start : scale_row_start + per_block_scale_rows]
+            s_b_expanded = s_b.repeat_interleave(block, dim=0).repeat_interleave(
                 block, dim=1
-            )[:rows_per_group, :w_cols]
-            w_g = w_full[row_start : row_start + rows_per_group].to(torch.float32)
-            w_deq_groups.append(w_g * s_g_expanded.to(torch.float32))
+            )[:rows_per_block, :w_cols]
+            w_b = w_full[row_start : row_start + rows_per_block].to(torch.float32)
+            w_deq_blocks.append(w_b * s_b_expanded.to(torch.float32))
     else:
-        # Globally packed scales: expand over the whole tensor (blocks may
-        # straddle group boundaries), then slice groups out of the result.
         s_expanded = s_full.repeat_interleave(block, dim=0).repeat_interleave(
             block, dim=1
         )[:total_rows, :w_cols]
         w_deq = w_full.to(torch.float32) * s_expanded.to(torch.float32)
-        w_deq_groups = [
-            w_deq[g_idx * rows_per_group : (g_idx + 1) * rows_per_group]
-            for g_idx in range(group_start, group_end)
+        w_deq_blocks = [
+            w_deq[b_idx * rows_per_block : (b_idx + 1) * rows_per_block]
+            for b_idx in range(nb)
         ]
 
-    k_end = q_rows_per_group + k_rows_per_group
-    qs, ks, vs = [], [], []
-    for w_g_deq in w_deq_groups:
-        qs.append(w_g_deq[q_offset_in_group : q_offset_in_group + q_rows_per_rank])
-        ks.append(w_g_deq[q_rows_per_group:k_end])
-        vs.append(w_g_deq[k_end : k_end + v_rows_per_group])
+    # Concatenate the blocks' Q/K/V parts into head-ordered full tensors.
+    all_q = torch.cat([b[:q_rows_per_block] for b in w_deq_blocks], dim=0)
+    k_end = q_rows_per_block + k_rows_per_block
+    all_k = torch.cat(
+        [b[q_rows_per_block:k_end] for b in w_deq_blocks], dim=0
+    )
+    all_v = torch.cat([b[k_end:] for b in w_deq_blocks], dim=0)
 
-    # Combine into [Q_1, ..., Q_g, K_1, ..., K_g, V_1, ..., V_g].
-    grouped = torch.cat([torch.cat(qs), torch.cat(ks), torch.cat(vs)], dim=0)
-    # scaled_quantize requires whole ``block``-row groups (e.g. TP8 replicas
-    # own 1856 rows = 14.5 blocks). Zero-pad the tail block; the caller
-    # truncates the returned weight to the parameter size, and the zero rows
-    # do not affect the real rows' block scales.
+    # Slice this rank's heads out of the head-ordered tensors.
+    num_heads_per_rank = num_heads // tp_size
+    q_start = tp_rank * num_heads_per_rank * head_dim
+    q = all_q[q_start : q_start + num_heads_per_rank * head_dim]
+    if num_kv_heads >= tp_size:
+        kvh = num_kv_heads // tp_size
+        k_start = tp_rank * kvh * head_dim
+        v_start = tp_rank * kvh * v_head_dim
+        k = all_k[k_start : k_start + kvh * head_dim]
+        v = all_v[v_start : v_start + kvh * v_head_dim]
+    else:
+        kv_replicas = tp_size // num_kv_heads
+        kvi = tp_rank // kv_replicas
+        k = all_k[kvi * head_dim : (kvi + 1) * head_dim]
+        v = all_v[kvi * v_head_dim : (kvi + 1) * v_head_dim]
+
+    grouped = torch.cat([q, k, v], dim=0)
+    # scaled_quantize requires whole ``block``-row groups; zero-pad the tail
+    # block (the caller truncates to the parameter size; zero rows do not
+    # perturb the real rows' block scales).
     pad_rows = -grouped.shape[0] % block
     if pad_rows:
         grouped = torch.nn.functional.pad(grouped, (0, 0, 0, pad_rows))
