@@ -112,7 +112,7 @@ class MiMoVisionPatchMerger(nn.Module):
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         # The checkpoint's merger ln_q is nn.LayerNorm (weight+bias), not the
         # RMSNorm the vision transformer passes in. Match the checkpoint
-        # exactly (validated on the MiMo-V2.5 0.26 branch).
+        # exactly.
         self.ln_q = nn.LayerNorm(context_dim, eps=1e-6)
 
         self.mlp = nn.Sequential(

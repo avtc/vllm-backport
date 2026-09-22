@@ -3,8 +3,6 @@
 from collections.abc import Iterable
 from itertools import islice
 
-import os
-
 import torch
 from torch import nn
 
@@ -73,32 +71,6 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-
-# Per-component activation statistics for debugging (VLLM_MIMO_DEBUG_NORMS=1).
-_MIMO_NORM_DEBUG = os.environ.get("VLLM_MIMO_DEBUG_NORMS", "0") == "1"
-_mimo_norm_debug_calls: dict[int, int] = {}
-
-
-def _mimo_debug_norm(tag: str, layer_id: int, t: torch.Tensor) -> None:
-    if not _MIMO_NORM_DEBUG:
-        return
-    calls = _mimo_norm_debug_calls.get(layer_id, 0)
-    if calls >= 12:
-        return
-    _mimo_norm_debug_calls[layer_id] = calls + 1
-    tf = t.detach().float()
-    line = (
-        f"l{layer_id:<3d} {tag:<9} shape={tuple(t.shape)} "
-        f"mean={tf.mean().item():+.4f} std={tf.std().item():.4f} "
-        f"absmax={tf.abs().max().item():.3f} "
-        f"nan={bool(torch.isnan(tf).any().item())}\n"
-    )
-    logger.info("NORMDBG %s", line)
-    try:
-        with open(f"/tmp/mimo_normdbg_{os.getpid()}.log", "a") as f:
-            f.write(line)
-    except OSError:
-        pass
 
 
 class MiMoV2MLP(nn.Module):
@@ -412,7 +384,6 @@ class MiMoV2Attention(nn.Module):
             v = v.reshape(-1, self.num_kv_heads * self.head_dim)
 
         attn_output = self.attn(q, k, v)
-        _mimo_debug_norm("attnraw", self.layer_id, attn_output)
 
         if self._pad_v:
             attn_output = attn_output.view(-1, self.num_heads, self.head_dim)
@@ -514,11 +485,9 @@ class MiMoV2FlashDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
-        _mimo_debug_norm("attn_out", self.layer_id, hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        _mimo_debug_norm("mlp_out", self.layer_id, hidden_states)
         return hidden_states, residual
 
     def is_moe_layer(self, layer_idx: int) -> bool:
@@ -737,7 +706,6 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer)
         ):
             hidden_states, residual = layer(positions, hidden_states, residual)
-            _mimo_debug_norm("resid_out", idx + self.start_layer, hidden_states)
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
             )
