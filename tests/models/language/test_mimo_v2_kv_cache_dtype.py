@@ -111,8 +111,10 @@ def fake_vllm_config(monkeypatch):
                 sliding_window=-1,
                 block_size=16,
                 skip_page_size_padded=None,
+                enable_prefix_caching=False,
             ),
             attention_config=SimpleNamespace(backend=_FakeDiffKV()),
+            compilation_config=SimpleNamespace(static_forward_context={}),
         )
         # Modules under test see the fake; CustomOps keep whatever real
         # config the default_vllm_config fixture installs.
