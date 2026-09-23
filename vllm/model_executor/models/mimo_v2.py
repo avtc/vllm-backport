@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 from collections.abc import Iterable
 from itertools import islice
 
@@ -292,6 +293,22 @@ class MiMoV2Attention(nn.Module):
         )
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
+
+        if sliding_window is None and cache_config is not None and (
+            cache_config.sliding_window is None
+            or cache_config.sliding_window > 0
+        ):
+            # Full-attention layer of a hybrid model. The checkpoint ships a
+            # generic hf `sliding_window` describing its SWA layers, which
+            # config resolution copies into cache_config.sliding_window (no
+            # `layer_types` array to say otherwise); Attention's model-level
+            # fallback would inherit it here and turn this layer into a
+            # windowed one — mis-pricing the KV pool (capacity ~ window /
+            # max_in_flight) and window-masking the global attention. Hand
+            # Attention a copy with the sentinel so it resolves full attention
+            # while still threading the cache dtype.
+            cache_config = copy.copy(cache_config)
+            cache_config.sliding_window = -1
 
         # Use DiffKV backend when V has a different head dim than K.
         # Auto-pick FA-DiffKV when FA3/4 is usable on this device, else fall

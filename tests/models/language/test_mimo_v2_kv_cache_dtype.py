@@ -105,10 +105,12 @@ def fake_vllm_config(monkeypatch):
             cache_config=SimpleNamespace(
                 cache_dtype=cache_dtype,
                 kv_cache_dtype_skip_layers=[],
-                # MiMo's window lives in hf sliding_window_size, so the
-                # model-level sentinel stays -1 here (and must resolve to
-                # full attention, not a window of -1).
-                sliding_window=-1,
+                # Mirror the real checkpoint: MiMo ships a generic hf
+                # `sliding_window` (128) alongside its per-layer
+                # `sliding_window_size`, and config resolution copies it into
+                # cache_config.sliding_window. The full-attention layers must
+                # NOT inherit it.
+                sliding_window=128,
                 block_size=16,
                 skip_page_size_padded=None,
                 enable_prefix_caching=False,
