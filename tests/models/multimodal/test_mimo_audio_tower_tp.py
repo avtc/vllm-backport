@@ -26,8 +26,10 @@ from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_port
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def tp1_env():
+    # Function-scoped: the suite's autouse teardown destroys model-parallel
+    # state after every test, so a module-scoped init would not survive.
     init_distributed_environment(
         world_size=1,
         rank=0,
@@ -48,7 +50,7 @@ def test_tp_for_dims_gate_and_divisibility():
     # Gate on, heads not divisible (e.g. 20-head whisper at TP8): replicate
     # rather than shard a subset (row-parallel reduce is global-TP).
     assert _audio_tower_tp_for_dims(8, (20, 1024, 4096), enabled=True) == 1
-    assert _audio_tower_tp_for_dims(8, (16, 1000, 4096), enabled=True) == 1
+    assert _audio_tower_tp_for_dims(8, (16, 1004, 4096), enabled=True) == 1
     # Single GPU: nothing to shard.
     assert _audio_tower_tp_for_dims(1, (16, 1024, 4096), enabled=True) == 1
 
@@ -85,7 +87,9 @@ def test_shard_state_dict_for_rank():
     ckpt = {
         "col.weight": torch.arange(64, dtype=torch.float32).view(8, 8),
         "col.bias": torch.arange(8, dtype=torch.float32),
-        "row.weight": torch.arange(32, dtype=torch.float32).view(8, 4) * 10,
+        # Full (unsharded) checkpoint tensors: col is [out,in]=[8,8] sharded to
+        # [4,8] per rank; row is [8,8] sharded to [8,4].
+        "row.weight": torch.arange(64, dtype=torch.float32).view(8, 8) * 10,
         "row.bias": torch.arange(8, dtype=torch.float32),
         "rep.weight": torch.zeros(8, 8),
         "decoder.unused.weight": torch.zeros(8, 8),  # dropped by strict=False
@@ -98,7 +102,7 @@ def test_shard_state_dict_for_rank():
         )
         assert torch.equal(out["col.bias"], ckpt["col.bias"][rank * 4 : (rank + 1) * 4])
         assert torch.equal(
-            out["row.weight"], ckpt["row.weight"][:, rank * 2 : (rank + 1) * 2]
+            out["row.weight"], ckpt["row.weight"][:, rank * 4 : (rank + 1) * 4]
         )
         assert torch.equal(out["row.bias"], ckpt["row.bias"])
         assert torch.equal(out["rep.weight"], ckpt["rep.weight"])
@@ -107,6 +111,7 @@ def test_shard_state_dict_for_rank():
     # Rank wraps modulo the per-tensor factor (subgroup-style replication).
     out2 = _shard_state_dict_for_rank(m, ckpt, tp_rank=5)
     assert torch.equal(out2["col.weight"], ckpt["col.weight"][4:8])
+    assert torch.equal(out2["row.weight"], ckpt["row.weight"][:, 4:8])
 
     # A shape that is neither a clean row nor column shard must raise.
     bad = dict(ckpt)
