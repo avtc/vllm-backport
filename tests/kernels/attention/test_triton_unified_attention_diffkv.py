@@ -613,3 +613,45 @@ def test_diffkv_fp8_kv_vs_ref(
         f"fp8 kernel error {kernel_err:.4f} vs dequant ref exceeds budget "
         f"max(2*{base_err:.4f}, 1e-2)"
     )
+
+
+@torch.inference_mode()
+def test_diffkv_fp8_store_matches_reference() -> None:
+    """fp8 KV store: bytes in the cache must equal torch's E4M3 cast of the
+    scaled inputs, on both the sm89+ implicit-cast path and the sm<89
+    torch-software-cast path (fp8e4nv cannot be lowered on Ampere)."""
+    if not current_platform.is_cuda():
+        pytest.skip("CUDA-only kernel")
+
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+        triton_reshape_and_cache_flash_diffkv,
+    )
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    num_tokens, num_heads, head_size_k, head_size_v, block_size = 7, 2, 192, 128, 16
+    key = torch.randn(num_tokens, num_heads, head_size_k, dtype=torch.bfloat16)
+    value = torch.randn(num_tokens, num_heads, head_size_v, dtype=torch.bfloat16)
+    k_scale = torch.tensor(1.5, dtype=torch.float32)
+    v_scale = torch.tensor(0.75, dtype=torch.float32)
+    num_slots = 32
+    cache = torch.zeros(
+        num_slots,
+        block_size,
+        num_heads,
+        head_size_k + head_size_v,
+        dtype=torch.uint8,
+    )
+    slots = torch.arange(num_tokens, dtype=torch.int64) % num_slots
+
+    triton_reshape_and_cache_flash_diffkv(
+        key, value, cache, slots, "fp8", k_scale, v_scale
+    )
+
+    ref_k = (key / k_scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    ref_v = (value / v_scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    for i, slot in enumerate(slots.tolist()):
+        got_k = cache[slot, i % block_size, :, :head_size_k]
+        got_v = cache[slot, i % block_size, :, head_size_k:]
+        assert torch.equal(got_k, ref_k[i]), f"K bytes mismatch at token {i}"
+        assert torch.equal(got_v, ref_v[i]), f"V bytes mismatch at token {i}"
