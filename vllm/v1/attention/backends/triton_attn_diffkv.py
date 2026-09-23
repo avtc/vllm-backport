@@ -60,6 +60,9 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
         # (q=8) per layer vs stock 16 on 46K-180K contexts. SWA groups keep
         # the stock count (their loops are window-bounded). Stock-off
         # default: unset keeps the stock 16 segments; set
+        # Upstream default 16. 64 = split-KV segments for the global
+        # (full-attention) layers: recipe-claimed 1.3-2.6x per layer at
+        # 46K-180K ctx; ladder-validated on sm86 TP8.
         full_attn_segments = int(
             os.environ.get("VLLM_DIFFKV_FULL_ATTN_SEGMENTS", "64")
         )

@@ -52,6 +52,8 @@ is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 # on the server (validated values from the diffbot recipe in comments).
 # VLLM_DIFFKV_SPEC_3D_MAX_Q: max query tokens per sequence for the split-KV verify path
 # (0 = off; diffbot validated 16: MTP verify batches take the 3D split-KV launch).
+# Upstream default 0 (path off). 16 enables the split-KV verify launch:
+# measured 3x decode at 33K ctx with MTP-3 on sm86 TP8 (50 -> 149 TG/s).
 _SPEC_3D_MAX_Q = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_MAX_Q", "16"))
 # Wide-prefill knobs (diffbot recipe): prefill-shaped 2D launches
 # (max_seqlen_q >= _PREFILL_MIN_Q) use a larger BLOCK_M (several query
@@ -60,6 +62,9 @@ _SPEC_3D_MAX_Q = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_MAX_Q", "16"))
 # Validated on sm120: 128 / 8 warps / tile 32 = 3.0x on a 4096-token chunk
 # at 30K ctx (global layers), 2.5x SWA; tile 64 exceeds sm120's 99 KB smem
 # for BLOCK_M 128. Stock-off default: 16 keeps the stock launch.
+# Upstream default 16. 128 = wide prefill tiles (recipe-claimed up to 3x on
+# 4096-token chunks; kept by the sm86 prefill ladder). Automatically clamped
+# to 64 under the fp8-KV LUT path on sm<89 (shared-memory ceiling).
 _PREFILL_BLOCK_M = int(os.environ.get("VLLM_DIFFKV_PREFILL_BLOCK_M", "128"))
 _PREFILL_NUM_WARPS = int(os.environ.get("VLLM_DIFFKV_PREFILL_NUM_WARPS", "8"))
 # 2 stages: same speed as the default 3 for bf16 and keeps the fp8-KV dequant

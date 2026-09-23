@@ -274,9 +274,11 @@ class MiMoV2Attention(nn.Module):
         # is memory-bound, so halving the weights wins (~1.25 ms/pass bf16
         # per the diffbot profile; +2-4% decode on sm120, Marlin W8A16 on
         # sm86). Ported from the diffbot recipe mimo_v2.patch.
-        # Online fp8 o_proj is on by default (+7-19% decode measured on
-        # sm86 TP8; W8A16 Marlin below sm89, dynamic fp8 above). Set
-        # VLLM_MIMO_OPROJ_FP8=0 to keep the checkpoint's bf16 o_proj.
+        # Online fp8 o_proj: upstream default OFF (checkpoint bf16 o_proj,
+        # ~400 MB/rank/step streamed at TP8). Default-on after measuring
+        # +7-19% decode (149 -> 176.9 TG/s @33K, 172 -> 183.7 @487) and
+        # +8% prefill @33K (~1700 -> 1841 PP/s) on sm86 TP8; W8A16 Marlin
+        # below sm89, dynamic fp8 above. VLLM_MIMO_OPROJ_FP8=0 opts out.
         if os.environ.get("VLLM_MIMO_OPROJ_FP8", "1") != "0":
             from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
