@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""MiMo-V2 attention modules must thread cache_config into Attention.
+
+`--kv-cache-dtype fp8` only halves the KV pool if every Attention layer
+resolves its spec dtype from cache_config.cache_dtype. The MiMo decoder
+layers (both the full-attention and the compressed-softmax/SWA branches)
+and the MTP predictor layer historically constructed MiMoV2Attention
+without cache_config, so the layers silently fell back to "auto" (model
+dtype) specs: fp8 kernels ran on a bf16-sized allocation — correct output,
+same token capacity, half of every cache row dead.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import vllm.model_executor.layers.attention.attention as attention_module
+import vllm.model_executor.models.mimo_v2 as mimo_v2_module
+from vllm.model_executor.models.mimo_v2 import MiMoV2FlashDecoderLayer
+from vllm.model_executor.models.mimo_v2_mtp import MiMoV2MTPLayer
+
+
+def _hf_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        v_head_dim=8,
+        swa_num_attention_heads=4,
+        swa_num_key_value_heads=2,
+        swa_head_dim=16,
+        swa_v_head_dim=8,
+        sliding_window_size=4,
+        attention_bias=False,
+        add_swa_attention_sink_bias=False,
+        rope_theta=1000000.0,
+        swa_rope_theta=1000000.0,
+        max_position_embeddings=32768,
+        attention_value_scale=None,
+        partial_rotary_factor=1.0,
+        layernorm_epsilon=1e-5,
+        # layer 0: full attention; layer 1: compressed softmax (SWA)
+        hybrid_layer_pattern=[0, 1],
+        # no moe_layer_freq -> dense layers
+    )
+
+
+class _FakeDiffKV:
+    """Pins the DiffKV selection so no device capability probe runs."""
+
+    name = "TRITON_ATTN_DIFFKV"
+
+    @classmethod
+    def get_class(cls):
+        from vllm.v1.attention.backends.triton_attn_diffkv import (
+            TritonAttentionDiffKVBackend,
+        )
+
+        return TritonAttentionDiffKVBackend
+
+
+@pytest.fixture()
+def fake_vllm_config(monkeypatch):
+    def build(cache_dtype: str) -> SimpleNamespace:
+        cfg = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=_hf_config(), dtype=torch.bfloat16
+            ),
+            quant_config=None,
+            cache_config=SimpleNamespace(
+                cache_dtype=cache_dtype, kv_cache_dtype_skip_layers=[]
+            ),
+            attention_config=SimpleNamespace(backend=_FakeDiffKV()),
+        )
+        monkeypatch.setattr(
+            mimo_v2_module, "get_current_vllm_config", lambda: cfg
+        )
+        monkeypatch.setattr(
+            attention_module, "get_current_vllm_config", lambda: cfg
+        )
+        return cfg
+
+    return build
+
+
+@pytest.mark.parametrize("cache_dtype,expected", [
+    ("fp8", torch.uint8),
+    ("auto", torch.bfloat16),
+])
+@pytest.mark.parametrize("prefix", ["model.layers.0", "model.layers.1"])
+def test_decoder_layer_threads_cache_dtype(
+    fake_vllm_config, cache_dtype: str, expected: torch.dtype, prefix: str
+):
+    """Both the full-attention and SWA branches resolve the spec dtype from
+    cache_config.cache_dtype, not from the model dtype."""
+    cfg = fake_vllm_config(cache_dtype)
+    layer = MiMoV2FlashDecoderLayer(vllm_config=cfg, prefix=prefix)
+    assert layer.self_attn.attn.kv_cache_torch_dtype == expected
+
+
+@pytest.mark.parametrize("cache_dtype,expected", [
+    ("fp8", torch.uint8),
+    ("auto", torch.bfloat16),
+])
+def test_mtp_layer_threads_cache_dtype(
+    fake_vllm_config, cache_dtype: str, expected: torch.dtype
+):
+    """The MTP predictor layer shares the same cache dtype as the target."""
+    cfg = fake_vllm_config(cache_dtype)
+    layer = MiMoV2MTPLayer(
+        config=cfg.model_config.hf_text_config,
+        prefix="model.mtp.layers.0",
+        quant_config=None,
+        cache_config=cfg.cache_config,
+    )
+    assert layer.self_attn.attn.kv_cache_torch_dtype == expected
+
+
+def test_mtp_layer_cache_config_optional(fake_vllm_config):
+    """Omitting cache_config keeps the old behavior (auto)."""
+    cfg = fake_vllm_config("fp8")
+    layer = MiMoV2MTPLayer(
+        config=cfg.model_config.hf_text_config,
+        prefix="model.mtp.layers.0",
+        quant_config=None,
+    )
+    assert layer.self_attn.attn.kv_cache_torch_dtype == torch.bfloat16
