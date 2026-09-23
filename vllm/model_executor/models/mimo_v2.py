@@ -278,6 +278,16 @@ class MiMoV2Attention(nn.Module):
         if os.environ.get("VLLM_MIMO_OPROJ_FP8", "0") == "1":
             from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
+            # The env is not part of the torch-compile cache key: a cache
+            # from a run with this env unset holds plain-F.linear graphs for
+            # o_proj and crashes at first prefill against the int Marlin
+            # weight (mm: BFloat16 != int). Clear
+            # ~/.cache/vllm/torch_compile_cache when toggling this flag.
+            logger.warning_once(
+                "VLLM_MIMO_OPROJ_FP8=1: online fp8 o_proj enabled; a "
+                "torch_compile_cache from a run without this env must be "
+                "removed or the first prefill will crash"
+            )
             o_proj_quant_config = Fp8Config(
                 is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
             )
