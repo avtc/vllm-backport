@@ -138,6 +138,11 @@ class TritonAttentionDiffKVBackend(TritonAttentionBackend):
 class TritonAttentionDiffKVImpl(TritonAttentionImpl):
     """Triton attention impl for the DiffKV packed KV cache layout."""
 
+    # fp8 K/V is dequantized via the 256-entry E4M3 LUT before the dot
+    # products (no native fp8 math), so the parent's SM89 architectural
+    # gate does not apply. See TritonAttentionImpl.__init__.
+    fp8_kv_lut_dequant = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # DiffKV dequantizes K/V to the query dtype before its dot products.

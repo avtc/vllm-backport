@@ -35,6 +35,7 @@ def _hf_config() -> SimpleNamespace:
     return SimpleNamespace(
         hidden_size=64,
         intermediate_size=128,
+        hidden_act="silu",
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=16,
