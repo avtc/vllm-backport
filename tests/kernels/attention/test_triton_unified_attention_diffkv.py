@@ -949,3 +949,49 @@ def test_prefill_cuda_failure_falls_back_to_triton(
         assert not any(
             "prefill_attn_sm86 failed" in r.message for r in caplog.records
         )
+
+
+@torch.inference_mode()
+def test_prefill_attn_cuda_causal_boundary_no_lookahead() -> None:
+    """Adversarial causal-mask check: tokens at pos == TK-2 (tile ends at
+    pos+1) must NOT attend their next token. The buggy need_mask (keying on
+    the later token's position) leaked exactly one future key here; amplify
+    with a huge V on the leaked token so random-data tolerance can't hide it.
+    """
+    if not current_platform.is_cuda():
+        pytest.skip("CUDA-only kernel")
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) >= (9, 0):
+        pytest.skip("sm86-TP8 build; sm90+ uses other paths")
+
+    from vllm.v1.attention.ops.prefill_attn_cuda import _load_ext, _qblock_metadata
+
+    ext = _load_ext()
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    HQ, HKV, DK, DV, BS = 8, 1, 192, 128, 16
+    qlen = 64  # tokens 0..63; token 62 sits at pos 62 = TK-2 (tile ends 63)
+    kv_lens = [qlen]
+    nb = qlen // BS + 2
+    kv = torch.randn(nb, HKV, BS, DK + DV, dtype=torch.bfloat16)
+    # make the would-be-leaked key/value distinctive
+    kv[3, 0, 14] = 8.0  # token 63's K row and V row
+    bt = torch.arange(nb, dtype=torch.int32).unsqueeze(0)
+    q = torch.randn(qlen, HQ, DK, dtype=torch.bfloat16)
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32)
+    seq_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
+
+    out = torch.empty(qlen, HQ, DV, dtype=torch.bfloat16)
+    qblk_seq, qblk_start = _qblock_metadata(cu_q)
+    ext.prefill_attn_sm86(
+        q, kv, bt, cu_q, seq_lens_t, qblk_seq, qblk_start,
+        DK**-0.5, 1.0, 1.0, out,
+    )
+    ref = _fp32_ref_prefill(
+        q, kv, bt, kv_lens, cu_q, HQ, HKV, DK, DV, DK**-0.5,
+    )
+    err = (out.float() - ref.float()).abs().max().item()
+    # token 62 (row 62) is the canary; a leak shows up as an ~O(1) error
+    row62 = (out[62].float() - ref[62].float()).abs().max().item()
+    assert row62 <= 5e-2, f"look-ahead leak at pos TK-2: err {row62:.4f}"
+    assert err <= 5e-2, f"err {err:.4f}"

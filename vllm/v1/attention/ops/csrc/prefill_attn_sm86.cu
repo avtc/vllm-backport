@@ -232,8 +232,11 @@ __global__ void __launch_bounds__(256, 1) prefill_attn_sm86_kernel(
         mma16816(s[2 * np + 1], qa[kk], r[1], r[3]);
       }
     }
-    // ---- scale + mask: row group 0 -> pos0, group 1 -> pos1
-    const bool need_mask = (key0 + TK - 1 > pos1) || !valid1;
+    // ---- scale + mask: group 0 (token t0) has pos0 = pos1 - 1, so the mask
+    // must fire on the EARLIER position: the 64-aligned tile ending exactly
+    // at pos1 lets t0 see its next token otherwise (look-ahead leak).
+    const bool need_mask =
+        (key0 + TK - 1 > pos0) || !valid0 || !valid1;
 #pragma unroll
     for (int n = 0; n < TK / 8; ++n) {
 #pragma unroll
