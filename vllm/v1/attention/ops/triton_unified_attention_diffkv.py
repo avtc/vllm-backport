@@ -535,6 +535,33 @@ def unified_attention_diffkv(
                 f"VLLM_DIFFKV_FP8_DEQUANT must be auto|lut|native, got {mode!r}"
             )
 
+    # sm80/sm86 have a ~99KB shared-memory ceiling. The LUT gather stages
+    # the raw uint8 tile alongside the gathered fp16 tile, so a BLOCK_M=128
+    # prefill/verify kernel needs ~112KB and fails to launch
+    # (OutOfResources: 114688 vs 101376). bf16 direct loads fit at 128 on
+    # these parts, so only clamp the wide-tile knobs when the LUT path is
+    # actually taken below sm89.
+    lut_low_smem = fp8_lut and q.is_cuda and (
+        torch.cuda.get_device_capability(q.device) < (8, 9)
+    )
+    prefill_block_m = _PREFILL_BLOCK_M
+    spec_3d_block_m = _SPEC_3D_BLOCK_M
+    if lut_low_smem:
+        if prefill_block_m > 64:
+            logger.warning_once(
+                "fp8-KV LUT dequant: clamping VLLM_DIFFKV_PREFILL_BLOCK_M "
+                "%d -> 64 to fit the sm86 shared-memory ceiling",
+                prefill_block_m,
+            )
+            prefill_block_m = 64
+        if spec_3d_block_m > 64:
+            logger.warning_once(
+                "fp8-KV LUT dequant: clamping VLLM_DIFFKV_SPEC_3D_BLOCK_M "
+                "%d -> 64 to fit the sm86 shared-memory ceiling",
+                spec_3d_block_m,
+            )
+            spec_3d_block_m = 64
+
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
@@ -555,10 +582,10 @@ def unified_attention_diffkv(
     prefill_tile = None
     if (
         max_seqlen_q >= _PREFILL_MIN_Q
-        and _PREFILL_BLOCK_M > BLOCK_M
-        and _PREFILL_BLOCK_M % num_queries_per_kv == 0
+        and prefill_block_m > BLOCK_M
+        and prefill_block_m % num_queries_per_kv == 0
     ):
-        BLOCK_M = _PREFILL_BLOCK_M
+        BLOCK_M = prefill_block_m
         launch_kw["num_warps"] = _PREFILL_NUM_WARPS
         if _PREFILL_NUM_STAGES > 0:
             launch_kw["num_stages"] = _PREFILL_NUM_STAGES
@@ -591,9 +618,9 @@ def unified_attention_diffkv(
     )
 
     spec_tile = None
-    if use_3d and spec_3d and _SPEC_3D_BLOCK_M > BLOCK_M:
+    if use_3d and spec_3d and spec_3d_block_m > BLOCK_M:
         spec_bm = min(
-            _SPEC_3D_BLOCK_M,
+            spec_3d_block_m,
             triton.next_power_of_2(max_seqlen_q * num_queries_per_kv),
         )
         if spec_bm > BLOCK_M and spec_bm % num_queries_per_kv == 0:

@@ -655,3 +655,69 @@ def test_diffkv_fp8_store_matches_reference() -> None:
         got_v = cache[slot, i % block_size, :, head_size_k:]
         assert torch.equal(got_k, ref_k[i]), f"K bytes mismatch at token {i}"
         assert torch.equal(got_v, ref_v[i]), f"V bytes mismatch at token {i}"
+
+
+@torch.inference_mode()
+def test_diffkv_fp8_prefill_wide_tile_lut_fits_sm86() -> None:
+    """Regression: BLOCK_M=128 prefill + LUT dequant needs ~112KB shared
+    memory and fails to launch on sm80/sm86 (99KB ceiling). The launcher
+    must clamp the wide tile so real prefills (qlen >= _PREFILL_MIN_Q) run."""
+    if not current_platform.is_cuda():
+        pytest.skip("CUDA-only kernel")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(_diffkv_module, "_FP8_DEQUANT_MODE", "auto")
+    monkeypatch.setattr(_diffkv_module, "_PREFILL_BLOCK_M", 128)
+    monkeypatch.setattr(_diffkv_module, "_PREFILL_NUM_WARPS", 8)
+    monkeypatch.setattr(_diffkv_module, "_PREFILL_NUM_STAGES", 2)
+    monkeypatch.setattr(_diffkv_module, "_PREFILL_TILE", 32)
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    num_query_heads, num_kv_heads, head_size_qk, head_size_v, block_size = (
+        8,
+        2,
+        192,
+        128,
+        16,
+    )
+    qlen, seq_len = 256, 3000
+    kv_cache = torch.randn(
+        4096,
+        block_size,
+        num_kv_heads,
+        head_size_qk + head_size_v,
+        dtype=torch.bfloat16,
+    )
+    k_descale = torch.tensor(1.0, dtype=torch.float32)
+    v_descale = torch.tensor(1.0, dtype=torch.float32)
+    kv_cache_fp8 = torch.cat(
+        [
+            kv_cache[..., :head_size_qk].to(torch.float8_e4m3fn),
+            kv_cache[..., head_size_qk:].to(torch.float8_e4m3fn),
+        ],
+        dim=-1,
+    )
+    block_table = torch.randint(0, 4096, (1, seq_len // block_size), dtype=torch.int32)
+    query = torch.randn(qlen, num_query_heads, head_size_qk, dtype=torch.bfloat16)
+
+    out = _run_diffkv(
+        query,
+        kv_cache_fp8,
+        [seq_len],
+        qlen,
+        block_table,
+        num_query_heads,
+        head_size_qk,
+        head_size_v,
+        block_size,
+        (-1, -1),
+        None,
+        seq_threshold_3d=None,
+        segments=16,
+        out_dtype=torch.bfloat16,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    assert out.shape == (qlen, num_query_heads, head_size_v)
+    assert not torch.isnan(out.float()).any(), "NaN in fp8-KV prefill output"
