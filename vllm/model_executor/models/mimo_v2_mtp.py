@@ -289,6 +289,10 @@ class MiMoV2MTP(nn.Module):
             # together once both are buffered.
             if "qkv_proj" in name:
                 base, _, kind = name.rpartition(".")
+                if f"{base}.weight" not in params_dict:
+                    # The draft model builds only the MTP layers it uses
+                    # (EAGLE semantics: one reused layer); skip the rest.
+                    continue
                 is_fp8_weight = kind == "weight" and (
                     loaded_weight.dtype == torch.float8_e4m3fn
                 )
