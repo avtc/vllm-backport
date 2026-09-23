@@ -72,8 +72,10 @@ class _FakeDiffKV:
 
 
 @pytest.fixture()
-def tp1_env():
-    """Single-rank tensor-parallel group for the parallel-linear weights."""
+def tp1_env(default_vllm_config):
+    """Single-rank tensor-parallel group for the parallel-linear weights.
+    Depends on default_vllm_config: initialize_model_parallel reads the
+    current config, so it must already be set."""
     destroy_model_parallel()
     destroy_distributed_environment()
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -136,7 +138,7 @@ def test_decoder_layer_threads_cache_dtype(
     ("auto", torch.bfloat16),
 ])
 def test_mtp_layer_threads_cache_dtype(
-    default_vllm_config, fake_vllm_config,
+    tp1_env, default_vllm_config, fake_vllm_config,
     cache_dtype: str, expected: torch.dtype
 ):
     """The MTP predictor layer shares the same cache dtype as the target."""
@@ -150,7 +152,9 @@ def test_mtp_layer_threads_cache_dtype(
     assert layer.self_attn.attn.kv_cache_torch_dtype == expected
 
 
-def test_mtp_layer_cache_config_optional(default_vllm_config, fake_vllm_config):
+def test_mtp_layer_cache_config_optional(
+    tp1_env, default_vllm_config, fake_vllm_config
+):
     """Omitting cache_config keeps the old behavior (auto)."""
     cfg = fake_vllm_config("fp8")
     layer = MiMoV2MTPLayer(
