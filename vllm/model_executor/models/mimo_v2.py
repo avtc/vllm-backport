@@ -274,24 +274,18 @@ class MiMoV2Attention(nn.Module):
         # is memory-bound, so halving the weights wins (~1.25 ms/pass bf16
         # per the diffbot profile; +2-4% decode on sm120, Marlin W8A16 on
         # sm86). Ported from the diffbot recipe mimo_v2.patch.
-        # Online fp8 o_proj: upstream default OFF (checkpoint bf16 o_proj,
-        # ~400 MB/rank/step streamed at TP8). Default-on after measuring
-        # +7-19% decode (149 -> 176.9 TG/s @33K, 172 -> 183.7 @487) and
-        # +8% prefill @33K (~1700 -> 1841 PP/s) on sm86 TP8; W8A16 Marlin
-        # below sm89, dynamic fp8 above. VLLM_MIMO_OPROJ_FP8=0 opts out.
-        if os.environ.get("VLLM_MIMO_OPROJ_FP8", "1") != "0":
+        # Online fp8 o_proj: OPT-IN (VLLM_MIMO_OPROJ_FP8=1) because it is
+        # lossy (per-tensor fp8 weights; GSM8K parity measured: 82.7% vs
+        # 82.0% bf16, full test set) — quality-neutral but not bit-exact.
+        # Measured on sm86 TP8 MNBT 1024: +7-19% decode (149 -> 176.9 TG/s
+        # @33K), +8% prefill @33K; W8A16 Marlin below sm89, dynamic fp8
+        # above. At MNBT >= 2048 Marlin loses to bf16 cuBLAS (-0.5..-3.8%
+        # prefill) — pair with small chunk budgets. When toggling, clear
+        # ~/.cache/vllm/torch_compile_cache (env is not part of the compile
+        # cache key; stale graphs crash at first prefill).
+        if os.environ.get("VLLM_MIMO_OPROJ_FP8", "0") == "1":
             from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-            if os.environ.get("VLLM_MIMO_OPROJ_FP8") is not None:
-                # Explicit toggle: the env is not part of the torch-compile
-                # cache key, so graphs from a run with the other setting
-                # replay stale F.linear-vs-Marlin code and crash at first
-                # prefill. Clear ~/.cache/vllm/torch_compile_cache.
-                logger.warning_once(
-                    "VLLM_MIMO_OPROJ_FP8 explicitly set: remove "
-                    "~/.cache/vllm/torch_compile_cache if this differs from "
-                    "the previous run's setting"
-                )
             o_proj_quant_config = Fp8Config(
                 is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
             )
