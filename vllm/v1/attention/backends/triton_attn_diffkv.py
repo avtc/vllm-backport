@@ -201,19 +201,28 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
     _prefill_cuda_sinks_zero: bool | None = None
 
     def _use_prefill_cuda(
-        self, num_actual_tokens: int, head_size_qk: int, head_size_v: int
+        self,
+        num_actual_tokens: int,
+        max_query_len: int,
+        head_size_qk: int,
+        head_size_v: int,
     ) -> bool:
         """Route global-layer prefill to the CUDA kernel when configured.
 
         Only full-attention layers with the MiMo TP8 per-rank shape (8 Q
-        heads, K 192 / V 128, 1 KV head) qualify; decode, spec-decode verify
-        and SWA layers keep the Triton path. Full attention is the parent
-        impl's (-1, -1) window tuple (never None). The CUDA kernel has no
-        sink support: with add_swa_attention_sink_bias the checkpoint hands
-        a sink Parameter to every layer, so a layer qualifies only when its
-        sink values are provably all-zero (add_full_attention_sink_bias is
-        false, i.e. global layers carry inert zero sinks) — checked once and
-        latched at first use, after weights load.
+        heads, K 192 / V 128, 1 KV head) qualify. Full attention is the
+        parent impl's (-1, -1) window tuple (never None). The CUDA kernel
+        has no sink support: with add_swa_attention_sink_bias the checkpoint
+        hands a sink Parameter to every layer, so a layer qualifies only
+        when its sink values are provably all-zero (add_full_attention_sink
+        bias is false, i.e. global layers carry inert zero sinks) — checked
+        once and latched at first use, after weights load.
+
+        Prefill-shaped batches only (max_query_len > 16): the kernel gets
+        its parallelism from the query dimension (a 1024-token chunk is 64
+        CTAs), while spec-decode verify batches (max_query_len =
+        num_spec_tokens + 1) would leave it CTA-starved — those stay on the
+        tuned split-KV spec-3D Triton path regardless of batch width.
         """
         from vllm.v1.attention.ops.prefill_attn_cuda import prefill_cuda_enabled
 
@@ -234,6 +243,7 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
                 return False
         return (
             num_actual_tokens > 16
+            and max_query_len > 16
             and self.num_heads == 8
             and self.num_kv_heads == 1
             and head_size_qk == 192
@@ -279,7 +289,12 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
         head_size_qk = self.head_size
         head_size_v = TritonAttentionDiffKVBackend.head_size_v
 
-        if self._use_prefill_cuda(num_actual_tokens, head_size_qk, head_size_v):
+        if self._use_prefill_cuda(
+            num_actual_tokens,
+            attn_metadata.max_query_len,
+            head_size_qk,
+            head_size_v,
+        ):
             # Global (full-attention) layers' prefill: purpose-built CUDA
             # kernel (ldmatrix + mma.m16n8k16; fp8/bf16 KV converted in the
             # load path — sm86 has no cvt.rn e4m3 hardware, so fp8 converts

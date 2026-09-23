@@ -864,6 +864,28 @@ def _make_diffkv_impl_for_prefill_cuda(sinks: torch.Tensor | None):
     return impl
 
 
+def test_prefill_cuda_hook_prefill_shaped_only() -> None:
+    """max_query_len <= 16 (spec-verify batches, any batch width) must stay
+    on the split-KV spec-3D Triton path; only prefill-shaped batches route
+    to the CUDA kernel."""
+    from vllm.v1.attention.backends.triton_attn_diffkv import (
+        TritonAttentionDiffKVImpl,
+    )
+
+    impl = _make_diffkv_impl_for_prefill_cuda(None)
+    assert isinstance(impl, TritonAttentionDiffKVImpl)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("VLLM_DIFFKV_PREFILL_CUDA", "1")
+        # re-read the module-level default through the enabled() helper
+        import vllm.v1.attention.ops.prefill_attn_cuda as pac
+
+        mp.setattr(pac, "_PREFILL_CUDA_ENV", True)
+        assert not impl._use_prefill_cuda(32, 4, 192, 128)   # verify-shaped
+        assert not impl._use_prefill_cuda(4, 1, 192, 128)    # decode
+        assert impl._use_prefill_cuda(1024, 1024, 192, 128)  # prefill chunk
+        assert not impl._use_prefill_cuda(1024, 8, 192, 128)  # verify × wide batch
+
+
 @pytest.mark.parametrize("sinks_zero", [True, False])
 @torch.inference_mode()
 def test_prefill_cuda_failure_falls_back_to_triton(

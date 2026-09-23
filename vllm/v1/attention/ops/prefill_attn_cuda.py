@@ -21,7 +21,11 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_PREFILL_CUDA_ENV = os.environ.get("VLLM_DIFFKV_PREFILL_CUDA", "0") == "1"
+# Upstream default off. Default-on after the chained-prefix long-ctx A/B on
+# sm86 TP8: incremental prefill +7.1% @20K, +4.7% @50K, +13.0% @100K,
+# TTFT@100K 37.4 -> 33.1 s (short/mid mixed-bench ~-5% decode; opt out
+# with VLLM_DIFFKV_PREFILL_CUDA=0 for short-ctx latency profiles).
+_PREFILL_CUDA_ENV = os.environ.get("VLLM_DIFFKV_PREFILL_CUDA", "1") != "0"
 
 if _PREFILL_CUDA_ENV:
     # Import-time marker: distinguishes "env set but hook never engaged"
