@@ -1292,9 +1292,11 @@ class MiMoV2OmniForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQ
         # audio items (limit_mm_per_prompt audio=0 or language_model_only):
         # it is never exercised and only costs load time and VRAM. Same
         # gate as nano_nemotron_vl's multimodal weight loading.
-        mm_config = vllm_config.multimodal_config
+        mm_config = vllm_config.model_config.get_multimodal_config()
         audio_needed = audio_config is not None and (
-            mm_config.get_limit_per_prompt("audio") != 0 or mm_config.enable_mm_embeds
+            mm_config is None
+            or mm_config.get_limit_per_prompt("audio") != 0
+            or mm_config.enable_mm_embeds
         )
         if audio_needed:
             with self._mark_tower_model(vllm_config, "audio"):
