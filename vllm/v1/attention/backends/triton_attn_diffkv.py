@@ -96,10 +96,14 @@ class TritonAttentionDiffKVBackend(TritonAttentionBackend):
     # V head dim — set per layer via ``set_head_size_v`` before instantiation.
     head_size_v: int = 128
 
-    # No FP8 / int8 KV cache for the DiffKV path yet; require fp16/bf16/fp32.
+    # Packed DiffKV supports unquantized cache and per-tensor E4M3 scales
+    # (diffbot recipe port of local-inference-lab/vllm #830; sm86 uses the
+    # kernel's LUT dequant path automatically).
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
+        "fp8",
+        "fp8_e4m3",
     ]
 
     @classmethod
@@ -136,10 +140,17 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if is_quantized_kv_cache(self.kv_cache_dtype):
+        # DiffKV dequantizes K/V to the query dtype before its dot products.
+        # Inheriting the parent's CUDA query-quantization flag would instead
+        # quantize Q without supplying a query descale to this implementation.
+        self.supports_quant_query_input = False
+        if is_quantized_kv_cache(self.kv_cache_dtype) and self.kv_cache_dtype not in (
+            "fp8",
+            "fp8_e4m3",
+        ):
             raise NotImplementedError(
-                "TritonAttentionDiffKVBackend does not yet support quantized "
-                f"KV cache (got kv_cache_dtype={self.kv_cache_dtype!r})."
+                "TritonAttentionDiffKVBackend only supports per-tensor E4M3 "
+                f"quantized KV cache (got kv_cache_dtype={self.kv_cache_dtype!r})."
             )
         if self._is_per_token_head_quant:
             raise NotImplementedError(
@@ -217,6 +228,8 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
 
         # Triton DiffKV kernels consume (B, N, H, D) cache views.
         kv_cache = kv_cache.transpose(1, 2)
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            kv_cache = kv_cache.view(self.fp8_dtype)
         key_cache = kv_cache[..., :head_size_qk]
         value_cache = kv_cache[..., head_size_qk : head_size_qk + head_size_v]
 
@@ -241,5 +254,7 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
             softmax_segm_output=attn_metadata.softmax_segm_output,
             softmax_segm_max=attn_metadata.softmax_segm_max,
             softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
+            k_descale=layer._k_scale,
+            v_descale=layer._v_scale,
         )
         return output

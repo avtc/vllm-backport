@@ -78,6 +78,24 @@ _PREFILL_MIN_Q = 64
 _SPEC_3D_BLOCK_M = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_BLOCK_M", "128"))
 _SPEC_3D_NUM_WARPS = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_NUM_WARPS", "8"))
 _SPEC_3D_TILE = int(os.environ.get("VLLM_DIFFKV_SPEC_3D_TILE", "16"))
+# fp8 E4M3 KV dequant strategy: "auto" picks the LUT gather below sm89 and
+# the native in-kernel conversion on sm89+ (Triton cannot lower the native
+# E4M3->fp16/bf16 element conversion on sm80/sm86, see vllm PR #55184).
+# "lut" / "native" force a mode for testing.
+_FP8_DEQUANT_MODE = os.environ.get("VLLM_DIFFKV_FP8_DEQUANT", "auto").lower()
+
+_fp8_e4m3_lut_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+
+def _get_fp8_e4m3_lut(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """256-entry dequant table for E4M3 bytes (sm86-safe gather path)."""
+    key = (str(dtype), device)
+    lut = _fp8_e4m3_lut_cache.get(key)
+    if lut is None:
+        codes = torch.arange(256, dtype=torch.uint8)
+        lut = codes.view(torch.float8_e4m3fn).to(dtype).contiguous().to(device)
+        _fp8_e4m3_lut_cache[key] = lut
+    return lut
 
 
 @triton.jit
@@ -97,6 +115,8 @@ def kernel_unified_attention_diffkv(
     k_descale_ptr,
     v_descale_ptr,
     FP8_KV_CACHE: tl.constexpr,
+    lut_ptr,
+    FP8_LUT: tl.constexpr,
     block_tables_ptr,
     seq_lens_ptr,
     alibi_slopes_ptr,
@@ -259,14 +279,30 @@ def kernel_unified_attention_diffkv(
         # E4M3 -> fp16/bf16 is exact; the per-tensor K/V descales are applied
         # in fp32 on S and acc below (no fp32 staging tile: that pushed
         # BLOCK_M 128 prefill past smem limits).
-        K = K_load.to(Q.dtype)
+        if FP8_LUT:
+            # sm80/sm86: dequantize through a 256-entry fp16 LUT gather
+            # instead of the (unavailable) native element conversion.
+            K = tl.load(
+                lut_ptr + K_load.to(tl.int32),
+                mask=dim_mask_qk[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+        else:
+            K = K_load.to(Q.dtype)
         # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
         V_load = tl.load(
             value_cache_ptr + v_offset,
             mask=dim_mask_v[None, :] & tile_mask[:, None],
             other=0.0,
         )
-        V = V_load.to(Q.dtype)
+        if FP8_LUT:
+            V = tl.load(
+                lut_ptr + V_load.to(tl.int32),
+                mask=dim_mask_v[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+        else:
+            V = V_load.to(Q.dtype)
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = compute_kv_seq_mask(
@@ -475,6 +511,30 @@ def unified_attention_diffkv(
         if k_descale.numel() != 1 or v_descale.numel() != 1:
             raise ValueError("FP8 DiffKV only supports per-tensor K/V scales")
 
+    # sm80/sm86 cannot lower the native E4M3 conversion; dequant through a
+    # 256-entry LUT gather instead (cache reinterpreted as raw bytes).
+    fp8_lut = False
+    lut = None
+    if fp8_kv_cache:
+        mode = _FP8_DEQUANT_MODE
+        if mode == "auto":
+            if q.is_cuda:
+                major, minor = torch.cuda.get_device_capability(q.device)
+                mode = "native" if (major, minor) >= (8, 9) else "lut"
+            else:
+                mode = "native"
+        if mode == "lut":
+            if k.dtype != torch.float8_e4m3fn:
+                raise ValueError(f"LUT dequant requires E4M3 (fn) cache, got {k.dtype}")
+            fp8_lut = True
+            lut = _get_fp8_e4m3_lut(q.device, torch.float16)
+            k = k.view(torch.uint8)
+            v = v.view(torch.uint8)
+        elif mode != "native":
+            raise ValueError(
+                f"VLLM_DIFFKV_FP8_DEQUANT must be auto|lut|native, got {mode!r}"
+            )
+
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
@@ -582,6 +642,8 @@ def unified_attention_diffkv(
         k_descale_ptr=k_descale,
         v_descale_ptr=v_descale,
         FP8_KV_CACHE=fp8_kv_cache,
+        lut_ptr=lut if fp8_lut else q,
+        FP8_LUT=fp8_lut,
         block_tables_ptr=block_table,
         seq_lens_ptr=seqused_k,
         alibi_slopes_ptr=alibi_slopes,

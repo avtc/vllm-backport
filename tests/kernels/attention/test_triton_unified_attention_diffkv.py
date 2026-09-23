@@ -272,6 +272,8 @@ def _run_diffkv(
     seq_threshold_3d: int,
     segments: int,
     out_dtype: torch.dtype,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     cu_query_lens = torch.tensor([0] + [qlen] * len(kv_lens), dtype=torch.int32).cumsum(
         dim=0, dtype=torch.int32
@@ -307,6 +309,8 @@ def _run_diffkv(
         softmax_segm_max=segm_max,
         softmax_segm_expsum=segm_expsum,
         sinks=sinks,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     return out
 
@@ -451,3 +455,161 @@ def test_diffkv_prefill_tiles_vs_ref(
         None,
     )
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+# ---- fp8 E4M3 KV cache (per-tensor scales) ----------------------------------
+#
+# Contract (diffbot recipe): the kernel output on a quantized cache must match
+# a fp32 reference computed on the DEQUANTIZED cache (kernel correctness,
+# budget = max(2x the bf16-cache kernel error, 1e-2)); the quantization error
+# vs the original bf16 cache is informational.  Both dequant strategies are
+# covered: the sm86-safe LUT gather and the sm89+ native conversion.
+
+F8_E4M3 = torch.float8_e4m3fn
+FP8_QUANT_MAX = 448.0
+
+
+def _quant_kv(
+    kv_cache: torch.Tensor,
+    head_size_qk: int,
+    k_scale: float,
+    v_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a bf16 packed cache to E4M3 with per-tensor scales.
+
+    Returns the fp8 cache and its bf16 dequantization.
+    """
+    k8 = (kv_cache[..., :head_size_qk].float() / k_scale).to(F8_E4M3)
+    v8 = (kv_cache[..., head_size_qk:].float() / v_scale).to(F8_E4M3)
+    kv8 = torch.cat([k8, v8], dim=-1)
+    deq = torch.cat([k8.float() * k_scale, v8.float() * v_scale], dim=-1).to(
+        kv_cache.dtype
+    )
+    return kv8, deq
+
+
+FP8_CASES = [
+    # (qlen, sliding_window, sinks, seq_threshold_3d)
+    (1, None, False, 64),  # decode (stock 3D split-KV)
+    (8, None, False, 64),  # spec verify (patched spec-3D launch)
+    (256, None, False, 0),  # prefill chunk (2D + wide-prefill tiles)
+    (8, 128, True, 64),  # SWA + sinks verify
+    (128, 128, True, 0),  # SWA prefill + sinks
+]
+
+
+@pytest.mark.parametrize("num_heads", SPEC3D_NUM_HEADS)
+@pytest.mark.parametrize("dequant_mode", ["lut", "native"])
+@pytest.mark.parametrize("qlen,sliding_window,sinks,seq_threshold_3d", FP8_CASES)
+@pytest.mark.parametrize("scale_mode", ["1.0", "amax"])
+@torch.inference_mode()
+def test_diffkv_fp8_kv_vs_ref(
+    num_heads: tuple[int, int],
+    dequant_mode: str,
+    qlen: int,
+    sliding_window: int | None,
+    sinks: bool,
+    seq_threshold_3d: int,
+    scale_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not current_platform.is_cuda():
+        pytest.skip("CUDA-only kernel")
+    major, minor = torch.cuda.get_device_capability()
+    if dequant_mode == "native" and (major, minor) < (8, 9):
+        pytest.skip("native E4M3 conversion needs sm89+")
+
+    monkeypatch.setattr(_diffkv_module, "_FP8_DEQUANT_MODE", dequant_mode)
+    # Exercise the same launch shapes the split-KV knobs produce on the server.
+    monkeypatch.setattr(_diffkv_module, "_SPEC_3D_MAX_Q", 16)
+    monkeypatch.setattr(_diffkv_module, "_SPEC_3D_BLOCK_M", 128)
+    monkeypatch.setattr(_diffkv_module, "_SPEC_3D_NUM_WARPS", 8)
+    monkeypatch.setattr(_diffkv_module, "_SPEC_3D_TILE", 16)
+    monkeypatch.setattr(_diffkv_module, "_PREFILL_BLOCK_M", 128)
+    monkeypatch.setattr(_diffkv_module, "_PREFILL_NUM_WARPS", 8)
+    monkeypatch.setattr(_diffkv_module, "_PREFILL_NUM_STAGES", 2)
+    monkeypatch.setattr(_diffkv_module, "_PREFILL_TILE", 32)
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+
+    num_query_heads, num_kv_heads = num_heads
+    head_size_qk, head_size_v, block_size = 192, 128, 16
+    kv_lens = [9000, 300, qlen]
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+    sink_t = torch.randn(num_query_heads, dtype=torch.float32) if sinks else None
+
+    num_seqs = len(kv_lens)
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    kv_cache = (
+        torch.randn(
+            4096,
+            block_size,
+            num_kv_heads,
+            head_size_qk + head_size_v,
+            dtype=torch.bfloat16,
+        )
+        * 1.5
+    )
+    block_table = torch.randint(0, 4096, (num_seqs, max_blocks), dtype=torch.int32)
+    query = torch.randn(
+        num_seqs * qlen, num_query_heads, head_size_qk, dtype=torch.bfloat16
+    )
+
+    if scale_mode == "amax":
+        k_scale = kv_cache[..., :head_size_qk].abs().max().item() / FP8_QUANT_MAX
+        v_scale = kv_cache[..., head_size_qk:].abs().max().item() / FP8_QUANT_MAX
+    else:
+        k_scale = v_scale = 1.0
+    kv8, deq = _quant_kv(kv_cache, head_size_qk, k_scale, v_scale)
+    k_descale = torch.tensor([k_scale], dtype=torch.float32)
+    v_descale = torch.tensor([v_scale], dtype=torch.float32)
+
+    common = dict(
+        kv_lens=kv_lens,
+        qlen=qlen,
+        block_table=block_table,
+        num_query_heads=num_query_heads,
+        head_size_qk=head_size_qk,
+        head_size_v=head_size_v,
+        block_size=block_size,
+        window_size=window_size,
+        sinks=sink_t,
+        seq_threshold_3d=seq_threshold_3d,
+        segments=16,
+        out_dtype=torch.bfloat16,
+    )
+    out8 = _run_diffkv(query, kv8, k_descale=k_descale, v_descale=v_descale, **common)
+    base = _run_diffkv(query, kv_cache, **common)
+    ref_deq = _diffkv_fp32_ref(
+        deq,
+        block_table,
+        query,
+        kv_lens,
+        qlen,
+        num_query_heads,
+        head_size_qk**-0.5,
+        block_size,
+        window_size,
+        sink_t,
+    )
+    ref_bf16 = _diffkv_fp32_ref(
+        kv_cache,
+        block_table,
+        query,
+        kv_lens,
+        qlen,
+        num_query_heads,
+        head_size_qk**-0.5,
+        block_size,
+        window_size,
+        sink_t,
+    )
+
+    assert not torch.isnan(out8.float()).any(), "NaN in fp8-KV output"
+    base_err = (base.float() - ref_bf16).abs().max().item()
+    kernel_err = (out8.float() - ref_deq).abs().max().item()
+    assert kernel_err <= max(2 * base_err, 1e-2), (
+        f"fp8 kernel error {kernel_err:.4f} vs dequant ref exceeds budget "
+        f"max(2*{base_err:.4f}, 1e-2)"
+    )
