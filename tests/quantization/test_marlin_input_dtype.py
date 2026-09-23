@@ -58,3 +58,42 @@ def test_marlin_experts_reads_env_at_init(monkeypatch: pytest.MonkeyPatch) -> No
 
     init_src = inspect.getsource(MarlinExperts.__init__)
     assert "get_marlin_input_dtype()" in init_src
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="CUDA-only kernel selection"
+)
+def test_online_fp8_picks_marlin_without_native_fp8() -> None:
+    """Online (dynamically quantized) fp8 linear layers must not select the
+    per-tensor torch fallback on parts without native fp8 (sm86): it accepts
+    the config but never quantizes dynamic activations, producing a
+    bf16 x fp8 matmul crash at runtime. Weight-only Marlin (W8A16) is the
+    supported route there, matching the offline fp8 path."""
+    from vllm.model_executor.kernels.linear.scaled_mm import (
+        MarlinFP8ScaledMMLinearKernel,
+        PerTensorTorchFP8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.layers.quantization.online.fp8 import (
+        Fp8PerTensorOnlineLinearMethod,
+    )
+
+    with torch.device("cuda"), pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "vllm.model_executor.layers.quantization.online.fp8."
+            "cutlass_fp8_supported",
+            lambda: False,
+        )
+        method = Fp8PerTensorOnlineLinearMethod()
+        layer = torch.nn.Module()
+        method.create_weights(
+            layer,
+            input_size_per_partition=1024,
+            output_partition_sizes=[4096],
+            input_size=1024,
+            output_size=4096,
+            params_dtype=torch.bfloat16,
+        )
+        assert not isinstance(
+            method.fp8_linear, PerTensorTorchFP8ScaledMMLinearKernel
+        )
+        assert isinstance(method.fp8_linear, MarlinFP8ScaledMMLinearKernel)
