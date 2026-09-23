@@ -654,31 +654,18 @@ def test_diffkv_fp8_store_matches_reference() -> None:
 
     ref_k = (key / k_scale).to(torch.float8_e4m3fn).view(torch.uint8)
     ref_v = (value / v_scale).to(torch.float8_e4m3fn).view(torch.uint8)
-    mismatches = [
-        i
-        for i, slot in enumerate(slots.tolist())
-        if not torch.equal(
-            cache[slot, i % block_size, :, :head_size_k], ref_k[i]
-        )
-    ]
-    if mismatches:
-        i = mismatches[0]
-        needle = ref_k[i].reshape(-1)
-        # Where did token i's K bytes actually land in the pool?
-        flat = cache.reshape(-1)
-        hits = (flat == needle[0]).nonzero().flatten().tolist()[:8]
-        detail = {
-            "mismatched_tokens": mismatches,
-            "first_bad_token": i,
-            "slot": int(slots[i]),
-            "expected_head0_first6": needle[:6].tolist(),
-            "got_at_expected_pos": cache[int(slots[i]), i % block_size, 0, :6]
-            .tolist(),
-            "first_byte_found_at_flat": hits,
-        }
-        raise AssertionError(f"fp8 store mismatch: {detail}")
+    # slot_mapping carries FLAT slots into the [num_blocks, block_size] pool:
+    # block = slot // block_size, offset = slot % block_size.
+    def slot_pos(flat_slot: int) -> tuple[int, int]:
+        return flat_slot // block_size, flat_slot % block_size
+
     for i, slot in enumerate(slots.tolist()):
-        got_v = cache[slot, i % block_size, :, head_size_k:]
+        blk, off = slot_pos(slot)
+        got_k = cache[blk, off, :, :head_size_k]
+        got_v = cache[blk, off, :, head_size_k:]
+        assert torch.equal(got_k, ref_k[i]), (
+            f"K bytes mismatch at token {i} (slot {slot} -> block {blk} off {off})"
+        )
         assert torch.equal(got_v, ref_v[i]), f"V bytes mismatch at token {i}"
 
 
@@ -723,7 +710,8 @@ def test_diffkv_fp8_prefill_wide_tile_lut_fits_sm86() -> None:
         ],
         dim=-1,
     )
-    block_table = torch.randint(0, 4096, (1, seq_len // block_size), dtype=torch.int32)
+    num_blocks = (seq_len + block_size - 1) // block_size
+    block_table = torch.randint(0, 4096, (1, num_blocks), dtype=torch.int32)
     query = torch.randn(qlen, num_query_heads, head_size_qk, dtype=torch.bfloat16)
 
     out = _run_diffkv(
