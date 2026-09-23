@@ -63,13 +63,16 @@ __device__ __forceinline__ uint32_t e4m3_to_f16(uint16_t x) {
   if (e == 15 && m == 7) return s | 0x7e00;        // NaN (0x7F / 0xFF)
   return s | ((e + 8) << 10) | (m << 7);           // bias 7 -> 15, mantissa 3 -> 10
 }
-// 8 fp8 (uint2) -> 8 fp16 (uint4)
+// 8 fp8 (one uint2: v.x = bytes 0-3, v.y = bytes 4-7, little-endian)
+// -> 8 fp16 (uint4 of four half2 words, element order preserved).
 __device__ __forceinline__ uint4 fp8x8_to_f16x8(uint2 v) {
   uint4 o;
-  const uint16_t* h = reinterpret_cast<const uint16_t*>(&v);
   uint16_t r[8];
 #pragma unroll
-  for (int i = 0; i < 8; ++i) r[i] = (uint16_t)e4m3_to_f16(h[i]);
+  for (int j = 0; j < 4; ++j) {
+    r[j] = (uint16_t)e4m3_to_f16((v.x >> (8 * j)) & 0xFF);
+    r[4 + j] = (uint16_t)e4m3_to_f16((v.y >> (8 * j)) & 0xFF);
+  }
   o.x = (uint32_t)r[0] | ((uint32_t)r[1] << 16);
   o.y = (uint32_t)r[2] | ((uint32_t)r[3] << 16);
   o.z = (uint32_t)r[4] | ((uint32_t)r[5] << 16);
