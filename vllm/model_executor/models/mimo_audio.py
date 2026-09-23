@@ -26,7 +26,91 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
+from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _audio_tower_tp_for_dims(world: int, dims: tuple[int, ...], enabled: bool) -> int:
+    """TP size for the audio tower's large linears: the full tensor-parallel
+    world size when every dim in ``dims`` divides it, else 1 (replicated).
+
+    Partial subgroups are deliberately not supported: RowParallelLinear
+    reduces over the global TP group, so a tp_size smaller than the world
+    size would double-count replicas.
+    """
+    if not enabled or world <= 1:
+        return 1
+    if all(d % world == 0 for d in dims):
+        return world
+    logger.warning(
+        "VLLM_MIMO_AUDIO_TOWER_TP=1 but dims %s are not divisible by TP=%d;"
+        " audio tower linears stay replicated",
+        dims,
+        world,
+    )
+    return 1
+
+
+def audio_tower_tp_size(dims: tuple[int, ...]) -> int:
+    """Env-gated (VLLM_MIMO_AUDIO_TOWER_TP=1) TP sharding decision for the
+    audio tower. Default off: plain replicated nn.Linear, byte-identical to
+    upstream behavior."""
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    enabled = os.environ.get("VLLM_MIMO_AUDIO_TOWER_TP", "0") == "1"
+    return _audio_tower_tp_for_dims(
+        get_tensor_model_parallel_world_size(), dims, enabled
+    )
+
+
+def _shard_state_dict_for_rank(
+    model: nn.Module, state_dict: dict, tp_rank: int
+) -> dict:
+    """Slice full (unsharded) audio-tokenizer tensors to the shapes a possibly
+    TP-sharded ``model`` expects. Column-parallel params lose rows (and their
+    1-D biases shrink), row-parallel params lose columns; everything else must
+    already match and passes through. Self-describing via shape ratios, so no
+    name maps are needed."""
+    params = dict(model.named_parameters())
+    sharded = {}
+    for key, tensor in state_dict.items():
+        param = params.get(key)
+        if param is None or tuple(param.shape) == tuple(tensor.shape):
+            sharded[key] = tensor
+            continue
+        pshape, tshape = tuple(param.shape), tuple(tensor.shape)
+        if tensor.dim() == 1 and pshape[0] < tshape[0]:
+            factor = tshape[0] // pshape[0]
+            if pshape[0] * factor == tshape[0]:
+                sharded[key] = tensor.narrow(
+                    0, (tp_rank % factor) * pshape[0], pshape[0]
+                )
+                continue
+        elif tensor.dim() >= 2:
+            if pshape[1] == tshape[1] and pshape[0] < tshape[0]:
+                factor = tshape[0] // pshape[0]
+                if pshape[0] * factor == tshape[0]:
+                    sharded[key] = tensor.narrow(
+                        0, (tp_rank % factor) * pshape[0], pshape[0]
+                    )
+                    continue
+            if pshape[0] == tshape[0] and pshape[1] < tshape[1]:
+                factor = tshape[1] // pshape[1]
+                if pshape[1] * factor == tshape[1]:
+                    sharded[key] = tensor.narrow(
+                        1, (tp_rank % factor) * pshape[1], pshape[1]
+                    )
+                    continue
+        raise RuntimeError(
+            f"audio tokenizer weight {key}: cannot shard checkpoint shape "
+            f"{tshape} into parameter shape {pshape} for tp_rank {tp_rank}"
+        )
+    return sharded
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +754,7 @@ class AudioEncoderAttention(nn.Module):
         num_heads: int,
         window_size: tuple[int, int] = (-1, -1),
         causal: bool = False,
+        tp_size: int = 1,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -677,11 +762,28 @@ class AudioEncoderAttention(nn.Module):
         self.head_dim = embed_dim // num_heads
         self.window_size = window_size
         self.causal = causal
+        self.tp_size = tp_size
 
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        if tp_size > 1:
+            # Head-sharded attention: q/k/v column-parallel (local heads),
+            # out_proj row-parallel over the local head slice + all-reduce.
+            self.k_proj = ColumnParallelLinear(
+                embed_dim, embed_dim, bias=False, return_bias=False
+            )
+            self.v_proj = ColumnParallelLinear(
+                embed_dim, embed_dim, bias=True, return_bias=False
+            )
+            self.q_proj = ColumnParallelLinear(
+                embed_dim, embed_dim, bias=True, return_bias=False
+            )
+            self.out_proj = RowParallelLinear(
+                embed_dim, embed_dim, bias=True, return_bias=False
+            )
+        else:
+            self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+            self.v_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+            self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+            self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
 
     def forward(
         self,
@@ -693,13 +795,14 @@ class AudioEncoderAttention(nn.Module):
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 
         bsz, _ = hidden_states.size()
+        num_heads = self.num_heads // self.tp_size
 
         query_states = self.q_proj(hidden_states).view(
-            bsz, self.num_heads, self.head_dim
+            bsz, num_heads, self.head_dim
         )
-        key_states = self.k_proj(hidden_states).view(bsz, self.num_heads, self.head_dim)
+        key_states = self.k_proj(hidden_states).view(bsz, num_heads, self.head_dim)
         value_states = self.v_proj(hidden_states).view(
-            bsz, self.num_heads, self.head_dim
+            bsz, num_heads, self.head_dim
         )
 
         if rope_position_embeddings is not None:
@@ -720,7 +823,7 @@ class AudioEncoderAttention(nn.Module):
             window_size=list(self.window_size),
         )
 
-        attn_output = attn_output.reshape(bsz, self.embed_dim)
+        attn_output = attn_output.reshape(bsz, self.embed_dim // self.tp_size)
         attn_output = self.out_proj(attn_output)
         return attn_output
 
@@ -731,6 +834,7 @@ class AudioEncoderTransformerLayer(nn.Module):
         config: MiMoAudioTokenizerConfig,
         causal: bool,
         attn_window_size: tuple[int, int] = (-1, -1),
+        tp_size: int = 1,
     ):
         super().__init__()
         self.embed_dim = config.d_model
@@ -740,12 +844,27 @@ class AudioEncoderTransformerLayer(nn.Module):
             num_heads=config.encoder_attention_heads,
             window_size=attn_window_size,
             causal=causal,
+            tp_size=tp_size,
         )
         self.self_attn_layer_norm = LAYER_NORM[config.ln_type](self.embed_dim)
 
         self.activation_fn = ACT2FN[config.activation_function]
-        self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
-        self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
+        if tp_size > 1:
+            self.fc1 = ColumnParallelLinear(
+                self.embed_dim,
+                config.encoder_ffn_dim,
+                bias=True,
+                return_bias=False,
+            )
+            self.fc2 = RowParallelLinear(
+                config.encoder_ffn_dim,
+                self.embed_dim,
+                bias=True,
+                return_bias=False,
+            )
+        else:
+            self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
+            self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = LAYER_NORM[config.ln_type](self.embed_dim)
 
     def forward(
@@ -778,9 +897,19 @@ class AudioEncoder(nn.Module):
     def __init__(
         self,
         config: MiMoAudioTokenizerConfig,
+        tp_size: int | None = None,
     ):
         super().__init__()
         self.config = config
+        if tp_size is None:
+            tp_size = audio_tower_tp_size(
+                (
+                    config.d_model,
+                    config.encoder_attention_heads,
+                    config.encoder_ffn_dim,
+                )
+            )
+        self.tp_size = tp_size
         self.max_source_positions = (
             config.max_audio_seconds * config.sampling_rate // config.hop_length
         ) // config.stride_size
@@ -831,6 +960,7 @@ class AudioEncoder(nn.Module):
                     config=config,
                     causal=config.encoder_causal,
                     attn_window_size=attn_window_sizes[i],
+                    tp_size=tp_size,
                 )
                 for i in range(config.encoder_layers)
             ]
@@ -1157,13 +1287,25 @@ class AudioProjection(nn.Module):
         input_size: int,
         hidden_size: int,
         output_size: int,
+        tp_size: int = 1,
     ) -> None:
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_size, hidden_size, bias=False),
-            nn.GELU(),
-            nn.Linear(hidden_size, output_size, bias=False),
-        )
+        if tp_size > 1:
+            self.mlp = nn.Sequential(
+                ColumnParallelLinear(
+                    input_size, hidden_size, bias=False, return_bias=False
+                ),
+                nn.GELU(),
+                RowParallelLinear(
+                    hidden_size, output_size, bias=False, return_bias=False
+                ),
+            )
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(input_size, hidden_size, bias=False),
+                nn.GELU(),
+                nn.Linear(hidden_size, output_size, bias=False),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.mlp(x)
@@ -1227,17 +1369,27 @@ class MimoAudioEncoder(nn.Module):
             ]
         )
 
+        proj_in = config.input_local_dim * config.group_size
+        proj_tp = audio_tower_tp_size(
+            (proj_in, proj_in * 4, config.out_hidden_size)
+        )
         if config.projection_layers == 1:
-            self.projection = nn.Linear(
-                config.input_local_dim * config.group_size,
-                config.out_hidden_size,
-                bias=False,
-            )
+            if proj_tp > 1:
+                self.projection = ColumnParallelLinear(
+                    proj_in, config.out_hidden_size, bias=False, return_bias=False
+                )
+            else:
+                self.projection = nn.Linear(
+                    proj_in,
+                    config.out_hidden_size,
+                    bias=False,
+                )
         elif config.projection_layers == 2:
             self.projection = AudioProjection(
-                config.input_local_dim * config.group_size,
-                config.input_local_dim * config.group_size * 4,
+                proj_in,
+                proj_in * 4,
                 config.out_hidden_size,
+                tp_size=proj_tp,
             )
         else:
             raise ValueError(f"Invalid projection_layers: {config.projection_layers}")
@@ -1277,6 +1429,9 @@ class MimoAudioEncoder(nn.Module):
                 f"No model weights found in {path} "
                 "(expected model.safetensors or pytorch_model.bin)"
             )
+        state_dict = _shard_state_dict_for_rank(
+            model, state_dict, get_tensor_model_parallel_rank()
+        )
         model.load_state_dict(state_dict, strict=False)
         model = model.to(device=device, dtype=torch.bfloat16)
         model.eval()
