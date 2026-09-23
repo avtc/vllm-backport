@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -267,11 +268,26 @@ class MiMoV2Attention(nn.Module):
             v_head_size=self.v_head_dim,
         )
 
+        # VLLM_MIMO_OPROJ_FP8=1 quantizes the checkpoint's bf16 o_proj to
+        # FP8 at load (per-tensor W, dynamic activations). The o_proj layers
+        # are on the checkpoint's fp8 ignore list (bf16) and the decode GEMM
+        # is memory-bound, so halving the weights wins (~1.25 ms/pass bf16
+        # per the diffbot profile; +2-4% decode on sm120, Marlin W8A16 on
+        # sm86). Ported from the diffbot recipe mimo_v2.patch.
+        o_proj_quant_config = quant_config
+        if os.environ.get("VLLM_MIMO_OPROJ_FP8", "0") == "1":
+            from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+            o_proj_quant_config = Fp8Config(
+                is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config if "mtp.layers" not in prefix else None,
+            quant_config=o_proj_quant_config
+            if "mtp.layers" not in prefix
+            else None,
             reduce_results=True,
             prefix=f"{prefix}.o_proj",
         )

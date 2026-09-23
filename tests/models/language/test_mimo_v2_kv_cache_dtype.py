@@ -197,3 +197,22 @@ def test_mtp_layer_cache_config_optional(
         quant_config=None,
     )
     assert layer.self_attn.attn.kv_cache_torch_dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("env,expected_online", [("1", True), ("0", False)])
+def test_mimo_oproj_fp8_env(
+    tp1_env, default_vllm_config, fake_vllm_config, monkeypatch, env, expected_online
+):
+    """VLLM_MIMO_OPROJ_FP8=1 swaps the decoder o_proj to online per-tensor
+    FP8 (Marlin W8A16 on sm86); off keeps the checkpoint quant config."""
+    from vllm.model_executor.layers.quantization.online.fp8 import (
+        Fp8PerTensorOnlineLinearMethod,
+    )
+
+    monkeypatch.setenv("VLLM_MIMO_OPROJ_FP8", env)
+    cfg = fake_vllm_config("fp8")
+    layer = MiMoV2FlashDecoderLayer(vllm_config=cfg, prefix="model.layers.0")
+    is_online = isinstance(
+        layer.self_attn.o_proj.quant_method, Fp8PerTensorOnlineLinearMethod
+    )
+    assert is_online == expected_online
