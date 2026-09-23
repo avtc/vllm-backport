@@ -28,6 +28,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.models.mimo_v2 import MiMoV2FlashDecoderLayer
 from vllm.model_executor.models.mimo_v2_mtp import MiMoV2MTPLayer
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 
 def _hf_config() -> SimpleNamespace:
@@ -102,7 +103,14 @@ def fake_vllm_config(monkeypatch):
             ),
             quant_config=None,
             cache_config=SimpleNamespace(
-                cache_dtype=cache_dtype, kv_cache_dtype_skip_layers=[]
+                cache_dtype=cache_dtype,
+                kv_cache_dtype_skip_layers=[],
+                # MiMo's window lives in hf sliding_window_size, so the
+                # model-level sentinel stays -1 here (and must resolve to
+                # full attention, not a window of -1).
+                sliding_window=-1,
+                block_size=16,
+                skip_page_size_padded=None,
             ),
             attention_config=SimpleNamespace(backend=_FakeDiffKV()),
         )
@@ -133,6 +141,25 @@ def test_decoder_layer_threads_cache_dtype(
     cfg = fake_vllm_config(cache_dtype)
     layer = MiMoV2FlashDecoderLayer(vllm_config=cfg, prefix=prefix)
     assert layer.self_attn.attn.kv_cache_torch_dtype == expected
+
+
+def test_full_attention_layer_is_not_windowed(tp1_env, default_vllm_config,
+                                               fake_vllm_config):
+    """Regression: threading cache_config must not turn the full-attention
+    layers into sliding-window layers via the model-level -1 sentinel.
+    A SlidingWindowSpec(-1) both mis-prices the pool (capacity explodes as
+    ~1/max_in_flight) and window-masks the global layers (garbage output)."""
+    cfg = fake_vllm_config("fp8")
+    full = MiMoV2FlashDecoderLayer(vllm_config=cfg, prefix="model.layers.0")
+    swa = MiMoV2FlashDecoderLayer(vllm_config=cfg, prefix="model.layers.1")
+    assert full.self_attn.attn.sliding_window is None
+    assert swa.self_attn.attn.sliding_window == 4
+    full_spec = full.self_attn.attn.get_kv_cache_spec(cfg)
+    swa_spec = swa.self_attn.attn.get_kv_cache_spec(cfg)
+    assert isinstance(full_spec, FullAttentionSpec)
+    assert isinstance(swa_spec, SlidingWindowSpec)
+    assert swa_spec.sliding_window == 4
+    assert full_spec.dtype == torch.uint8 and swa_spec.dtype == torch.uint8
 
 
 @pytest.mark.parametrize("cache_dtype,expected", [
