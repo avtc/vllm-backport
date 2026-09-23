@@ -192,22 +192,44 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
         # The fused rope+cache path assumes the standard 2-tensor layout.
         return False
 
+    # Latched at first qualifying forward (weights are loaded by then):
+    # True once the layer's sink values are proven all-zero, False if not.
+    _prefill_cuda_sinks_zero: bool | None = None
+
     def _use_prefill_cuda(
         self, num_actual_tokens: int, head_size_qk: int, head_size_v: int
     ) -> bool:
         """Route global-layer prefill to the CUDA kernel when configured.
 
-        Only full-attention layers (no window, no sinks) with the MiMo TP8
-        per-rank shape (8 Q heads, K 192 / V 128, 1 KV head) qualify; decode,
-        spec-decode verify and SWA layers keep the Triton path.
+        Only full-attention layers with the MiMo TP8 per-rank shape (8 Q
+        heads, K 192 / V 128, 1 KV head) qualify; decode, spec-decode verify
+        and SWA layers keep the Triton path. Full attention is the parent
+        impl's (-1, -1) window tuple (never None). The CUDA kernel has no
+        sink support: with add_swa_attention_sink_bias the checkpoint hands
+        a sink Parameter to every layer, so a layer qualifies only when its
+        sink values are provably all-zero (add_full_attention_sink_bias is
+        false, i.e. global layers carry inert zero sinks) — checked once and
+        latched at first use, after weights load.
         """
         from vllm.v1.attention.ops.prefill_attn_cuda import prefill_cuda_enabled
 
+        if not prefill_cuda_enabled():
+            return False
+        if self.sliding_window != (-1, -1):
+            return False
+        if self.sinks is not None:
+            if self._prefill_cuda_sinks_zero is None:
+                self._prefill_cuda_sinks_zero = bool((self.sinks == 0).all())
+                if not self._prefill_cuda_sinks_zero:
+                    logger.warning_once(
+                        "prefill_attn_sm86: layer %s has non-zero sinks; "
+                        "keeping Triton prefill for it",
+                        getattr(self, "layer_name", "<unknown>"),
+                    )
+            if not self._prefill_cuda_sinks_zero:
+                return False
         return (
-            prefill_cuda_enabled()
-            and self.sliding_window is None
-            and self.sinks is None
-            and num_actual_tokens > 16
+            num_actual_tokens > 16
             and self.num_heads == 8
             and self.num_kv_heads == 1
             and head_size_qk == 192

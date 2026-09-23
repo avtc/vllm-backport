@@ -841,20 +841,44 @@ def test_prefill_attn_cuda_sm86_vs_ref(kv_dtype: str) -> None:
     assert err <= 5e-2, f"CUDA prefill err {err:.4f}"
 
 
+def _make_diffkv_impl_for_prefill_cuda(sinks: torch.Tensor | None):
+    """Impl mirroring production global-layer attrs: full-attention layers
+    carry the (-1, -1) window tuple (the parent impl never stores None) and,
+    with add_swa_attention_sink_bias, a sink Parameter (zeros for global
+    layers since add_full_attention_sink_bias is false)."""
+    from vllm.v1.attention.backends.triton_attn_diffkv import (
+        TritonAttentionDiffKVImpl,
+    )
+
+    impl = object.__new__(TritonAttentionDiffKVImpl)
+    impl.kv_cache_dtype = "auto"
+    impl.head_size = 192
+    impl.sliding_window = (-1, -1)
+    impl.sinks = sinks
+    impl.num_heads = 8
+    impl.num_kv_heads = 1
+    impl.scale = 192**-0.5
+    impl.alibi_slopes = None
+    impl.use_alibi_sqrt = False
+    impl.logits_soft_cap = None
+    return impl
+
+
+@pytest.mark.parametrize("sinks_zero", [True, False])
 @torch.inference_mode()
-def test_prefill_cuda_failure_falls_back_to_triton(caplog) -> None:
+def test_prefill_cuda_failure_falls_back_to_triton(
+    caplog, sinks_zero: bool
+) -> None:
     """If the JIT CUDA prefill kernel raises, forward must fall back to the
     Triton path, produce identical output, and log the failure with a full
-    traceback (debug) + one-shot warning."""
+    traceback (debug) + one-shot warning. With non-zero sinks the hook must
+    not engage at all (the CUDA kernel has no sink support)."""
     if not current_platform.is_cuda():
         pytest.skip("CUDA-only kernel")
     import logging
     from types import SimpleNamespace
 
     import vllm.v1.attention.ops.prefill_attn_cuda as pac
-    from vllm.v1.attention.backends.triton_attn_diffkv import (
-        TritonAttentionDiffKVImpl,
-    )
 
     torch.set_default_device(DEVICE_TYPE)
     set_random_seed(0)
@@ -888,24 +912,15 @@ def test_prefill_cuda_failure_falls_back_to_triton(caplog) -> None:
         use_cascade=False,
     )
 
-    impl = object.__new__(TritonAttentionDiffKVImpl)
-    impl.kv_cache_dtype = "auto"
-    impl.head_size = DK
-    impl.sliding_window = None
-    impl.sinks = None
-    impl.num_heads = HQ
-    impl.num_kv_heads = HKV
-    impl.scale = DK**-0.5
-    impl.alibi_slopes = None
-    impl.use_alibi_sqrt = False
-    impl.logits_soft_cap = None
+    sinks = (
+        torch.zeros(HQ, dtype=torch.bfloat16) if sinks_zero
+        else torch.full((HQ,), 0.5, dtype=torch.bfloat16)
+    )
+    impl = _make_diffkv_impl_for_prefill_cuda(sinks)
     layer = SimpleNamespace(_k_scale=None, _v_scale=None)
 
     with (
-        caplog.at_level(
-            logging.DEBUG,
-            logger=TritonAttentionDiffKVImpl.__module__,
-        ),
+        caplog.at_level(logging.DEBUG, logger=impl.__module__),
         pytest.MonkeyPatch.context() as mp,
     ):
         mp.setattr(pac, "prefill_cuda_enabled", lambda: True)
@@ -917,10 +932,20 @@ def test_prefill_cuda_failure_falls_back_to_triton(caplog) -> None:
         impl.forward(layer, q, q[..., :DV], q[..., :DV], kv, meta, out)
 
     ref = _run_diffkv(
-        q, kv, kv_lens, qlen, bt, HQ, DK, DV, BS, (None, None), None, 1, 16,
+        q, kv, kv_lens, qlen, bt, HQ, DK, DV, BS, (None, None), sinks, 1, 16,
         torch.bfloat16,
     )
     assert not torch.isnan(out.float()).any()
     torch.testing.assert_close(out.float(), ref.float(), atol=0, rtol=0)
-    assert "boom" in caplog.text, "failure traceback must reach the log"
-    assert any("prefill_attn_sm86 failed" in r.message for r in caplog.records)
+    if sinks_zero:
+        assert "boom" in caplog.text, "failure traceback must reach the log"
+        assert any(
+            "prefill_attn_sm86 failed" in r.message for r in caplog.records
+        )
+    else:
+        # hook must not engage: no kernel failure, no fallback warning; only
+        # the (per-layer, one-shot) non-zero-sinks notice may appear
+        assert "boom" not in caplog.text
+        assert not any(
+            "prefill_attn_sm86 failed" in r.message for r in caplog.records
+        )
