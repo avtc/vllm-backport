@@ -23,6 +23,15 @@ logger = init_logger(__name__)
 
 _PREFILL_CUDA_ENV = os.environ.get("VLLM_DIFFKV_PREFILL_CUDA", "0") == "1"
 
+if _PREFILL_CUDA_ENV:
+    # Import-time marker: distinguishes "env set but hook never engaged"
+    # (shape/layer conditions failed) from "env unset or code absent".
+    logger.info(
+        "VLLM_DIFFKV_PREFILL_CUDA=1: CUDA prefill kernel enabled "
+        "(JIT-compiles on first qualifying prefill; look for "
+        "'JIT-compiled prefill_attn_sm86')"
+    )
+
 
 def prefill_cuda_enabled() -> bool:
     return _PREFILL_CUDA_ENV
