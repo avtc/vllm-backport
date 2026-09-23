@@ -60,8 +60,9 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
         # (q=8) per layer vs stock 16 on 46K-180K contexts. SWA groups keep
         # the stock count (their loops are window-bounded). Stock-off
         # default: unset keeps the stock 16 segments; set
-        # VLLM_DIFFKV_FULL_ATTN_SEGMENTS=64 on the server to enable.
-        full_attn_segments = int(os.environ.get("VLLM_DIFFKV_FULL_ATTN_SEGMENTS", "16"))
+        full_attn_segments = int(
+            os.environ.get("VLLM_DIFFKV_FULL_ATTN_SEGMENTS", "64")
+        )
         if (
             getattr(kv_cache_spec, "sliding_window", None) is None
             and full_attn_segments > self.num_par_softmax_segments

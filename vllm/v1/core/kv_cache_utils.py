@@ -2328,32 +2328,6 @@ def update_kv_cache_capacity(
         f"{max_model_len:,}",
         max_concurrency,
     )
-    # Debug receipt for capacity accounting (hybrid/quantized pools):
-    # log every group's spec shape so an impossible capacity line can be
-    # attributed without a debugger. Gated by VLLM_LOG_KV_CAPACITY_SPECS.
-    if os.environ.get("VLLM_LOG_KV_CAPACITY_SPECS", "0") == "1":
-        for gi, group in enumerate(kv_cache_config.kv_cache_groups):
-            spec = group.kv_cache_spec
-            logger.info_once(
-                "KV capacity spec group %d: type=%s block_size=%s "
-                "page_size_bytes=%s num_layers=%s dtype=%s "
-                "max_memory_usage_bytes=%s",
-                gi,
-                type(spec).__name__,
-                getattr(spec, "block_size", None),
-                spec.page_size_bytes,
-                len(getattr(group, "layer_names", []) or []),
-                getattr(spec, "dtype", None),
-                spec.max_memory_usage_bytes(vllm_config),
-            )
-        logger.info_once(
-            "KV capacity pool: num_blocks=%s bytes_per_block=%s "
-            "available check via _pool_bytes_per_block",
-            kv_cache_config.num_blocks,
-            _pool_bytes_per_block(kv_cache_config.kv_cache_groups),
-        )
-
-
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],

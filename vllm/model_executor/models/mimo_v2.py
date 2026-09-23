@@ -274,20 +274,22 @@ class MiMoV2Attention(nn.Module):
         # is memory-bound, so halving the weights wins (~1.25 ms/pass bf16
         # per the diffbot profile; +2-4% decode on sm120, Marlin W8A16 on
         # sm86). Ported from the diffbot recipe mimo_v2.patch.
-        o_proj_quant_config = quant_config
-        if os.environ.get("VLLM_MIMO_OPROJ_FP8", "0") == "1":
+        # Online fp8 o_proj is on by default (+7-19% decode measured on
+        # sm86 TP8; W8A16 Marlin below sm89, dynamic fp8 above). Set
+        # VLLM_MIMO_OPROJ_FP8=0 to keep the checkpoint's bf16 o_proj.
+        if os.environ.get("VLLM_MIMO_OPROJ_FP8", "1") != "0":
             from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-            # The env is not part of the torch-compile cache key: a cache
-            # from a run with this env unset holds plain-F.linear graphs for
-            # o_proj and crashes at first prefill against the int Marlin
-            # weight (mm: BFloat16 != int). Clear
-            # ~/.cache/vllm/torch_compile_cache when toggling this flag.
-            logger.warning_once(
-                "VLLM_MIMO_OPROJ_FP8=1: online fp8 o_proj enabled; a "
-                "torch_compile_cache from a run without this env must be "
-                "removed or the first prefill will crash"
-            )
+            if os.environ.get("VLLM_MIMO_OPROJ_FP8") is not None:
+                # Explicit toggle: the env is not part of the torch-compile
+                # cache key, so graphs from a run with the other setting
+                # replay stale F.linear-vs-Marlin code and crash at first
+                # prefill. Clear ~/.cache/vllm/torch_compile_cache.
+                logger.warning_once(
+                    "VLLM_MIMO_OPROJ_FP8 explicitly set: remove "
+                    "~/.cache/vllm/torch_compile_cache if this differs from "
+                    "the previous run's setting"
+                )
             o_proj_quant_config = Fp8Config(
                 is_checkpoint_fp8_serialized=False, activation_scheme="dynamic"
             )
