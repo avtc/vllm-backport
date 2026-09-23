@@ -278,11 +278,12 @@ class MiMoV2Attention(nn.Module):
         # lossy (per-tensor fp8 weights; GSM8K parity measured: 82.7% vs
         # 82.0% bf16, full test set) — quality-neutral but not bit-exact.
         # Measured on sm86 TP8 MNBT 1024: +7-19% decode (149 -> 176.9 TG/s
-        # @33K), +8% prefill @33K; W8A16 Marlin below sm89, dynamic fp8
-        # above. At MNBT >= 2048 Marlin loses to bf16 cuBLAS (-0.5..-3.8%
-        # prefill) — pair with small chunk budgets. When toggling, clear
-        # ~/.cache/vllm/torch_compile_cache (env is not part of the compile
-        # cache key; stale graphs crash at first prefill).
+        # @33K), +9% prefill @33K (1689 -> 1841 PP/s); W8A16 Marlin below
+        # sm89, dynamic fp8 above. At MNBT >= 2048 Marlin loses to bf16
+        # cuBLAS (-0.5..-3.8% prefill) — pair with small chunk budgets. When
+        # toggling, clear ~/.cache/vllm/torch_compile_cache (env is not part
+        # of the compile cache key; stale graphs crash at first prefill).
+        o_proj_quant_config = None
         if os.environ.get("VLLM_MIMO_OPROJ_FP8", "0") == "1":
             from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
