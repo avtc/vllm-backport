@@ -11,6 +11,8 @@ dtype) specs: fp8 kernels ran on a bf16-sized allocation — correct output,
 same token capacity, half of every cache row dead.
 """
 
+import os
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +20,12 @@ import torch
 
 import vllm.model_executor.layers.attention.attention as attention_module
 import vllm.model_executor.models.mimo_v2 as mimo_v2_module
+from vllm.distributed import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm.model_executor.models.mimo_v2 import MiMoV2FlashDecoderLayer
 from vllm.model_executor.models.mimo_v2_mtp import MiMoV2MTPLayer
 
@@ -64,6 +72,24 @@ class _FakeDiffKV:
 
 
 @pytest.fixture()
+def tp1_env():
+    """Single-rank tensor-parallel group for the parallel-linear weights."""
+    destroy_model_parallel()
+    destroy_distributed_environment()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"file://{os.path.join(tmpdir, 'dist')}",
+        )
+        initialize_model_parallel(tensor_model_parallel_size=1)
+        yield
+    destroy_model_parallel()
+    destroy_distributed_environment()
+
+
+@pytest.fixture()
 def fake_vllm_config(monkeypatch):
     def build(cache_dtype: str) -> SimpleNamespace:
         cfg = SimpleNamespace(
@@ -76,6 +102,8 @@ def fake_vllm_config(monkeypatch):
             ),
             attention_config=SimpleNamespace(backend=_FakeDiffKV()),
         )
+        # Modules under test see the fake; CustomOps keep whatever real
+        # config the default_vllm_config fixture installs.
         monkeypatch.setattr(
             mimo_v2_module, "get_current_vllm_config", lambda: cfg
         )
@@ -93,7 +121,8 @@ def fake_vllm_config(monkeypatch):
 ])
 @pytest.mark.parametrize("prefix", ["model.layers.0", "model.layers.1"])
 def test_decoder_layer_threads_cache_dtype(
-    fake_vllm_config, cache_dtype: str, expected: torch.dtype, prefix: str
+    tp1_env, default_vllm_config, fake_vllm_config,
+    cache_dtype: str, expected: torch.dtype, prefix: str
 ):
     """Both the full-attention and SWA branches resolve the spec dtype from
     cache_config.cache_dtype, not from the model dtype."""
@@ -107,7 +136,8 @@ def test_decoder_layer_threads_cache_dtype(
     ("auto", torch.bfloat16),
 ])
 def test_mtp_layer_threads_cache_dtype(
-    fake_vllm_config, cache_dtype: str, expected: torch.dtype
+    default_vllm_config, fake_vllm_config,
+    cache_dtype: str, expected: torch.dtype
 ):
     """The MTP predictor layer shares the same cache dtype as the target."""
     cfg = fake_vllm_config(cache_dtype)
@@ -120,7 +150,7 @@ def test_mtp_layer_threads_cache_dtype(
     assert layer.self_attn.attn.kv_cache_torch_dtype == expected
 
 
-def test_mtp_layer_cache_config_optional(fake_vllm_config):
+def test_mtp_layer_cache_config_optional(default_vllm_config, fake_vllm_config):
     """Omitting cache_config keeps the old behavior (auto)."""
     cfg = fake_vllm_config("fp8")
     layer = MiMoV2MTPLayer(
