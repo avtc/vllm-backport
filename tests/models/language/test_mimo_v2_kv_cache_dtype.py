@@ -96,7 +96,9 @@ def fake_vllm_config(monkeypatch):
     def build(cache_dtype: str) -> SimpleNamespace:
         cfg = SimpleNamespace(
             model_config=SimpleNamespace(
-                hf_text_config=_hf_config(), dtype=torch.bfloat16
+                hf_text_config=_hf_config(),
+                dtype=torch.bfloat16,
+                is_mm_prefix_lm=False,
             ),
             quant_config=None,
             cache_config=SimpleNamespace(
