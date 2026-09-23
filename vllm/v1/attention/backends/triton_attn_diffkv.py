@@ -192,6 +192,28 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
         # The fused rope+cache path assumes the standard 2-tensor layout.
         return False
 
+    def _use_prefill_cuda(
+        self, num_actual_tokens: int, head_size_qk: int, head_size_v: int
+    ) -> bool:
+        """Route global-layer prefill to the CUDA kernel when configured.
+
+        Only full-attention layers (no window, no sinks) with the MiMo TP8
+        per-rank shape (8 Q heads, K 192 / V 128, 1 KV head) qualify; decode,
+        spec-decode verify and SWA layers keep the Triton path.
+        """
+        from vllm.v1.attention.ops.prefill_attn_cuda import prefill_cuda_enabled
+
+        return (
+            prefill_cuda_enabled()
+            and self.sliding_window is None
+            and self.sinks is None
+            and num_actual_tokens > 16
+            and self.num_heads == 8
+            and self.num_kv_heads == 1
+            and head_size_qk == 192
+            and head_size_v == 128
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -230,6 +252,45 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         head_size_qk = self.head_size
         head_size_v = TritonAttentionDiffKVBackend.head_size_v
+
+        if self._use_prefill_cuda(num_actual_tokens, head_size_qk, head_size_v):
+            # Global (full-attention) layers' prefill: purpose-built CUDA
+            # kernel (ldmatrix + mma.m16n8k16; fp8/bf16 KV converted in the
+            # load path — sm86 has no cvt.rn e4m3 hardware, so fp8 converts
+            # via exact bit-repack). Consumes the physical [pages, 1, page,
+            # 320] layout, so hook BEFORE the Triton (B, N, H, D) transpose.
+            from vllm.v1.attention.ops.prefill_attn_cuda import prefill_attn_cuda
+
+            try:
+                cache = (
+                    kv_cache.view(self.fp8_dtype)
+                    if is_quantized_kv_cache(self.kv_cache_dtype)
+                    else kv_cache
+                )
+                prefill_attn_cuda(
+                    q=query[:num_actual_tokens],
+                    kv_cache=cache,
+                    block_table=attn_metadata.block_table,
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    seq_lens=attn_metadata.seq_lens,
+                    softmax_scale=self.scale,
+                    k_descale=(
+                        float(layer._k_scale)
+                        if layer._k_scale is not None
+                        else 1.0
+                    ),
+                    v_descale=(
+                        float(layer._v_scale)
+                        if layer._v_scale is not None
+                        else 1.0
+                    ),
+                    out=output[:num_actual_tokens],
+                )
+                return output
+            except Exception as e:  # noqa: BLE001
+                logger.warning_once(
+                    "prefill_attn_sm86 failed (%s); falling back to Triton", e
+                )
 
         # Triton DiffKV kernels consume (B, N, H, D) cache views.
         kv_cache = kv_cache.transpose(1, 2)

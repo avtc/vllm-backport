@@ -734,3 +734,108 @@ def test_diffkv_fp8_prefill_wide_tile_lut_fits_sm86() -> None:
     )
     assert out.shape == (qlen, num_query_heads, head_size_v)
     assert not torch.isnan(out.float()).any(), "NaN in fp8-KV prefill output"
+
+
+def _fp32_ref_prefill(
+    q, kv, block_table, kv_lens, cu_q, hq, hkv, dk, dv, scale,
+    k_descale=1.0, v_descale=1.0,
+):
+    outs = []
+    bs = kv.shape[2]
+    for i, s in enumerate(kv_lens):
+        qs, qe = int(cu_q[i]), int(cu_q[i + 1])
+        ql = qe - qs
+        n = (s + bs - 1) // bs
+        blk = kv[block_table[i, :n].long()].reshape(n * bs, hkv, dk + dv)[:s]
+        kx = blk[..., :dk].float() * k_descale
+        vx = blk[..., dk:].float() * v_descale
+        kx = kx.repeat_interleave(hq // hkv, 1)
+        vx = vx.repeat_interleave(hq // hkv, 1)
+        sc = torch.einsum("qhd,khd->hqk", q[qs:qe].float(), kx) * scale
+        ctx = s - ql
+        pos = torch.arange(ql, device=q.device) + ctx
+        mask = torch.arange(s, device=q.device)[None, :] > pos[:, None]
+        sc = sc.masked_fill(mask[None], float("-inf"))
+        p = torch.softmax(sc, dim=-1)
+        outs.append(torch.einsum("hqk,khd->qhd", p, vx))
+    return torch.cat(outs).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@torch.inference_mode()
+def test_prefill_attn_cuda_sm86_vs_ref(kv_dtype: str) -> None:
+    """JIT CUDA prefill kernel (global layers, TP8 shape) vs fp32 reference,
+    for bf16 and fp8-E4M3 KV (exact bit-repack dequant on sm86)."""
+    if not current_platform.is_cuda():
+        pytest.skip("CUDA-only kernel")
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) >= (9, 0):
+        pytest.skip("sm86-TP8 build; sm90+ uses other paths")
+
+    from vllm.v1.attention.ops.prefill_attn_cuda import _load_ext, _qblock_metadata
+
+    ext = _load_ext()
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    HQ, HKV, DK, DV, BS = 8, 1, 192, 128, 16
+    kv_lens, qlen = [3000, 700, 140], 48
+    seq_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
+    cu_q = torch.tensor([0] + [qlen] * len(kv_lens), dtype=torch.int32).cumsum(0)
+    nblk = [(s + BS - 1) // BS for s in kv_lens]
+    nb = sum(nblk) + 4
+    kv = torch.randn(nb, HKV, BS, DK + DV, dtype=torch.bfloat16)
+    block_table = torch.zeros(len(kv_lens), max(nblk), dtype=torch.int32)
+    perm = torch.randperm(nb, dtype=torch.int64)
+    o = 0
+    for i, n in enumerate(nblk):
+        block_table[i, :n] = perm[o : o + n].to(torch.int32)
+        o += n
+    q = torch.randn(cu_q[-1], HQ, DK, dtype=torch.bfloat16)
+
+    k_descale = v_descale = 1.0
+    if kv_dtype == "fp8":
+        k_descale = 1.5
+        v_descale = 0.75
+        kv8 = torch.cat(
+            [
+                (kv[..., :DK].float() / k_descale).to(torch.float8_e4m3fn),
+                (kv[..., DK:].float() / v_descale).to(torch.float8_e4m3fn),
+            ],
+            dim=-1,
+        )
+        deq = torch.cat(
+            [
+                kv8[..., :DK].float() * k_descale,
+                kv8[..., DK:].float() * v_descale,
+            ],
+            dim=-1,
+        ).to(torch.bfloat16)
+        cache = kv8
+    else:
+        deq = kv
+        cache = kv
+
+    out = torch.empty(cu_q[-1], HQ, DV, dtype=torch.bfloat16)
+    qblk_seq, qblk_start = _qblock_metadata(cu_q)
+    ext.prefill_attn_sm86(
+        q,
+        cache,
+        block_table,
+        cu_q,
+        seq_lens_t,
+        qblk_seq,
+        qblk_start,
+        DK**-0.5,
+        k_descale,
+        v_descale,
+        out,
+    )
+
+    ref = _fp32_ref_prefill(
+        q, deq, block_table, kv_lens, cu_q, HQ, HKV, DK, DV,
+        DK**-0.5, k_descale, v_descale,
+    )
+    # bf16 outputs: tolerance a few ULP of the bf16 reduction
+    err = (out.float() - ref.float()).abs().max().item()
+    assert not torch.isnan(out.float()).any(), "NaN in CUDA prefill output"
+    assert err <= 5e-2, f"CUDA prefill err {err:.4f}"
