@@ -122,17 +122,20 @@ def test_shard_state_dict_for_rank():
 
 def test_parallel_projection_forward_matches_reference(tp1_env):
     """At world size 1 the parallel branch must be numerically identical to
-    the plain nn.Sequential path with the same weights (GELU mid-activation)."""
+    the plain nn.Sequential path with the same weights (GELU mid-activation).
+    Weights flow reference -> parallel because parallel layers allocate with
+    torch.empty (the loader overwrites them in production) and may hold NaNs.
+    """
     torch.manual_seed(0)
-    parallel = AudioProjection(64, 256, 64, tp_size=2)
     reference = nn.Sequential(
         nn.Linear(64, 256, bias=False), nn.GELU(), nn.Linear(256, 64, bias=False)
     )
+    parallel = AudioProjection(64, 256, 64, tp_size=2)
     assert isinstance(parallel.mlp[0], ColumnParallelLinear)
     assert isinstance(parallel.mlp[2], RowParallelLinear)
     with torch.no_grad():
-        reference[0].weight.copy_(parallel.mlp[0].weight)
-        reference[2].weight.copy_(parallel.mlp[2].weight)
+        parallel.mlp[0].weight.copy_(reference[0].weight)
+        parallel.mlp[2].weight.copy_(reference[2].weight)
     x = torch.randn(17, 64)
     torch.testing.assert_close(parallel(x), reference(x))
 
@@ -141,13 +144,13 @@ def test_parallel_attention_projections_match_at_tp1(tp1_env):
     """Head-sharded construction at world size 1 keeps full-size projections
     whose outputs match a plain nn.Linear with the same weights."""
     torch.manual_seed(1)
+    plain = nn.Linear(64, 64, bias=True)
     attn = AudioEncoderAttention(embed_dim=64, num_heads=8, tp_size=2)
     assert isinstance(attn.q_proj, ColumnParallelLinear)
     assert isinstance(attn.out_proj, RowParallelLinear)
-    plain = nn.Linear(64, 64, bias=True)
     with torch.no_grad():
-        plain.weight.copy_(attn.q_proj.weight)
-        plain.bias.copy_(attn.q_proj.bias)
+        attn.q_proj.weight.copy_(plain.weight)
+        attn.q_proj.bias.copy_(plain.bias)
     x = torch.randn(9, 64)
     torch.testing.assert_close(attn.q_proj(x), plain(x))
 
@@ -159,6 +162,9 @@ def test_parallel_attention_full_forward_shapes(tp1_env):
     attn = AudioEncoderAttention(
         embed_dim=64, num_heads=8, tp_size=2, window_size=(-1, -1), causal=False
     ).to("cuda")
+    with torch.no_grad():
+        for p in attn.parameters():
+            p.normal_(0.0, 0.1)
     cu = torch.tensor([0, 5, 9], dtype=torch.int32, device="cuda")
     x = torch.randn(9, 64, device="cuda", dtype=torch.bfloat16)
     with torch.autocast("cuda", torch.bfloat16):

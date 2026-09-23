@@ -795,11 +795,14 @@ class AudioEncoderAttention(nn.Module):
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 
         bsz, _ = hidden_states.size()
-        num_heads = self.num_heads // self.tp_size
 
-        query_states = self.q_proj(hidden_states).view(
-            bsz, num_heads, self.head_dim
-        )
+        # Local head count follows the projection's actual output width, so the
+        # forward stays consistent with whatever TP size the layers really
+        # sharded to (the layers shard by the world size, not by our branch
+        # selector argument).
+        query_states = self.q_proj(hidden_states)
+        num_heads = query_states.shape[-1] // self.head_dim
+        query_states = query_states.view(bsz, num_heads, self.head_dim)
         key_states = self.k_proj(hidden_states).view(bsz, num_heads, self.head_dim)
         value_states = self.v_proj(hidden_states).view(
             bsz, num_heads, self.head_dim
@@ -823,7 +826,7 @@ class AudioEncoderAttention(nn.Module):
             window_size=list(self.window_size),
         )
 
-        attn_output = attn_output.reshape(bsz, self.embed_dim // self.tp_size)
+        attn_output = attn_output.reshape(bsz, num_heads * self.head_dim)
         attn_output = self.out_proj(attn_output)
         return attn_output
 
