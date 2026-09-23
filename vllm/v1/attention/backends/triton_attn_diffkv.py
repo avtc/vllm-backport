@@ -288,8 +288,15 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
                 )
                 return output
             except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "prefill_attn_sm86 failed; falling back to Triton",
+                    exc_info=True,
+                )
                 logger.warning_once(
-                    "prefill_attn_sm86 failed (%s); falling back to Triton", e
+                    "prefill_attn_sm86 failed (%s: %s); falling back to "
+                    "Triton (full traceback logged at debug level)",
+                    type(e).__name__,
+                    e,
                 )
 
         # Triton DiffKV kernels consume (B, N, H, D) cache views.

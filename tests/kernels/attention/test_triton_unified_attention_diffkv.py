@@ -839,3 +839,88 @@ def test_prefill_attn_cuda_sm86_vs_ref(kv_dtype: str) -> None:
     err = (out.float() - ref.float()).abs().max().item()
     assert not torch.isnan(out.float()).any(), "NaN in CUDA prefill output"
     assert err <= 5e-2, f"CUDA prefill err {err:.4f}"
+
+
+@torch.inference_mode()
+def test_prefill_cuda_failure_falls_back_to_triton(caplog) -> None:
+    """If the JIT CUDA prefill kernel raises, forward must fall back to the
+    Triton path, produce identical output, and log the failure with a full
+    traceback (debug) + one-shot warning."""
+    if not current_platform.is_cuda():
+        pytest.skip("CUDA-only kernel")
+    import logging
+    from types import SimpleNamespace
+
+    import vllm.v1.attention.ops.prefill_attn_cuda as pac
+    from vllm.v1.attention.backends.triton_attn_diffkv import (
+        TritonAttentionDiffKVImpl,
+    )
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    HQ, HKV, DK, DV, BS = 8, 1, 192, 128, 16
+    kv_lens, qlen = [300, 80], 32
+    nblk = [(s + BS - 1) // BS for s in kv_lens]
+    nb = sum(nblk) + 4
+    kv = torch.randn(nb, HKV, BS, DK + DV, dtype=torch.bfloat16)
+    bt = torch.zeros(len(kv_lens), max(nblk), dtype=torch.int32)
+    perm = torch.randperm(nb, dtype=torch.int64)
+    o = 0
+    for i, n in enumerate(nblk):
+        bt[i, :n] = perm[o : o + n].to(torch.int32)
+        o += n
+    q = torch.randn(len(kv_lens) * qlen, HQ, DK, dtype=torch.bfloat16)
+    out = torch.empty_like(q[..., :DV])
+
+    cu_q = torch.tensor([0] + [qlen] * len(kv_lens), dtype=torch.int32).cumsum(0)
+    segm_out = torch.empty((1, HQ, 16, next_power_of_2(DV)), dtype=torch.float32)
+    meta = SimpleNamespace(
+        num_actual_tokens=q.shape[0],
+        query_start_loc=cu_q,
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32),
+        block_table=bt,
+        max_query_len=qlen,
+        seq_threshold_3D=1,
+        num_par_softmax_segments=16,
+        softmax_segm_output=segm_out,
+        softmax_segm_max=torch.empty((1, HQ, 16), dtype=torch.float32),
+        softmax_segm_expsum=torch.empty((1, HQ, 16), dtype=torch.float32),
+        use_cascade=False,
+    )
+
+    impl = object.__new__(TritonAttentionDiffKVImpl)
+    impl.kv_cache_dtype = "auto"
+    impl.head_size = DK
+    impl.sliding_window = None
+    impl.sinks = None
+    impl.num_heads = HQ
+    impl.num_kv_heads = HKV
+    impl.scale = DK**-0.5
+    impl.alibi_slopes = None
+    impl.use_alibi_sqrt = False
+    impl.logits_soft_cap = None
+    layer = SimpleNamespace(_k_scale=None, _v_scale=None)
+
+    with (
+        caplog.at_level(
+            logging.DEBUG,
+            logger=TritonAttentionDiffKVImpl.__module__,
+        ),
+        pytest.MonkeyPatch.context() as mp,
+    ):
+        mp.setattr(pac, "prefill_cuda_enabled", lambda: True)
+        mp.setattr(
+            pac,
+            "prefill_attn_cuda",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        impl.forward(layer, q, q[..., :DV], q[..., :DV], kv, meta, out)
+
+    ref = _run_diffkv(
+        q, kv, kv_lens, qlen, bt, HQ, DK, DV, BS, (None, None), None, 1, 16,
+        torch.bfloat16,
+    )
+    assert not torch.isnan(out.float()).any()
+    torch.testing.assert_close(out.float(), ref.float(), atol=0, rtol=0)
+    assert "boom" in caplog.text, "failure traceback must reach the log"
+    assert any("prefill_attn_sm86 failed" in r.message for r in caplog.records)
