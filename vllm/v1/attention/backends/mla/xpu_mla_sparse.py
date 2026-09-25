@@ -241,6 +241,38 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
 
         return output[:, : self.num_heads, :]
 
+    def _topk_global_indices(
+        self,
+        num_actual_toks: int,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: XPUMLASparseMetadata,
+    ) -> torch.Tensor:
+        """Read this step's top-k buffer and map (req, pos) to flat cache rows."""
+        buf = (
+            self._indexer.topk_indices_buffer
+            if self._indexer is not None
+            else self.topk_indices_buffer
+        )
+        assert buf is not None, "topk_indices_buffer required for sparse MLA"
+        topk_indices = buf[:num_actual_toks]
+
+        _, block_stride_rows = flat_kv_row_view(
+            kv_c_and_k_pe_cache, attn_metadata.block_size
+        )
+        return triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            # The buffer's own width, not the logical top-k. GLM-5.3-Flash's
+            # kpool indexer reserves `kpool - 1` extra slots for the in-progress
+            # pool tail and rounds the total up to the sparse-MLA 128-column
+            # tile (2048 -> 2176); the padding stays -1 and is masked. Models
+            # whose buffer is exactly topk_tokens wide are unaffected.
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        )
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -260,29 +292,11 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
 
         num_actual_toks = q.shape[0]
 
-        buf = (
-            self._indexer.topk_indices_buffer
-            if self._indexer is not None
-            else self.topk_indices_buffer
-        )
-        assert buf is not None, "topk_indices_buffer required for sparse MLA"
-        topk_indices = buf[:num_actual_toks]
-
-        kv_rows, block_stride_rows = flat_kv_row_view(
+        kv_rows, _ = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
         )
-        topk_indices_global = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            BLOCK_STRIDE_ROWS=block_stride_rows,
-            # The buffer's own width, not the logical top-k. GLM-5.3-Flash's
-            # kpool indexer reserves `kpool - 1` extra slots for the in-progress
-            # pool tail and rounds the total up to the sparse-MLA 128-column
-            # tile (2048 -> 2176); the padding stays -1 and is masked. Models
-            # whose buffer is exactly topk_tokens wide are unaffected.
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        topk_indices_global = self._topk_global_indices(
+            num_actual_toks, kv_c_and_k_pe_cache, attn_metadata
         )
 
         attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)
