@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""NVMe-backed (mmap) PLE n-gram table: host-gather semantics + file lifecycle.
+
+VLLM_PLE_MMAP_PATH backs the per-rank table shard with a file mapping instead
+of GPU residency (~6.4 GiB/GPU freed) or pinned host RAM (no 51 GiB mlock).
+"""
+
+from __future__ import annotations
+
+import os
+from unittest.mock import patch
+
+import torch
+
+from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+    _FP8_STORAGE_DTYPES,
+    _gather_rows_from_table,
+)
+
+
+def test_gather_in_range_rows_only():
+    table = torch.arange(0, 24, dtype=torch.bfloat16).reshape(8, 3)
+    ids = torch.tensor([10, 12, 9])  # vocab window [9, 12) -> local [1, 3, 0]
+    out = _gather_rows_from_table(table, ids, vocab_start=9, vocab_end=12)
+    assert out.shape == (3, 3)
+    assert torch.equal(out[0], table[1])  # 10 - 9 = 1
+    assert torch.equal(out[1], table[3])  # 12 - 9 = 3
+    assert torch.equal(out[2], table[0])  # 9 - 9 = 0
+
+
+def test_gather_out_of_range_rows_are_zero():
+    table = torch.randn(8, 4, dtype=torch.float32)
+    ids = torch.tensor([0, 100, -5, 7])  # only 7 in [0, 8)
+    out = _gather_rows_from_table(table, ids, vocab_start=0, vocab_end=8)
+    assert torch.equal(out[1], torch.zeros(4))
+    assert torch.equal(out[2], torch.zeros(4))
+    assert torch.equal(out[3], table[7])
+
+
+def test_gather_fp8_rows_as_bytes():
+    table = torch.randn(16, 8).to(torch.float8_e4m3fn)
+    assert table.dtype in _FP8_STORAGE_DTYPES
+    ids = torch.tensor([3, 5])
+    out = _gather_rows_from_table(table, ids, vocab_start=0, vocab_end=16)
+    assert out.dtype == torch.uint8
+    assert torch.equal(out[0], table.view(torch.uint8)[3])
+    assert torch.equal(out[1], table.view(torch.uint8)[5])
+
+
+def test_gather_empty_ids():
+    table = torch.zeros(4, 3, dtype=torch.bfloat16)
+    out = _gather_rows_from_table(table, torch.tensor([], dtype=torch.long), 0, 4)
+    assert out.shape == (0, 3)
+
+
+def test_mmap_roundtrip_persists_rows(tmp_path):
+    """A tensor written through the mmap mapping is readable after re-open."""
+    import mmap as _mmap
+
+    import numpy as np
+
+    path = tmp_path / "table.bin"
+    rows, dim = 128, 16
+    nbytes = rows * dim * 2  # bf16
+
+    with open(path, "w+b") as f:
+        f.truncate(nbytes)
+        with _mmap.mmap(f.fileno(), 0) as mm:
+            arr = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
+            t = torch.frombuffer(arr).view(torch.bfloat16).reshape(rows, dim)
+            t[7] = torch.arange(dim, dtype=torch.bfloat16)
+            mm.flush()
+
+    with open(path, "rb") as f, _mmap.mmap(f.fileno(), 0) as mm:
+        arr = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
+        t = torch.frombuffer(arr).view(torch.bfloat16).reshape(rows, dim)
+        assert torch.equal(t[7], torch.arange(dim, dtype=torch.bfloat16))
+        # untouched rows read back zero (fresh file is zero-filled)
+        assert torch.count_nonzero(t[0]) == 0
+
+
+def test_mmap_table_path_is_per_rank(tmp_path):
+    from vllm.models.qwen4_exp.nvidia import ngram_embedding as ne
+
+    class _FakeGroup:
+        def __init__(self, rank):
+            self._rank = rank
+
+        def size(self):
+            return 8
+
+    _FakeEtP = type('G', (), {'device_group': _FakeGroup(5)})
+    fake_dist = type(
+        "M",
+        (),
+        {"get_rank": staticmethod(lambda group: group._rank)},
+    )
+    with (
+        patch.dict(os.environ, {"VLLM_PLE_MMAP_PATH": str(tmp_path / "ple")}),
+        patch.object(torch, "distributed", fake_dist),
+        patch.object(ne, "get_etp_group", lambda: _FakeEtP(5)),
+    ):
+        from vllm import envs
+
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+        assert ne._mmap_table_path().endswith(f"{os.sep}ple.rank5")
+
+
+def test_envs_defaults():
+    from vllm import envs
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("VLLM_PLE_MMAP_PATH", None)
+        os.environ.pop("VLLM_PLE_MMAP_REBUILD", None)
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+        assert envs.VLLM_PLE_MMAP_PATH is None
+        assert envs.VLLM_PLE_MMAP_REBUILD is False

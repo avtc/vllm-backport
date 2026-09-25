@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_etp_group, get_tp_group
@@ -484,13 +485,20 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         )
         self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
         self._block_d = triton.next_power_of_2(self.embedding_dim)
-        self._prefetch_stream = torch.cuda.Stream(device=self._uva_weight.device)
+        self._init_prefetch_resources(num_ngram_heads, max_total_tokens)
+
+    def _init_prefetch_resources(
+        self, num_ngram_heads: int, max_total_tokens: int
+    ) -> None:
+        """Side stream and GPU prefetch buffer shared by host-backed variants."""
+        device = torch.cuda.current_device()
+        self._prefetch_stream = torch.cuda.Stream(device=device)
         self._prefetch_buffer = torch.empty(
             max_total_tokens * self.etp_data_parallel_size,
             num_ngram_heads,
             self.embedding_dim,
             dtype=self.weight.dtype,
-            device=self._uva_weight.device,
+            device=device,
         )
         self._output_dim = num_ngram_heads * self.embedding_dim
 
@@ -605,6 +613,205 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             (hidden_states.shape[0], self._output_dim)
         )
         self._finalize_prefetch(self._prefetch_buffer, output)
+        return output
+
+
+def _gather_rows_from_table(
+    table: torch.Tensor,
+    row_ids: torch.Tensor,
+    vocab_start: int,
+    vocab_end: int,
+) -> torch.Tensor:
+    """Host-side row gather with the UVA kernel's out-of-range semantics.
+
+    Rows outside ``[vocab_start, vocab_end)`` yield zeros (the kernel's
+    ``other=0.0`` masked load). fp8 tables gather as raw bytes because CPU
+    indexing does not support fp8 dtypes (one byte per element keeps the
+    row width).
+    """
+    if table.dtype in _FP8_STORAGE_DTYPES:
+        table = table.view(torch.uint8)
+    in_range = (row_ids >= vocab_start) & (row_ids < vocab_end)
+    local = (row_ids - vocab_start).clamp_(min=0, max=table.shape[0] - 1)
+    rows = table[local]
+    if rows.numel() == 0:
+        return rows.reshape(*row_ids.shape, table.shape[1])
+    rows = torch.where(in_range.unsqueeze(-1), rows, torch.zeros_like(rows))
+    return rows
+
+
+def _mmap_table_path() -> str:
+    """Per-ETP-rank table file path from VLLM_PLE_MMAP_PATH."""
+
+    from vllm import envs
+    from vllm.distributed import get_etp_group
+
+    base = envs.VLLM_PLE_MMAP_PATH
+    assert base, "VLLM_PLE_MMAP_PATH must be set for the mmap PLE table"
+    rank = torch.distributed.get_rank(get_etp_group().device_group)
+    return f"{base}.rank{rank}"
+
+
+class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+    """PLE table backed by an NVMe file via mmap, gathered on the host.
+
+    Unlike the pinned-host variant nothing is mlock'd: the table lives in the
+    kernel page cache backed by a file on disk, so memory pressure simply
+    evicts clean pages and the kernel re-reads them on demand. The UVA lookup
+    kernel cannot address unmapped file pages, so lookups gather the needed
+    rows on the CPU into a small pinned staging buffer and copy them to the
+    GPU on the prefetch side stream - the same interface and graph safety as
+    the pinned variant, at the cost of one D2H sync per prefetched step.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        params_dtype: torch.dtype,
+        padding_size: int,
+        prefix: str,
+        embedding_method: Qwen4ExpPLEEmbeddingMethod,
+        num_ngram_heads: int = 1,
+        max_total_tokens: int = 0,
+        data_parallel_rank: int = 0,
+    ) -> None:
+        # Skip the pinned variant's __init__ (UVA view + pin_memory alloc);
+        # the base constructor builds the mmap-backed weight first.
+        Qwen4ExpPLEEmbedding.__init__(
+            self,
+            num_embeddings,
+            embedding_dim,
+            params_dtype=params_dtype,
+            padding_size=padding_size,
+            prefix=prefix,
+            embedding_method=embedding_method,
+            num_ngram_heads=num_ngram_heads,
+            max_total_tokens=max_total_tokens,
+            data_parallel_rank=data_parallel_rank,
+        )
+        self._staging = torch.empty(
+            max_total_tokens * self.etp_data_parallel_size,
+            num_ngram_heads,
+            self.embedding_dim,
+            dtype=self.weight.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        self._init_prefetch_resources(num_ngram_heads, max_total_tokens)
+        self._mmap_flushed = False
+
+    def allocate_embedding_weight(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Map (or create) this rank's table shard as a file-backed tensor."""
+        import mmap as _mmap
+        import os
+
+        import numpy as np
+
+        from vllm import envs
+
+        path = _mmap_table_path()
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        nbytes = num_embeddings * embedding_dim * itemsize
+        rebuild = (
+            bool(envs.VLLM_PLE_MMAP_REBUILD)
+            or not os.path.exists(path)
+            or os.path.getsize(path) != nbytes
+        )
+        if rebuild and os.path.exists(path):
+            os.unlink(path)
+        # The handle stays open for the process lifetime: the mmap behind
+        # the weight tensor references it.
+        self._mmap_file = open(  # noqa: SIM115
+            path, "r+b" if not rebuild else "w+b"
+        )
+        if rebuild:
+            self._mmap_file.truncate(nbytes)
+            length = 0  # map the whole (freshly sized) file
+        else:
+            length = nbytes
+        self._mmap = _mmap.mmap(self._mmap_file.fileno(), length)
+        array = np.frombuffer(self._mmap, dtype=np.uint8, count=nbytes)
+        tensor = (
+            torch.frombuffer(array).view(dtype).reshape(num_embeddings, embedding_dim)
+        )
+        logger.info(
+            "PLE mmap table %s: rows=%d dim=%d dtype=%s bytes=%d (%s)",
+            path,
+            num_embeddings,
+            embedding_dim,
+            dtype,
+            nbytes,
+            "rebuilt" if rebuild else "reused",
+        )
+        return tensor
+
+    def start_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        ngram_ids: torch.Tensor,
+    ) -> None:
+        """Gather ETP IDs on the host and stage their rows on the side stream."""
+        if not self._mmap_flushed:
+            # First eager call after weight loading: persist the rebuilt file.
+            self._flush_mmap()
+        super().start_prefetch(hidden_states, ngram_ids)
+
+    def _flush_mmap(self) -> None:
+        mmap_obj = getattr(self, "_mmap", None)
+        if mmap_obj is not None:
+            try:
+                mmap_obj.flush()
+            except (BufferError, ValueError):
+                logger.warning("PLE mmap flush failed; file may rebuild", exc_info=True)
+        self._mmap_flushed = True
+
+    def _lookup(
+        self,
+        input_ids: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Host-gather rows from the mmap table into GPU output storage."""
+        expected_shape = (*input_ids.shape, self.embedding_dim)
+        if output is None:
+            output = torch.empty(
+                expected_shape, dtype=self.weight.dtype, device=input_ids.device
+            )
+        elif (
+            tuple(output.shape) != expected_shape
+            or output.dtype != self.weight.dtype
+            or output.device != input_ids.device
+        ):
+            raise ValueError(
+                "PLE prefetch output must match the input shape, weight dtype, "
+                "and input device"
+            )
+
+        flat_ids = input_ids.reshape(-1).to("cpu", non_blocking=False).long()
+        rows = _gather_rows_from_table(
+            self.weight,
+            flat_ids,
+            int(self.shard_indices.org_vocab_start_index),
+            int(self.shard_indices.org_vocab_end_index),
+        )
+        n = rows.shape[0]
+        staging = self._staging.reshape(-1, self.embedding_dim)
+        assert n <= staging.shape[0], (
+            f"PLE mmap staging overflow: {n} rows > {staging.shape[0]}"
+        )
+        if self.weight.dtype in _FP8_STORAGE_DTYPES:
+            staging.view(torch.uint8)[:n].copy_(rows)
+            active = staging[:n]
+        else:
+            staging[:n].copy_(rows)
+            active = staging[:n]
+        output.reshape(-1, self.embedding_dim).copy_(active, non_blocking=True)
         return output
 
 
@@ -776,11 +983,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
+        mmap_path = envs.VLLM_PLE_MMAP_PATH
+        if mmap_path:
+            embedding_cls = Qwen4ExpPLEMmapHostEmbedding
+        elif engram_config is not None and engram_config.cpu_offload:
+            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
+        else:
+            embedding_cls = Qwen4ExpPLEDeviceEmbedding
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,

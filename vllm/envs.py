@@ -176,6 +176,11 @@ if TYPE_CHECKING:
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_PLE_CPU_OFFLOAD: bool = False
+    # NVMe-backed PLE n-gram table: file-mapped storage + host-side row gather
+    # instead of GPU residency or pinned host RAM (VLLM_PLE_MMAP_PATH enables;
+    # the per-rank file is written on first start and reused after).
+    VLLM_PLE_MMAP_PATH: str | None = None
+    VLLM_PLE_MMAP_REBUILD: bool = False
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -2435,6 +2440,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Legacy fallback for EngramConfig.cpu_offload, which takes precedence.
     # This environment variable may be removed in a future release.
     "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "0"))),
+    "VLLM_PLE_MMAP_PATH": lambda: os.getenv("VLLM_PLE_MMAP_PATH", None),
+    "VLLM_PLE_MMAP_REBUILD": lambda: bool(
+        int(os.getenv("VLLM_PLE_MMAP_REBUILD", "0"))
+    ),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
