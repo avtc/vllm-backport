@@ -55,7 +55,12 @@ def test_gather_empty_ids():
 
 
 def test_mmap_roundtrip_persists_rows(tmp_path):
-    """A tensor written through the mmap mapping is readable after re-open."""
+    """A tensor written through the mmap mapping is readable after re-open.
+
+    Views keep the mapping exported (mmap.close raises BufferError while
+    numpy/torch hold pointers), so each mapping lives in a function scope
+    that drops the views before the mapping closes.
+    """
     import mmap as _mmap
 
     import numpy as np
@@ -64,20 +69,42 @@ def test_mmap_roundtrip_persists_rows(tmp_path):
     rows, dim = 128, 16
     nbytes = rows * dim * 2  # bf16
 
-    with open(path, "w+b") as f:
-        f.truncate(nbytes)
-        with _mmap.mmap(f.fileno(), 0) as mm:
-            arr = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
-            t = torch.frombuffer(arr).view(torch.bfloat16).reshape(rows, dim)
-            t[7] = torch.arange(dim, dtype=torch.bfloat16)
-            mm.flush()
+    def write():
+        f = open(path, "w+b")  # noqa: SIM115
+        try:
+            f.truncate(nbytes)
+            mm = _mmap.mmap(f.fileno(), 0)
+            try:
+                arr = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
+                t = torch.frombuffer(arr, dtype=torch.uint8)
+                t = t.view(torch.bfloat16).reshape(rows, dim)
+                t[7] = torch.arange(dim, dtype=torch.bfloat16)
+                mm.flush()
+            finally:
+                del t, arr
+                mm.close()
+        finally:
+            f.close()
 
-    with open(path, "rb") as f, _mmap.mmap(f.fileno(), 0) as mm:
-        arr = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
-        t = torch.frombuffer(arr).view(torch.bfloat16).reshape(rows, dim)
-        assert torch.equal(t[7], torch.arange(dim, dtype=torch.bfloat16))
-        # untouched rows read back zero (fresh file is zero-filled)
-        assert torch.count_nonzero(t[0]) == 0
+    def read() -> torch.Tensor:
+        f = open(path, "rb")  # noqa: SIM115
+        try:
+            mm = _mmap.mmap(f.fileno(), 0)
+            try:
+                arr = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
+                t = torch.frombuffer(arr, dtype=torch.uint8)
+                return t.view(torch.bfloat16).reshape(rows, dim).clone()
+            finally:
+                del t, arr
+                mm.close()
+        finally:
+            f.close()
+
+    write()
+    t = read()
+    assert torch.equal(t[7], torch.arange(dim, dtype=torch.bfloat16))
+    # untouched rows read back zero (fresh file is zero-filled)
+    assert torch.count_nonzero(t[0]) == 0
 
 
 def test_mmap_table_path_is_per_rank(tmp_path):
