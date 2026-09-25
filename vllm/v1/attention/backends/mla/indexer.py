@@ -833,7 +833,16 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     # within the flashmla_sparse workspace.
     # For DeepSeek-V3.2, the max_model_len is 163840.
     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
-    return max_model_len * 40
+    factor = envs.VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR
+    if factor < 1:
+        # The chunk splitter only sub-chunks the query dimension, so a
+        # workspace smaller than one max-length request's gather would
+        # overflow the K-gather buffer.
+        raise ValueError(
+            "VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR must be >= 1, got "
+            f"{factor}."
+        )
+    return max_model_len * factor
 
 
 def _supports_varlen_paged_mqa_logits() -> bool:

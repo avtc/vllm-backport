@@ -58,6 +58,13 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    # Multiplier on max_model_len for the sparse-indexer K-gather workspace
+    # (each gathered row costs head_dim fp8 bytes + 4 scale bytes, 132 B at
+    # head_dim=128). Default 40 preserves upstream sizing; lower it on
+    # memory-constrained long-context setups (factor 4 at 1M ctx turns the
+    # 5.16 GiB workspace into 540 MB). Must stay >= 1: the chunker cannot
+    # split a single request's gather below its full length.
+    VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1133,6 +1140,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    "VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR": lambda: int(
+        os.getenv("VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR", "40")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

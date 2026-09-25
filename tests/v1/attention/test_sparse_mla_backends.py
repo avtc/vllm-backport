@@ -3,7 +3,9 @@
 """Unit tests for the sparse MLA backends and utilities."""
 
 import math
+import os
 from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -1446,6 +1448,49 @@ def test_split_indexer_prefill_chunks_single_request_overflow():
     # req1: M=5, N=50 -> 250 elems fits budget
     expected.append((slice(1, 2), slice(0, 5)))
     assert out == expected
+
+
+def _fake_indexer_vllm_config(max_model_len: int):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=512),
+    )
+
+
+def test_get_max_prefill_buffer_size_default_factor():
+    """Env unset keeps the upstream 40x max_model_len sizing."""
+    from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR", None)
+        assert get_max_prefill_buffer_size(_fake_indexer_vllm_config(1048576)) == (
+            1048576 * 40
+        )
+
+
+@pytest.mark.parametrize("factor", ["1", "4", "8"])
+def test_get_max_prefill_buffer_size_env_factor(factor: str):
+    """The env factor directly scales max_model_len (A/B knob for the
+    per-GPU K-gather workspace: 1M ctx needs factor<=4 to stay under
+    ~550MB instead of the 5.16GiB default)."""
+    from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
+
+    with patch.dict(os.environ, {"VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR": factor}):
+        assert get_max_prefill_buffer_size(_fake_indexer_vllm_config(1000)) == (
+            1000 * int(factor)
+        )
+
+
+@pytest.mark.parametrize("bad", ["0", "-3"])
+def test_get_max_prefill_buffer_size_rejects_sub_unit_factor(bad: str):
+    """A factor below 1 would shrink the workspace under a single
+    max-length request's gather, which the chunker cannot split (it only
+    sub-chunks the query dim), so it must be rejected loudly."""
+    from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
+
+    with patch.dict(os.environ, {"VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR": bad}):
+        with pytest.raises(ValueError, match="PREFILL_BUFFER_FACTOR"):
+            get_max_prefill_buffer_size(_fake_indexer_vllm_config(1000))
 
 
 # 384 is not a power of two, so it counts via the tiled atomic accumulation
