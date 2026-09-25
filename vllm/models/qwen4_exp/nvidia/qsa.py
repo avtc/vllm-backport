@@ -54,6 +54,24 @@ from . import model
 from .indexer_qsa import QSAIndexer
 
 
+def _qsa_fp8_kv_mode() -> str:
+    """VLLM_QSA_FP8_KV read path for fp8 main-KV caches.
+
+    The empty default keeps the historical bf16-only guards; "decode" runs
+    e4m3 decode inside the sparse GQA kernel; "gather" materializes the
+    selected rows into a bf16 workspace first and runs the kernel
+    unchanged.
+    """
+    from vllm import envs
+
+    mode = envs.VLLM_QSA_FP8_KV.strip().lower()
+    if mode not in ("", "decode", "gather"):
+        raise ValueError(
+            f"VLLM_QSA_FP8_KV={mode!r} is not one of '', 'decode', 'gather'"
+        )
+    return mode
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -64,7 +82,7 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16", "fp8"]
 
     @staticmethod
     def get_name() -> str:
@@ -106,8 +124,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if self.kv_cache_dtype not in ("auto", "bfloat16") and not (
+            self.kv_cache_dtype == "fp8" and _qsa_fp8_kv_mode()
+        ):
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires a BF16 main KV cache, or an fp8 one "
+                "with VLLM_QSA_FP8_KV=decode|gather"
+            )
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -143,17 +166,66 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
+        fp8_kv = key_cache.dtype == torch.float8_e4m3fn
+        if (key_cache.dtype != torch.bfloat16 and not fp8_kv) or (
+            query.dtype != torch.bfloat16
+        ):
             raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
 
-        from .ops.qsa import qsa_sparse_paged_attention
+        from .ops.qsa import qsa_gather_dequant_workspace, qsa_sparse_paged_attention
 
+        block_table = attn_metadata.block_table
+        if fp8_kv:
+            mode = _qsa_fp8_kv_mode()
+            k_scale = layer._k_scale
+            v_scale = layer._v_scale
+            if mode == "gather":
+                (
+                    key_cache,
+                    value_cache,
+                    logical_indices,
+                    block_table,
+                    token_to_req,
+                ) = qsa_gather_dequant_workspace(
+                    key_cache,
+                    value_cache,
+                    logical_indices,
+                    block_table,
+                    token_to_req,
+                    k_scale,
+                    v_scale,
+                )
+                qsa_sparse_paged_attention(
+                    query[:num_tokens],
+                    key_cache,
+                    value_cache,
+                    logical_indices,
+                    block_table,
+                    token_to_req,
+                    use_prefill_config,
+                    output[:num_tokens],
+                )
+                return output
+            qsa_sparse_paged_attention(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                logical_indices,
+                block_table,
+                token_to_req,
+                use_prefill_config,
+                output[:num_tokens],
+                kv_fp8=True,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            return output
         qsa_sparse_paged_attention(
             query[:num_tokens],
             key_cache,
             value_cache,
             logical_indices,
-            attn_metadata.block_table,
+            block_table,
             token_to_req,
             use_prefill_config,
             output[:num_tokens],
@@ -183,8 +255,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
-        if cache_config.cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if cache_config.cache_dtype not in ("auto", "bfloat16") and not (
+            cache_config.cache_dtype == "fp8" and _qsa_fp8_kv_mode()
+        ):
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires a BF16 main KV cache, or an fp8 one "
+                "with VLLM_QSA_FP8_KV=decode|gather"
+            )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -283,7 +360,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != torch.bfloat16:
+        if self.kv_cache_torch_dtype != torch.bfloat16 and not (
+            self.kv_cache_torch_dtype == torch.float8_e4m3fn and _qsa_fp8_kv_mode()
+        ):
             raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])

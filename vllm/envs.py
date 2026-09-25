@@ -182,6 +182,9 @@ if TYPE_CHECKING:
     VLLM_PLE_MMAP_PATH: str | None = None
     VLLM_PLE_MMAP_REBUILD: bool = False
     VLLM_PLE_MMAP_PIN_STAGING: bool = True
+    # QSA fp8 main-KV read path: "" (bf16 only), "decode" (in-kernel e4m3
+    # decode) or "gather" (bf16 workspace pre-pass) for A/B comparison.
+    VLLM_QSA_FP8_KV: str = ""
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -2448,6 +2451,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_MMAP_PIN_STAGING": lambda: bool(
         int(os.getenv("VLLM_PLE_MMAP_PIN_STAGING", "1"))
     ),
+    "VLLM_QSA_FP8_KV": lambda: os.getenv("VLLM_QSA_FP8_KV", ""),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
