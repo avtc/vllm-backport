@@ -74,8 +74,12 @@ def test_workspace_layout_is_kernel_addressable():
 def test_uint8_view_preserves_strides():
     """fp8 caches are passed as uint8 views; the reinterpretration must
     keep shapes and strides so the kernel's address math is unchanged."""
-    cache = torch.zeros(4, 16, 2 * 32, 8, dtype=torch.float8_e4m3fn)
+    # vLLM cache layout [blocks, kv_heads, page, 2*D]; transpose+split
+    # yields the kernel's [blocks, page, heads, D] key/value views.
+    cache = torch.zeros(4, 2, 16, 2 * 32, dtype=torch.float8_e4m3fn)
     key_cache, value_cache = cache.transpose(1, 2).split(32, dim=-1)
+    assert key_cache.shape == (4, 16, 2, 32)
+    assert key_cache.stride(3) == 1
     k8 = key_cache.view(torch.uint8)
     assert k8.shape == key_cache.shape
     assert k8.stride() == key_cache.stride()
