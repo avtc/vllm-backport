@@ -163,6 +163,29 @@ vllm serve /path/to/your/qwen3.8 \
 - AWQ W4A16 ([`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16), compressed-tensors `pack-quantized`, routed experts INT4 g128, everything else BF16): MTP speculative decoding works (the BF16 MTP draft is kept unquantized automatically). Verified on 4x A100-80GB: `VLLM_PLE_CPU_OFFLOAD=1 vllm serve wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --tensor-parallel-size 4 --enable-expert-parallel --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' --speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. This achieves up to 936 tps.
 - `--prefix-match-unit=16` is effectively mandatory. Prefix cache reuses whole blocks only, and this flag sets the block size; the remainder is never reused. It defaults to the mamba block size (800 here), and MTP drops one more block, so nothing under 1600 tokens can ever be reused and the hit rate reads a flat 0.0% no matter how often a prompt repeats. Setting it to 16 drops that floor to 32 tokens. The value must divide 800, so use 16 (or 25/40/50/80/100) -- 64 is rejected at startup. `--enable-mamba-fine-grained-prefix-cache` is optional on top; it only improves the worst-case hit.
 
+#### Qwen3.8-Flash-Next INT4-Mixed AutoRound (24GB cards)
+
+Third-party AutoRound checkpoints (e.g. [`Minachist/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound`](https://huggingface.co/Minachist/Qwen3.8-Flash-Next-INT4-Mixed-AutoRound): routed experts INT4 g128, dense INT6 g64, hyper-connection INT8 g64, embed/lm_head INT8 g128) need two things this fork now provides:
+
+- The hyper-connection `input_mix_weight_down`/`block_inject_weight` projections load **split** (separately-quantized tensors cannot be stacked into the merged packed weight), and `embed_tokens`/`lm_head` accept `quant_config`.
+- The shared expert (INT6 g64, 640-wide) is **replicated** when its TP partition is not a whole quant group (TP4: 160, TP8: 80) instead of crashing; detected via the compressed-tensors group-size probe. Kill switch: `VLLM_CT_SHARED_EXPERT_TP_REPLICATE=0`.
+
+The checkpoint's MTP head is stored in BF16 (the INT4 regex only matches `model|language_model` prefixes), so no separate draft requant is needed. The MTP draft layer, indexer `index_qk_proj` and the PLE `kv_proj` are TP-replicated by construction; the 2 KV heads use standard GQA replication at TP4/TP8.
+
+```bash
+# 8 x 24GB (target topology; ~10-11 GB weights/GPU, PLE table in host RAM)
+VLLM_PLE_CPU_OFFLOAD=1 vllm serve /path/to/qwen3.8-int4-mixed \
+  --tensor-parallel-size 8 --enable-expert-parallel \
+  --max-model-len 262144 --max-num-seqs 4 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --enable-prefix-caching --mamba-cache-mode align --prefix-match-unit 16 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
+```
+
+- `--enable-expert-parallel` is required at TP4/TP8 (routed experts INT4 g128: 160/80 per rank is not a whole group). Without EP the server exits with an explicit error suggesting EP; with EP the shared expert replicates (~178 MB/GPU).
+- At TP2 no EP is needed (experts 320 %128 == 0, shared expert 320 %64 == 0); for PP-only use `VLLM_PP_LAYER_PARTITION="12,12,13,11"` with `-tp 2 -pp 4` (stage 0 carries embed + the single PLE layer; stage 3 carries lm_head + MTP).
+- `VLLM_PLE_CPU_OFFLOAD=1` pins ~51 GiB fp8 n-gram rows in host RAM — budget for it (>=64 GB RAM).
+
 #### DeepSeek V4 Flash (Preview, 0731, Vision-Exp)
 
 ```bash
