@@ -670,7 +670,9 @@ def _mmap_table_path() -> str:
 def _mode_includes_full(mode: CUDAGraphMode) -> bool:
     if mode == CUDAGraphMode.FULL:
         return True
-    return isinstance(mode.value, tuple) and CUDAGraphMode.FULL in mode.value
+    # Combined modes store plain int tuples (e.g. (2, 1)); enum members
+    # never equal their int values, so compare the member's value.
+    return isinstance(mode.value, tuple) and CUDAGraphMode.FULL.value in mode.value
 
 
 def _clamp_cudagraph_mode_for_host_gather(
