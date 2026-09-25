@@ -69,7 +69,6 @@ def get_compressed_tensors_group_size(
         return None
 
     from compressed_tensors.quantization import QuantizationStrategy
-    from torch import nn
 
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
         CompressedTensorsConfig,
@@ -78,9 +77,12 @@ def get_compressed_tensors_group_size(
     if not isinstance(quant_config, CompressedTensorsConfig):
         return None
 
-    scheme_dict = quant_config.get_scheme_dict(
-        module if module is not None else nn.Linear(), layer_name
-    )
+    # Module-name targets resolve through the class name only, so a
+    # name-only stand-in matches what a plain linear layer would report.
+    if module is None:
+        module = _LinearNameStub()
+
+    scheme_dict = quant_config.get_scheme_dict(module, layer_name)
     if scheme_dict is None:
         return None
     weights = scheme_dict.get("weights")
@@ -88,6 +90,12 @@ def get_compressed_tensors_group_size(
         return None
     assert weights.group_size is not None
     return int(weights.group_size)
+
+
+class _LinearNameStub:
+    """Class-name stand-in for module-name target matching ("Linear")."""
+
+    __name__ = "Linear"
 
 
 def get_quantized_linear_group_size(

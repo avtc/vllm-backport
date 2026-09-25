@@ -273,3 +273,33 @@ def test_probe_import_paths_resolve():
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501, F401
         CompressedTensorsConfig,
     )
+
+
+def test_probe_default_stub_matches_linear_module_targets(ct_config, monkeypatch):
+    """Without an explicit module, the probe's name-only stand-in must match
+    module-name targets exactly like a plain nn.Linear would (class name
+    'Linear'), and never match unrelated module names."""
+    dict_with_module_target = dict(CT_CONFIG_DICT)
+    dict_with_module_target["config_groups"] = {
+        **dict_with_module_target["config_groups"],
+        "group_5_module_name": {
+            "format": "pack-quantized",
+            "input_activations": None,
+            "output_activations": None,
+            "targets": ["Linear"],
+            "weights": {
+                "block_structure": None,
+                "dynamic": False,
+                "group_size": 16,
+                "num_bits": 8,
+                "observer": "memoryless_minmax",
+                "scale_dtype": None,
+                "strategy": "group",
+                "symmetric": True,
+                "type": "int",
+            },
+        },
+    }
+    cfg = CompressedTensorsConfig.from_config(dict_with_module_target)
+    # 'nope' matches no layer target, but the default stub reports 'Linear'.
+    assert get_compressed_tensors_group_size(cfg, "nope") == 16
