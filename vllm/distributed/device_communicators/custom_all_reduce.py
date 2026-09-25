@@ -51,22 +51,24 @@ def expandable_segments_blocks_ipc() -> bool:
     )
 
 
-def _cumem_allocator_active() -> bool:
-    """Whether the active config routes allocations through CuMemAllocator.
+def _check_expandable_segments_compat() -> None:
+    """Raise when the VMM allocator will break custom-AR IPC export.
 
-    CuMemAllocator.use_memory_pool toggles expandable_segments off around
-    its pool (see #40812), so IPC-exported buffers land on cudaMalloc'd
-    pages even when the env var is set — the same exemption the
-    KV-connector compat check in config/vllm.py applies.
+    Placed after all of CustomAllreduce's self-disable paths: configs that
+    would gracefully fall back to NCCL must not be blocked here. The memory
+    whose export fails is the graph-captured activation buffers from the
+    plain caching allocator (custom_all_reduce.cuh:164), so the cumem
+    allocator is NOT an exemption here, unlike the KV-connector guard in
+    config/vllm.py (that one pins cumem-pool KV memory specifically).
     """
-    from vllm.config import get_current_vllm_config_or_none
-
-    vllm_config = get_current_vllm_config_or_none()
-    return (
-        vllm_config is not None
-        and vllm_config.model_config is not None
-        and vllm_config.model_config.enable_cumem_allocator
-    )
+    if expandable_segments_blocks_ipc():
+        raise ValueError(
+            "Custom all-reduce is incompatible with "
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: CUDA-IPC "
+            "handle export fails on VMM-backed allocations at CUDA-graph "
+            "capture (custom_all_reduce.cuh, 'invalid argument'). Unset "
+            "expandable_segments:True, or pass --disable-custom-all-reduce."
+        )
 
 
 def custom_ar_enforced_size_mb_from_config(vllm_config: Any = None) -> int | None:
@@ -245,19 +247,6 @@ class CustomAllreduce:
             # No need to initialize custom allreduce for single GPU case.
             return
 
-        # Fail fast on the expandable_segments x CUDA-IPC incompatibility:
-        # graph-buffer IPC export (custom_all_reduce.cuh:164) returns
-        # 'invalid argument' on VMM-backed allocations and kills the worker
-        # at CUDA-graph capture with no actionable message.
-        if expandable_segments_blocks_ipc() and not _cumem_allocator_active():
-            raise ValueError(
-                "Custom all-reduce is incompatible with "
-                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: CUDA-IPC "
-                "handle export fails on VMM-backed allocations at CUDA-graph "
-                "capture (custom_all_reduce.cuh, 'invalid argument'). Unset "
-                "expandable_segments:True, or pass --disable-custom-all-reduce."
-            )
-
         if world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
             logger.warning_once(
                 "Custom allreduce is disabled due to an unsupported world"
@@ -349,6 +338,11 @@ class CustomAllreduce:
                 "warning, specify disable_custom_all_reduce=True explicitly."
             )
             return
+
+        # All self-disable paths are past: this communicator WILL initialize
+        # IPC buffers, so fail fast on configurations that crash at CUDA-graph
+        # capture with an inactionable 'invalid argument' instead.
+        _check_expandable_segments_compat()
 
         self.disabled = False
         # Buffers memory are owned by this Python class and passed to C++.

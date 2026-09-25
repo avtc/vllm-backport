@@ -20,7 +20,6 @@ if not current_platform.is_cuda():
         allow_module_level=True,
     )
 
-from vllm import envs
 from vllm.v1.attention.backends.mla.triton_mla_sparse import (
     TritonMLASparseBackend,
     dequant_gather_fp8_rows,
@@ -49,11 +48,13 @@ def test_supports_kv_cache_dtype():
 
 
 def _make_fp8_cache(rows: torch.Tensor, block_size: int) -> torch.Tensor:
-    """Quantize bf16 rows [N, head_dim] into a flat fp8 cache, row i -> slot i."""
+    """Quantize bf16 rows into a flat fp8 cache, row i living at slot i."""
     n, head_dim = rows.shape
     num_blocks = (n + block_size - 1) // block_size
     cache = torch.zeros(
-        (num_blocks, block_size, head_dim), dtype=torch.float8_e4m3fn, device=rows.device
+        (num_blocks, block_size, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device=rows.device,
     ).view(-1, head_dim)
     cache[:n] = rows.to(torch.float8_e4m3fn)
     return cache.view(num_blocks, block_size, head_dim)
@@ -84,6 +85,21 @@ def test_dequant_gather_fp8_rows_matches_cast(head_dim: int, pad: int):
     # Padded slots must be zero-filled (they are masked by -1 at attention
     # time; zeros keep NaN-free arithmetic).
     assert torch.count_nonzero(out[~valid]) == 0
+
+
+def test_dequant_gather_preserves_nan_byte():
+    """The e4m3fn NaN encoding (0x7F/0xFF) must decode to NaN (matching
+    torch's cast), not to a large finite value."""
+    head_dim = 512
+    cache = torch.zeros(1, BLOCK_SIZE, head_dim, dtype=torch.uint8, device=DEVICE)
+    cache[0, 0] = 0x7F  # +NaN in e4m3fn
+    cache[0, 1] = 0xFF  # -NaN in e4m3fn
+    cache = cache.view(torch.float8_e4m3fn)
+    ids = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+    out = torch.empty((2, head_dim), dtype=torch.bfloat16, device=DEVICE)
+    k_scale = torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
+    dequant_gather_fp8_rows(out, cache, ids, k_scale)
+    assert torch.isnan(out.float()).all()
 
 
 def test_remap_to_gather_rows_preserves_padding():
@@ -118,7 +134,9 @@ def test_fp8_sparse_attention_parity_vs_bf16(head_dim: int):
     topk_global = torch.arange(total_rows, dtype=torch.int32, device=DEVICE).reshape(
         num_tokens, 1, topk
     )
-    q = torch.randn(num_tokens, NUM_HEADS, head_dim, dtype=torch.bfloat16, device=DEVICE)
+    q = torch.randn(
+        num_tokens, NUM_HEADS, head_dim, dtype=torch.bfloat16, device=DEVICE
+    )
 
     # bf16 reference path (existing kernel, flat contiguous rows).
     out_bf16 = triton_mla_sparse_attention(
@@ -147,40 +165,55 @@ def test_fp8_sparse_attention_parity_vs_bf16(head_dim: int):
 
 @pytest.mark.parametrize("head_dim", [512, 576])
 def test_fp8_subbatched_parity(head_dim: int, monkeypatch: pytest.MonkeyPatch):
-    """The byte-budgeted sub-batch loop must produce the same output as one
-    single gather-dequant + attention call (prefill-shaped batches rely on
+    """The byte-budgeted sub-batch path (the real shared function) must be
+    bit-identical to a single-shot gather-dequant + attention call when the
+    budget forces one sub-batch per token (prefill-shaped batches rely on
     it to bound the workspace)."""
+    from vllm import envs
+    from vllm.v1.attention.backends.mla.triton_mla_sparse import (
+        _fp8_kv_subbatched_forward,
+    )
+
     torch.manual_seed(0)
-    num_tokens, topk = 7, 128
+    num_tokens, topk = 20, 128
     total_rows = num_tokens * topk
     rows = torch.randn(total_rows, head_dim, dtype=torch.bfloat16, device=DEVICE)
     topk_global = torch.arange(total_rows, dtype=torch.int32, device=DEVICE).reshape(
         num_tokens, 1, topk
     )
-    q = torch.randn(num_tokens, NUM_HEADS, head_dim, dtype=torch.bfloat16, device=DEVICE)
+    q = torch.randn(
+        num_tokens, NUM_HEADS, head_dim, dtype=torch.bfloat16, device=DEVICE
+    )
+    cache = _make_fp8_cache(rows, BLOCK_SIZE)
+    k_scale = torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
 
-    def run(budget_rows: int) -> torch.Tensor:
-        cache = _make_fp8_cache(rows, BLOCK_SIZE)
-        k_scale = torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
-        gathered = torch.empty(
-            (budget_rows * topk, head_dim), dtype=torch.bfloat16, device=DEVICE
+    def forward() -> torch.Tensor:
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+        return _fp8_kv_subbatched_forward(
+            q, cache, topk_global, k_scale, SM_SCALE, None
         )
-        outs = []
-        for t0 in range(0, num_tokens, budget_rows):
-            t1 = min(t0 + budget_rows, num_tokens)
-            sub = topk_global.reshape(-1)[t0 * topk : t1 * topk]
-            dequant_gather_fp8_rows(gathered[: sub.numel()], cache, sub, k_scale)
-            remapped = remap_to_gather_rows(sub).view(t1 - t0, 1, -1)
-            outs.append(
-                triton_mla_sparse_attention(
-                    q[t0:t1],
-                    gathered[: sub.numel()].view(-1, 1, head_dim),
-                    remapped,
-                    sm_scale=SM_SCALE,
-                )
-            )
-        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
 
-    single = run(num_tokens)
-    subbatched = run(3)  # 7 tokens -> 3 sub-batches of 3/3/1
+    # Huge budget: one sub-batch. 1 MiB -> budget_rows = 8 -> 3 sub-batches
+    # (8/8/4) for 20 tokens.
+    monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB", "1024")
+    single = forward()
+    monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB", "1")
+    subbatched = forward()
     torch.testing.assert_close(subbatched, single, rtol=0.0, atol=0.0)
+
+
+def test_forward_mqa_rejects_e5m2():
+    """Quantized dtypes outside the fp8 e4m3 whitelist must raise a clear
+    NotImplementedError from the Triton impl's dispatch (config mistakes
+    land here, not in a kernel crash)."""
+    from vllm.v1.attention.backends.mla.triton_mla_sparse import (
+        TritonMLASparseImpl,
+    )
+
+    impl = TritonMLASparseImpl.__new__(TritonMLASparseImpl)
+    impl.kv_cache_dtype = "fp8_e5m2"
+    q = torch.empty(1, 1, 512, dtype=torch.bfloat16, device=DEVICE)
+    kv = torch.empty(1, 1, 512, dtype=torch.float8_e4m3fn, device=DEVICE)
+    with pytest.raises(NotImplementedError, match="fp8/fp8_e4m3 only"):
+        impl.forward_mqa(q, kv, None, None)

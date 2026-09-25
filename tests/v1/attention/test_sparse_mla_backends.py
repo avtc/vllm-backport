@@ -1488,9 +1488,11 @@ def test_get_max_prefill_buffer_size_rejects_sub_unit_factor(bad: str):
     sub-chunks the query dim), so it must be rejected loudly."""
     from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
-    with patch.dict(os.environ, {"VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR": bad}):
-        with pytest.raises(ValueError, match="PREFILL_BUFFER_FACTOR"):
-            get_max_prefill_buffer_size(_fake_indexer_vllm_config(1000))
+    with (
+        patch.dict(os.environ, {"VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR": bad}),
+        pytest.raises(ValueError, match="PREFILL_BUFFER_FACTOR"),
+    ):
+        get_max_prefill_buffer_size(_fake_indexer_vllm_config(1000))
 
 
 # 384 is not a power of two, so it counts via the tiled atomic accumulation

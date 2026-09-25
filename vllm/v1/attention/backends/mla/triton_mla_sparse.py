@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pure-Triton sparse MLA backend for SM80 (A100) / SM121 (GB10)."""
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -14,16 +14,21 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
 from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
     XPUMLASparseBackend,
     XPUMLASparseImpl,
     XPUMLASparseMetadata,
     XPUMLASparseMetadataBuilder,
 )
+from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
 from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
     KV_SPLITS_CANDIDATES,
     triton_mla_sparse_attention,
 )
+
+if TYPE_CHECKING:
+    from vllm.config.cache import CacheDType
 
 # KV cache dtypes this backend can serve beyond the XPU base's bf16/fp16:
 # fp8 e4m3 with a per-tensor scale (written by the shared
@@ -38,46 +43,41 @@ def _dequant_gather_fp8_rows_kernel(
     cache_ptr,  # fp8 e4m3 cache, flat rows at slot * HEAD_DIM bytes
     indices_ptr,  # [total_rows] int32 flat cache row ids, -1 = padding
     k_scale_ptr,  # scalar fp32 dequant scale
+    num_rows,  # flat cache rows, for the bounds mask
     HEAD_DIM: tl.constexpr,
     BLOCK: tl.constexpr,  # elements per chunk, divides HEAD_DIM
     N_CHUNKS: tl.constexpr,  # HEAD_DIM // BLOCK
 ):
     """Gather-dequantize scattered fp8 rows into a flat bf16 workspace.
 
-    SM8x Triton cannot load or bitcast fp8e4nv element types, so e4m3fn is
-    decoded from raw bytes with integer ops (sign . 4-bit exp . 3-bit
-    mantissa, bias 7): normal = (1 + m/8) * 2^(e-7); subnormal (e == 0)
-    = m/8 * 2^-6. Global row ids address the cache as a flat contiguous
-    row array (the hybrid allocator never selects inter-block gap rows),
-    so the byte offset is simply slot * HEAD_DIM.
+    SM8x Triton cannot load or bitcast fp8e4nv element types, so bytes are
+    decoded via the shared fp8_sm80 helper (NaN-preserving, SM89+ fast
+    path). Global row ids address the cache as a flat contiguous row array
+    (the hybrid allocator never selects inter-block gap rows), so the byte
+    offset is simply slot * HEAD_DIM. Indices outside [0, num_rows) are
+    treated like -1 padding: zero-filled, then masked by the attention
+    kernel's remapped -1.
     """
     pid = tl.program_id(0)
     slot = tl.load(indices_ptr + pid).to(tl.int64)
 
     ks = tl.load(k_scale_ptr)
 
-    if slot < 0:
-        # Padded top-k slot: zero-fill keeps downstream NaN-free; the
-        # attention kernel masks it via the -1 remapped index anyway.
+    out_row = out_ptr + pid.to(tl.int64) * HEAD_DIM
+
+    if (slot < 0) | (slot >= num_rows):
         for c in tl.static_range(N_CHUNKS):
             offs = c * BLOCK + tl.arange(0, BLOCK)
-            tl.store(out_ptr + pid * HEAD_DIM + offs, tl.zeros([BLOCK], dtype=tl.bfloat16))
+            zero = tl.zeros([BLOCK], dtype=tl.bfloat16)
+            tl.store(out_row + offs, zero)
         return
 
     base = cache_ptr + slot * HEAD_DIM
     for c in tl.static_range(N_CHUNKS):
         offs = c * BLOCK + tl.arange(0, BLOCK)
         x_uint8 = tl.load(base + offs)
-        xi = x_uint8.to(tl.int32)
-        sign = (xi >> 7) & 1
-        exp = (xi >> 3) & 0xF
-        mant = (xi & 0x7).to(tl.float32)
-        normal = (1.0 + mant * 0.125) * tl.exp2(exp.to(tl.float32) - 7.0)
-        subnorm = mant * 0.125 * tl.exp2(-6.0)
-        x_float = tl.where(exp == 0, subnorm, normal) * (
-            1.0 - 2.0 * sign.to(tl.float32)
-        )
-        tl.store(out_ptr + pid * HEAD_DIM + offs, (x_float * ks).to(tl.bfloat16))
+        x_float = _decode_fp8_f32(x_uint8, False)
+        tl.store(out_row + offs, (x_float * ks).to(tl.bfloat16))
 
 
 def dequant_gather_fp8_rows(
@@ -94,17 +94,68 @@ def dequant_gather_fp8_rows(
     assert head_dim % 64 == 0, f"head_dim must be 64-aligned, got {head_dim}"
     assert cache.dtype == torch.float8_e4m3fn, cache.dtype
     # Triton on SM8x cannot handle fp8e4nv pointer types at all; view the
-    # storage as raw bytes and decode e4m3fn manually in the kernel.
+    # storage as raw bytes and decode e4m3fn in the kernel.
     cache_u8 = cache.view(torch.uint8)
+    num_rows = cache_u8.numel() // head_dim
     _dequant_gather_fp8_rows_kernel[(total_rows,)](
         out,
         cache_u8,
         indices,
         k_scale,
+        num_rows,
         HEAD_DIM=head_dim,
         BLOCK=64,
         N_CHUNKS=head_dim // 64,
     )
+
+
+def _fp8_kv_subbatched_forward(
+    q: torch.Tensor,  # [num_tokens, heads, head_dim] bf16
+    kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, block_size, head_dim] fp8
+    topk_indices_global: torch.Tensor,  # [num_tokens, topk] int32 row ids
+    k_scale: torch.Tensor,
+    softmax_scale: float,
+    sm_count: int | None,
+) -> torch.Tensor:
+    """fp8 gather-dequant + bf16 sparse attention, sub-batched by budget.
+
+    The workspace is [tokens, topk, head_dim] bf16: ~34 MB for decode-sized
+    batches, but ~1.1 GiB per layer at prefill shape (512 tokens x 2176 topk
+    x 512). Sub-batch tokens under a byte budget
+    (VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB, default 64 MiB) and reuse one
+    workspace allocation; decode batches always fit a single sub-batch.
+    """
+    flat_indices = topk_indices_global.reshape(-1)
+    num_tokens = q.shape[0]
+    head_dim = kv_c_and_k_pe_cache.shape[-1]
+    topk_width = topk_indices_global.shape[-1]
+    budget_rows = max(
+        1,
+        envs.VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB * 1024 * 1024
+        // (topk_width * head_dim * 2),
+    )
+    rows_per_subbatch = min(num_tokens, budget_rows) * topk_width
+    gathered = torch.empty(
+        (rows_per_subbatch, head_dim), dtype=torch.bfloat16, device=q.device
+    )
+    outs = []
+    for t0 in range(0, num_tokens, budget_rows):
+        t1 = min(t0 + budget_rows, num_tokens)
+        sub = flat_indices[t0 * topk_width : t1 * topk_width]
+        dequant_gather_fp8_rows(
+            gathered[: sub.numel()], kv_c_and_k_pe_cache, sub, k_scale
+        )
+        remapped = remap_to_gather_rows(sub).view(t1 - t0, 1, -1)
+        outs.append(
+            triton_mla_sparse_attention(
+                q[t0:t1],
+                gathered[: sub.numel()].view(-1, 1, head_dim),
+                remapped,
+                sm_scale=softmax_scale,
+                sm_count=sm_count,
+            )
+        )
+    return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
 
 
 def remap_to_gather_rows(flat_indices: torch.Tensor) -> torch.Tensor:
@@ -191,44 +242,14 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         bf16 kernel. Sparse attention touches only the ~topk selected rows
         per token, so the dequant cost stays bounded regardless of context
         length."""
-        flat_indices = topk_indices_global.reshape(-1)
-        num_tokens = q.shape[0]
-        head_dim = kv_c_and_k_pe_cache.shape[-1]
-        topk_width = topk_indices_global.shape[-1]
-        # The gather workspace is [tokens, topk, head_dim] bf16. Decode batches
-        # (<= max_num_seqs * next_n rows) are tiny, but prefill-shaped MQA
-        # batches would allocate ~1.1 GiB per layer at 512 tokens x 2176 topk,
-        # so sub-batch tokens under a byte budget instead and reuse one
-        # workspace allocation across sub-batches.
-        budget_rows = max(
-            1,
-            envs.VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB
-            * 1024
-            * 1024
-            // (topk_width * head_dim * 2),
+        return _fp8_kv_subbatched_forward(
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices_global,
+            layer._k_scale,
+            self.softmax_scale,
+            self._sm_count,
         )
-        rows_per_subbatch = min(num_tokens, budget_rows) * topk_width
-        gathered = torch.empty(
-            (rows_per_subbatch, head_dim), dtype=torch.bfloat16, device=q.device
-        )
-        outs = []
-        for t0 in range(0, num_tokens, max(1, budget_rows)):
-            t1 = min(t0 + budget_rows, num_tokens)
-            sub = flat_indices[t0 * topk_width : t1 * topk_width]
-            dequant_gather_fp8_rows(
-                gathered[: sub.numel()], kv_c_and_k_pe_cache, sub, layer._k_scale
-            )
-            remapped = remap_to_gather_rows(sub).view(t1 - t0, 1, -1)
-            outs.append(
-                triton_mla_sparse_attention(
-                    q[t0:t1],
-                    gathered[: sub.numel()].view(-1, 1, head_dim),
-                    remapped,
-                    sm_scale=self.softmax_scale,
-                    sm_count=self._sm_count,
-                )
-            )
-        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
 
     def forward_mqa(
         self,
@@ -245,8 +266,11 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
                 )
             if isinstance(q, tuple):
                 q = torch.cat(q, dim=-1)
+            _, block_stride_rows = flat_kv_row_view(
+                kv_c_and_k_pe_cache, attn_metadata.block_size
+            )
             topk_indices_global = self._topk_global_indices(
-                q.shape[0], kv_c_and_k_pe_cache, attn_metadata
+                q.shape[0], block_stride_rows, attn_metadata
             )
             return (
                 self._forward_fp8_kv(

@@ -244,10 +244,10 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
     def _topk_global_indices(
         self,
         num_actual_toks: int,
-        kv_c_and_k_pe_cache: torch.Tensor,
+        block_stride_rows: int,
         attn_metadata: XPUMLASparseMetadata,
     ) -> torch.Tensor:
-        """Read this step's top-k buffer and map (req, pos) to flat cache rows."""
+        """Read this step's top-k buffer and map (req, pos) to flat rows."""
         buf = (
             self._indexer.topk_indices_buffer
             if self._indexer is not None
@@ -256,9 +256,6 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
         assert buf is not None, "topk_indices_buffer required for sparse MLA"
         topk_indices = buf[:num_actual_toks]
 
-        _, block_stride_rows = flat_kv_row_view(
-            kv_c_and_k_pe_cache, attn_metadata.block_size
-        )
         return triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,
             attn_metadata.block_table,
@@ -292,11 +289,11 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
 
         num_actual_toks = q.shape[0]
 
-        kv_rows, _ = flat_kv_row_view(
+        kv_rows, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
         )
         topk_indices_global = self._topk_global_indices(
-            num_actual_toks, kv_c_and_k_pe_cache, attn_metadata
+            num_actual_toks, block_stride_rows, attn_metadata
         )
 
         attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)

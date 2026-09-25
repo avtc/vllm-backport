@@ -74,6 +74,33 @@ def test_expandable_segments_blocks_ipc(
 
 
 @pytest.mark.parametrize(
+    ("alloc_conf", "raises"),
+    [
+        (None, False),
+        ("max_split_size_mb:512", False),
+        ("expandable_segments:True", True),
+    ],
+)
+def test_check_expandable_segments_compat(
+    alloc_conf: str | None,
+    raises: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fail-fast check (called after CustomAllreduce's self-disable
+    paths, right before IPC buffer init) raises with an actionable message
+    exactly when the VMM allocator is on."""
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    if alloc_conf is not None:
+        monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", alloc_conf)
+
+    if raises:
+        with pytest.raises(ValueError, match="disable-custom-all-reduce"):
+            car._check_expandable_segments_compat()
+    else:
+        car._check_expandable_segments_compat()
+
+
+@pytest.mark.parametrize(
     ("major", "local_multicast", "expected"),
     [
         (8, True, False),
