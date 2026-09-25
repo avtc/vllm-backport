@@ -68,7 +68,7 @@ def get_compressed_tensors_group_size(
     if quant_config is None:
         return None
 
-    from compressed_tensors import QuantizationStrategy
+    from compressed_tensors.quantization import QuantizationStrategy
     from torch import nn
 
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501

@@ -262,3 +262,14 @@ def test_group_divisible_sizes_never_replicate():
         )
         is False
     )
+
+
+def test_probe_import_paths_resolve():
+    """The probe's lazy imports must match the canonical submodule paths
+    (the compressed_tensors package root does not re-export
+    QuantizationStrategy on all installed versions)."""
+    from compressed_tensors.quantization import QuantizationStrategy  # noqa: F401
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501, F401
+        CompressedTensorsConfig,
+    )
