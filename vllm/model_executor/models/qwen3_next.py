@@ -44,7 +44,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.config_utils import (
-    get_quark_ocp_mx_group_size,
+    get_quantized_linear_group_size,
 )
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -117,10 +117,10 @@ def _should_replicate_misaligned_shared_expert(
         )
 
     raise ValueError(
-        "The Quark OCP MX shared expert cannot be tensor-parallelized: "
+        "The group-quantized shared expert cannot be tensor-parallelized: "
         f"intermediate size {intermediate_size} with TP size {tp_size} "
         f"produces a partition of {partition_size}, which is not divisible by "
-        f"the OCP MX group size {group_size}. Choose a compatible "
+        f"the quantization group size {group_size}. Choose a compatible "
         "tensor-parallel size or enable expert parallelism."
     )
 
@@ -154,7 +154,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.is_fused_shared_expert_enabled:
             self.replicate_shared_expert = False
         else:
-            shared_expert_group_size = get_quark_ocp_mx_group_size(
+            shared_expert_group_size = get_quantized_linear_group_size(
                 quant_config,
                 f"{prefix}.shared_expert.down_proj",
             )

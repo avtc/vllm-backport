@@ -622,3 +622,19 @@ class TestVllmMaxNSequences:
 
         with pytest.raises(VLLMValidationError, match="n must be at most 128"):
             SamplingParams(n=129)
+
+
+class TestCTSharedExpertTPReplicate:
+    """VLLM_CT_SHARED_EXPERT_TP_REPLICATE gates the compressed-tensors
+    shared-expert group-size probe (kill switch restores quark-only)."""
+
+    def test_default_on(self):
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+        assert envs.VLLM_CT_SHARED_EXPERT_TP_REPLICATE is True
+
+    def test_explicit_off(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("VLLM_CT_SHARED_EXPERT_TP_REPLICATE", "0")
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+        assert envs.VLLM_CT_SHARED_EXPERT_TP_REPLICATE is False

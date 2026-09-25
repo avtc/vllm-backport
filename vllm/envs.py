@@ -211,6 +211,11 @@ if TYPE_CHECKING:
     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
+    # Replicate a group-quantized shared expert instead of erroring when its
+    # per-TP-partition intermediate is not a whole quant group (AutoRound/
+    # INC int4/int6/int8 compressed-tensors checkpoints). 0 restores the
+    # quark-only alignment probe.
+    VLLM_CT_SHARED_EXPERT_TP_REPLICATE: bool = True
     VLLM_INDEXER_PAGED_Q_BF16: bool = True
     VLLM_SPARSE_DECODE_MAXNREG: int = 0
     VLLM_SPARSE_DENSE_QUERY_BLOCK: int = -1
@@ -1663,6 +1668,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # replacement changed which variable it reads.
     "VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M": lambda: int(
         os.environ.get("VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M", "0")
+    ),
+    "VLLM_CT_SHARED_EXPERT_TP_REPLICATE": lambda: (
+        os.environ.get("VLLM_CT_SHARED_EXPERT_TP_REPLICATE", "1") == "1"
     ),
     # Decode-side paged indexer logits: hand the kernel bf16 q decoded once on
     # the host instead of LUT-decoding it inside every CTA. The grid is

@@ -8,8 +8,14 @@ from typing import TYPE_CHECKING
 
 import regex as re
 
+import vllm.envs as envs
+
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+    from torch import nn
+
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
 
 
 def get_quark_ocp_mx_group_size(
@@ -45,6 +51,56 @@ def get_quark_ocp_mx_group_size(
 
     assert weight_quant is not None
     return int(weight_quant["group_size"])
+
+
+def get_compressed_tensors_group_size(
+    quant_config: "QuantizationConfig | None",
+    layer_name: str,
+    module: "nn.Module | None" = None,
+) -> int | None:
+    """Return the group size of a group-quantized compressed-tensors layer.
+
+    AutoRound/INC pack-quantized checkpoints (int4/int6/int8 ``strategy:
+    group``) impose the same whole-group-per-TP-partition constraint as Quark
+    OCP MX via ``verify_group_size_divides_partition``; probing them as "no
+    group" crashes at TP4/TP8 instead of replicating the shared expert.
+    """
+    if quant_config is None:
+        return None
+
+    from compressed_tensors import QuantizationStrategy
+    from torch import nn
+
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    if not isinstance(quant_config, CompressedTensorsConfig):
+        return None
+
+    scheme_dict = quant_config.get_scheme_dict(
+        module if module is not None else nn.Linear(), layer_name
+    )
+    if scheme_dict is None:
+        return None
+    weights = scheme_dict.get("weights")
+    if weights is None or weights.strategy != QuantizationStrategy.GROUP:
+        return None
+    assert weights.group_size is not None
+    return int(weights.group_size)
+
+
+def get_quantized_linear_group_size(
+    quant_config: "QuantizationConfig | None",
+    layer_name: str,
+) -> int | None:
+    """TP-shard alignment group size for a quantized linear layer."""
+    group_size = get_quark_ocp_mx_group_size(quant_config, layer_name)
+    if group_size is not None:
+        return group_size
+    if not envs.VLLM_CT_SHARED_EXPERT_TP_REPLICATE:
+        return None
+    return get_compressed_tensors_group_size(quant_config, layer_name)
 
 
 def is_shared_expert_quant_fse_compatible(
