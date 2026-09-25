@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
@@ -233,3 +234,48 @@ def test_mmap_marker_roundtrip(tmp_path):
     # corrupted marker json -> None, not a crash
     (tmp_path / "table.bin.meta.json").write_text("{not json")
     assert _read_mmap_marker(str(table)) is None
+
+
+def test_e4m3fn_decode_lut_values():
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import _e4m3fn_decode_lut
+
+    lut = _e4m3fn_decode_lut()
+    assert lut[0x38] == 1.0
+    assert lut[0x3C] == 1.5
+    assert lut[0x40] == 2.0
+    assert lut[0xB8] == -1.0
+    assert abs(lut[0x01] - 2.0**-9) < 1e-12  # smallest subnormal
+    assert lut[0x7E] == 448.0  # largest finite
+    assert lut[0x00] == 0.0 and lut[0x80] == 0.0  # +-0
+    assert lut[0x7F] == 0.0 and lut[0xFF] == 0.0  # NaN encodings sanitized
+
+
+def test_gather_fp8_storage_dequantizes():
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+        _gather_rows_from_table,
+    )
+
+    base = torch.randn(32, 8, dtype=torch.bfloat16)
+    absmax = base.abs().amax().float().item()
+    scale = max(absmax / 448.0, 1.0e-12)
+    table = (base.to(torch.float32) / scale).to(torch.float8_e4m3fn)
+    ids = torch.tensor([3, 5, 100, -1])  # last two out of range -> zeros
+    rows = _gather_rows_from_table(
+        table, ids, 0, 32, scale=scale, compute_dtype=torch.bfloat16
+    )
+    assert rows.dtype == torch.bfloat16
+    decoded = table.to(torch.float32) * scale
+    assert torch.allclose(rows[0].float(), decoded[3], rtol=0.05)
+    assert torch.allclose(rows[1].float(), decoded[5], rtol=0.05)
+    assert torch.equal(rows[2], torch.zeros(8, dtype=torch.bfloat16))
+    assert torch.equal(rows[3], torch.zeros(8, dtype=torch.bfloat16))
+
+
+def test_gather_scale_requires_fp8_table():
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+        _gather_rows_from_table,
+    )
+
+    table = torch.randn(8, 4, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="fp8 table storage"):
+        _gather_rows_from_table(table, torch.tensor([1]), 0, 8, scale=0.5)

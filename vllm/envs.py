@@ -186,6 +186,10 @@ if TYPE_CHECKING:
     # instead of forward: removes the per-step D2H sync from the critical
     # path and keeps forward capturable in FULL cudagraphs.
     VLLM_PLE_MMAP_PREPARE_OUTSIDE: bool = False
+    # Store the PLE table as e4m3 with a per-tensor scale (written at first
+    # finalize as a .fp8 sidecar): halves NVMe footprint and warm page cache;
+    # gathers decode through a 256-entry LUT.
+    VLLM_PLE_MMAP_STORE_FP8: bool = False
     # QSA fp8 main-KV read path: "" (bf16 only), "decode" (in-kernel e4m3
     # decode) or "gather" (bf16 workspace pre-pass) for A/B comparison.
     VLLM_QSA_FP8_KV: str = ""
@@ -2457,6 +2461,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_PLE_MMAP_PREPARE_OUTSIDE": lambda: bool(
         int(os.getenv("VLLM_PLE_MMAP_PREPARE_OUTSIDE", "0"))
+    ),
+    "VLLM_PLE_MMAP_STORE_FP8": lambda: bool(
+        int(os.getenv("VLLM_PLE_MMAP_STORE_FP8", "0"))
     ),
     "VLLM_QSA_FP8_KV": lambda: os.getenv("VLLM_QSA_FP8_KV", ""),
     # Debug logging for --enable-mfu-metrics

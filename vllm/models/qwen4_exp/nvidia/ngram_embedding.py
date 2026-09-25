@@ -498,7 +498,10 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         self._init_prefetch_resources(num_ngram_heads, max_total_tokens)
 
     def _init_prefetch_resources(
-        self, num_ngram_heads: int, max_total_tokens: int
+        self,
+        num_ngram_heads: int,
+        max_total_tokens: int,
+        dtype: torch.dtype | None = None,
     ) -> None:
         """Side stream and GPU prefetch buffer shared by host-backed variants."""
         device = torch.cuda.current_device()
@@ -507,7 +510,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             max_total_tokens * self.etp_data_parallel_size,
             num_ngram_heads,
             self.embedding_dim,
-            dtype=self.weight.dtype,
+            dtype=dtype if dtype is not None else self.weight.dtype,
             device=device,
         )
         self._output_dim = num_ngram_heads * self.embedding_dim
@@ -631,33 +634,79 @@ _NUMPY_STORAGE_DTYPES = {1: np.int8, 2: np.int16, 4: np.int32}
 _STORAGE_TORCH_DTYPES = {1: torch.int8, 2: torch.int16, 4: torch.int32}
 
 
+_E4M3FN_F32_LUT: np.ndarray | None = None
+
+
+def _e4m3fn_decode_lut() -> np.ndarray:
+    """float32 values of all 256 e4m3fn byte encodings (NaN maps to 0).
+
+    Pure numpy bit math: CPU torch has no reliable fp8 elementwise ops, and
+    a 256-entry table decodes gathered bytes with one fancy index.
+    """
+    global _E4M3FN_F32_LUT
+    if _E4M3FN_F32_LUT is None:
+        u = np.arange(256, dtype=np.uint8)
+        sign = np.where(u & 0x80, -1.0, 1.0).astype(np.float32)
+        exponent = ((u >> 3) & 0x0F).astype(np.float32)
+        mantissa = (u & 0x07).astype(np.float32)
+        values = np.where(
+            exponent == 0,
+            (mantissa / 8.0) * np.float32(2.0**-6),
+            (1.0 + mantissa / 8.0) * np.exp2(exponent - 7.0),
+        ).astype(np.float32)
+        values = np.where((u & 0x7F) == 0x7F, 0.0, sign * values)
+        _E4M3FN_F32_LUT = values
+    return _E4M3FN_F32_LUT
+
+
 def _gather_rows_from_table(
     table: torch.Tensor,
     row_ids: torch.Tensor,
     vocab_start: int,
     vocab_end: int,
+    scale: float | None = None,
+    compute_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Host-side row gather with the UVA kernel's out-of-range semantics.
 
     Rows outside ``[vocab_start, vocab_end)`` yield zeros (the kernel's
-    ``other=0.0`` masked load). The gather is bit-exact: rows move through a
-    same-width integer view because numpy has no bf16/fp8 dtype, and CPU
-    indexing does not support fp8.
+    ``other=0.0`` masked load). Rows move through a same-width integer view
+    because numpy has no bf16/fp8 dtype and CPU indexing does not support
+    fp8. With ``scale`` set the table is e4m3 storage: bytes decode through
+    a 256-entry LUT, dequantize, and return ``compute_dtype`` rows.
     """
-    storage = _STORAGE_TORCH_DTYPES.get(table.dtype.itemsize)
+    src = table.detach()
+    ids = row_ids.detach().to(torch.int64).numpy()
+    if scale is not None:
+        if src.dtype not in _FP8_STORAGE_DTYPES:
+            raise RuntimeError("a gather scale requires fp8 table storage")
+        out = np.zeros((ids.shape[0], src.shape[1]), dtype=np.float32)
+        if ids.size:
+            in_range = (ids >= vocab_start) & (ids < vocab_end)
+            local = np.where(in_range, ids - vocab_start, 0)
+            out[:] = (
+                _e4m3fn_decode_lut()[
+                    np.take(src.view(torch.uint8).numpy(), local, axis=0)
+                ]
+                * scale
+            )
+            out[~in_range] = 0
+        rows = torch.from_numpy(out)
+        return rows.to(compute_dtype if compute_dtype is not None else torch.bfloat16)
+
+    storage = _STORAGE_TORCH_DTYPES.get(src.dtype.itemsize)
     if storage is None:
         raise RuntimeError(
-            f"unsupported PLE mmap storage dtype ({table.dtype.itemsize} bytes)"
+            f"unsupported PLE mmap storage dtype ({src.dtype.itemsize} bytes)"
         )
-    src = table.detach().view(storage).numpy()
-    ids = row_ids.detach().to(torch.int64).numpy()
-    out = np.zeros((ids.shape[0], src.shape[1]), dtype=src.dtype)
+    src_np = src.view(storage).numpy()
+    out = np.zeros((ids.shape[0], src_np.shape[1]), dtype=src_np.dtype)
     if ids.size:
         in_range = (ids >= vocab_start) & (ids < vocab_end)
         local = np.where(in_range, ids - vocab_start, 0)
-        np.take(src, local, axis=0, out=out)
+        np.take(src_np, local, axis=0, out=out)
         out[~in_range] = 0
-    return torch.from_numpy(out).view(table.dtype)
+    return torch.from_numpy(out).view(src.dtype)
 
 
 def _mmap_table_path() -> str:
@@ -751,7 +800,6 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
     VLLM_USE_BREAKABLE_CUDAGRAPH=1) or NONE.
     """
 
-
     def __init__(
         self,
         num_embeddings: int,
@@ -769,9 +817,7 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         # With VLLM_PLE_MMAP_PREPARE_OUTSIDE the host gather runs in the
         # model state's prepare_inputs (before forward), so forward holds
         # only GPU ops and FULL cudagraphs stay sound.
-        self.prefetch_runs_outside_forward = bool(
-            envs.VLLM_PLE_MMAP_PREPARE_OUTSIDE
-        )
+        self.prefetch_runs_outside_forward = bool(envs.VLLM_PLE_MMAP_PREPARE_OUTSIDE)
         clamped, reason = _clamp_cudagraph_mode_for_host_gather(
             self._vllm_cfg.compilation_config.cudagraph_mode,
             is_breakable_cudagraph_enabled(),
@@ -794,15 +840,20 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             max_total_tokens=max_total_tokens,
             data_parallel_rank=data_parallel_rank,
         )
+        # fp8 table storage dequantizes on gather, so every buffer the model
+        # consumes stays in the checkpoint (compute) dtype chosen in
+        # allocate_embedding_weight.
         self._staging = torch.empty(
             max_total_tokens * self.etp_data_parallel_size,
             num_ngram_heads,
             self.embedding_dim,
-            dtype=self.weight.dtype,
+            dtype=self._compute_dtype,
             device="cpu",
             pin_memory=bool(envs.VLLM_PLE_MMAP_PIN_STAGING),
         )
-        self._init_prefetch_resources(num_ngram_heads, max_total_tokens)
+        self._init_prefetch_resources(
+            num_ngram_heads, max_total_tokens, self._compute_dtype
+        )
 
     def allocate_embedding_weight(
         self,
@@ -816,6 +867,46 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         path = _mmap_table_path()
         itemsize = torch.empty((), dtype=dtype).element_size()
         nbytes = num_embeddings * embedding_dim * itemsize
+        fp8_path = path + ".fp8"
+        fp8_marker = (
+            _read_mmap_marker(fp8_path)
+            if envs.VLLM_PLE_MMAP_STORE_FP8 and not envs.VLLM_PLE_MMAP_REBUILD
+            else None
+        )
+        if (
+            fp8_marker is not None
+            and fp8_marker.get("num_embeddings") == num_embeddings
+            and fp8_marker.get("embedding_dim") == embedding_dim
+            and fp8_marker.get("dtype") == str(torch.float8_e4m3fn)
+            and fp8_marker.get("model") == self._vllm_cfg.model_config.model
+            and isinstance(fp8_marker.get("scale"), float)
+            and os.path.exists(fp8_path)
+            and os.path.getsize(fp8_path) == num_embeddings * embedding_dim
+        ):
+            # Halves the file and the warm page cache; gathers decode via LUT.
+            self._mmap_array = np.memmap(
+                fp8_path,
+                dtype=np.int8,
+                mode="c",
+                shape=(num_embeddings, embedding_dim),
+            )
+            self._mmap_prebuilt = True
+            self._storage_scale = float(fp8_marker["scale"])
+            self._compute_dtype = dtype
+            self._mmap_table_path_used = fp8_path
+            logger.info(
+                "PLE mmap table %s: rows=%d dim=%d fp8 storage, scale=%.3e "
+                "(%.2f GiB, prebuilt copy-on-write)",
+                fp8_path,
+                num_embeddings,
+                embedding_dim,
+                self._storage_scale,
+                num_embeddings * embedding_dim / (1 << 30),
+            )
+            return torch.from_numpy(self._mmap_array).view(torch.float8_e4m3fn)
+
+        self._storage_scale = None
+        self._compute_dtype = dtype
         np_dtype = _NUMPY_STORAGE_DTYPES.get(itemsize)
         if np_dtype is None:
             raise RuntimeError(
@@ -834,7 +925,12 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             and not envs.VLLM_PLE_MMAP_REBUILD
         )
         if envs.VLLM_PLE_MMAP_REBUILD:
-            for stale in (path, _mmap_marker_path(path)):
+            for stale in (
+                path,
+                _mmap_marker_path(path),
+                fp8_path,
+                _mmap_marker_path(fp8_path),
+            ):
                 if os.path.exists(stale):
                     os.unlink(stale)
         if prebuilt:
@@ -897,8 +993,56 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
                 "model": self._vllm_cfg.model_config.model,
             },
         )
+        if envs.VLLM_PLE_MMAP_STORE_FP8 and self._storage_scale is None:
+            self._quantize_table_to_fp8()
         self._mmap_prebuilt = True
         logger.info("PLE mmap table persisted; the next start skips loading it")
+
+    def _quantize_table_to_fp8(self) -> None:
+        """Write a half-size e4m3 copy of the freshly filled bf16 table.
+
+        Per-tensor scale = absmax/448 keeps the full value range; the
+        running boots map this file copy-on-write and decode gathers through
+        the e4m3 LUT, halving both NVMe footprint and warm page cache.
+        """
+        if self.weight.dtype in _FP8_STORAGE_DTYPES:
+            return
+        rows, dim = self.weight.shape
+        chunk_rows = max(1, (1 << 20) // max(1, dim))
+        absmax = 0.0
+        for start in range(0, rows, chunk_rows):
+            stop = min(start + chunk_rows, rows)
+            absmax = max(absmax, float(self.weight[start:stop].abs().amax().float()))
+        scale = max(absmax / 448.0, 1.0e-12)
+        fp8_path = _mmap_table_path() + ".fp8"
+        target = np.memmap(fp8_path, dtype=np.int8, mode="w+", shape=(rows, dim))
+        for start in range(0, rows, chunk_rows):
+            stop = min(start + chunk_rows, rows)
+            quantized = (
+                self.weight[start:stop]
+                .to(torch.float32)
+                .div(scale)
+                .to(torch.float8_e4m3fn)
+            )
+            target[start:stop] = quantized.view(torch.int8).numpy()
+        target.flush()
+        _write_mmap_marker(
+            fp8_path,
+            {
+                "num_embeddings": int(rows),
+                "embedding_dim": int(dim),
+                "dtype": str(torch.float8_e4m3fn),
+                "model": self._vllm_cfg.model_config.model,
+                "scale": scale,
+            },
+        )
+        logger.info(
+            "PLE mmap table quantized to fp8 at %s (scale=%.3e); next start "
+            "maps the %.2f GiB file",
+            fp8_path,
+            scale,
+            rows * dim / (1 << 30),
+        )
 
     def _lookup(
         self,
@@ -927,16 +1071,22 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             flat_ids,
             int(self.shard_indices.org_vocab_start_index),
             int(self.shard_indices.org_vocab_end_index),
+            scale=self._storage_scale,
+            compute_dtype=self._compute_dtype,
         )
         n = rows.shape[0]
         staging = self._staging.reshape(-1, self.embedding_dim)
         assert n <= staging.shape[0], (
             f"PLE mmap staging overflow: {n} rows > {staging.shape[0]}"
         )
-        # Byte copies through a same-width integer view: CPU fp8 indexing
-        # is unreliable and numpy lacks bf16/fp8.
-        storage = _STORAGE_TORCH_DTYPES[self.weight.dtype.itemsize]
-        staging.view(storage)[:n].copy_(rows.view(storage))
+        if self._storage_scale is None:
+            # Byte copies through a same-width integer view: CPU fp8
+            # indexing is unreliable and numpy lacks bf16/fp8.
+            storage = _STORAGE_TORCH_DTYPES[self.weight.dtype.itemsize]
+            staging.view(storage)[:n].copy_(rows.view(storage))
+        else:
+            # e4m3 storage: gather already dequantized to the compute dtype.
+            staging[:n].copy_(rows)
         output.reshape(-1, self.embedding_dim).copy_(
             staging[:n], non_blocking=self._staging.is_pinned()
         )
