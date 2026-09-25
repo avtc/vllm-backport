@@ -839,8 +839,7 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
         # workspace smaller than one max-length request's gather would
         # overflow the K-gather buffer.
         raise ValueError(
-            "VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR must be >= 1, got "
-            f"{factor}."
+            f"VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR must be >= 1, got {factor}."
         )
     return max_model_len * factor
 

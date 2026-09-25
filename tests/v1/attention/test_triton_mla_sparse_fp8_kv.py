@@ -23,6 +23,7 @@ if not current_platform.is_cuda():
 from vllm.v1.attention.backends.mla.triton_mla_sparse import (
     TritonMLASparseBackend,
     dequant_gather_fp8_rows,
+    flat_cache_row_count,
     remap_to_gather_rows,
 )
 from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
@@ -58,6 +59,64 @@ def _make_fp8_cache(rows: torch.Tensor, block_size: int) -> torch.Tensor:
     ).view(-1, head_dim)
     cache[:n] = rows.to(torch.float8_e4m3fn)
     return cache.view(num_blocks, block_size, head_dim)
+
+
+def test_dequant_gather_strided_cache_last_block():
+    """Bounds must be stride-derived, not numel-derived, for paged caches
+    with interleaved (block-outermost) layouts.
+
+    Build a cache whose blocks are strided apart - as KVCacheTensor layouts
+    produce when other layers' pages sit between this cache's - then gather
+    rows from the LAST block. A numel()//head_dim bound undercounts the
+    addressable rows, masks those slots, and zero-fills the gather.
+    """
+    torch.manual_seed(0)
+    head_dim = 512
+    num_blocks, block_size = 4, 64
+    gap_blocks = 3  # other layers' pages between consecutive blocks
+    block_rows = block_size
+    backing = torch.zeros(
+        num_blocks * (1 + gap_blocks) * block_rows * head_dim,
+        dtype=torch.uint8,
+        device=DEVICE,
+    )
+    stride0 = (1 + gap_blocks) * block_rows * head_dim
+    cache = backing.as_strided(
+        (num_blocks, block_size, head_dim), (stride0, head_dim, 1)
+    ).view(torch.float8_e4m3fn)
+
+    # Formula mirrors flat_kv_row_view's row space.
+    assert flat_cache_row_count(cache) == (
+        (num_blocks - 1) * (stride0 // head_dim) + block_size
+    )
+    # The stride gap makes this strictly larger than the numel-based count;
+    # guards against silently reverting to numel()//head_dim.
+    assert flat_cache_row_count(cache) > cache.numel() // head_dim
+
+    # Distinct values per block; fill via the strided view itself.
+    for b in range(num_blocks):
+        cache[b] = torch.full(
+            (block_size, head_dim), 0.5 + b, dtype=torch.bfloat16, device=DEVICE
+        ).to(torch.float8_e4m3fn)
+
+    ids = torch.tensor(
+        # First row of each block in the virtual flat row space
+        # (block stride is (1 + gap_blocks) * block_rows rows).
+        [0, 256, 512, 768],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    out = torch.empty((ids.numel(), head_dim), dtype=torch.bfloat16, device=DEVICE)
+    k_scale = torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
+    dequant_gather_fp8_rows(out, cache, ids, k_scale)
+    for j, b in enumerate(range(num_blocks)):
+        expected = (
+            torch.full((head_dim,), 0.5 + b, dtype=torch.bfloat16, device=DEVICE)
+            .to(torch.float8_e4m3fn)
+            .to(torch.bfloat16)
+        )
+        # Zero-filled output is the signature of the numel-based-bound bug.
+        assert torch.equal(out[j], expected), f"block {b} row corrupted"
 
 
 @pytest.mark.parametrize("head_dim", [512, 576])

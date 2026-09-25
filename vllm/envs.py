@@ -63,11 +63,15 @@ if TYPE_CHECKING:
     # head_dim=128). Default 40 preserves upstream sizing; lower it on
     # memory-constrained long-context setups (factor 4 at 1M ctx turns the
     # 5.16 GiB workspace into 540 MB). Must stay >= 1: the chunker cannot
-    # split a single request's gather below its full length.
+    # Multiplier on max_model_len for the sparse-indexer prefill K-gather
+    # workspace rows. 40 is the upstream default, sized to match the
+    # flashmla workspace; values above it only grow memory, never enable
+    # bigger requests, and values below 1 are rejected.
     VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
     # Byte budget for the Triton sparse-MLA fp8 gather-dequant workspace.
-    # Prefill-shaped MQA batches sub-batch tokens to stay under this; decode
-    # batches (max_num_seqs * next_n rows) always fit the default.
+    # Prefill-shaped MQA batches sub-batch tokens to stay under this. At
+    # default 64 MiB a GLM-shaped batch (topk 2176, head_dim 512) fits ~30
+    # token rows per sub-batch, so large decode batches sub-batch too.
     VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB: int = 64
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"

@@ -100,6 +100,31 @@ def test_check_expandable_segments_compat(
         car._check_expandable_segments_compat()
 
 
+def test_guard_placement_after_self_disable_paths() -> None:
+    """The expandable-segments guard must fire only for live communicators.
+
+    Full CustomAllreduce construction needs a real process group, so this
+    pins the placement structurally: the guard call must be the LAST
+    statement of __init__, after the multi-node MNNVL-multicast disable
+    path (a communicator that disables itself must never be gated).
+    """
+    import inspect
+
+    src = inspect.getsource(car.CustomAllreduce.__init__)
+    mnnvl_pos = src.find("does not support MNNVL multicast")
+    guard_pos = src.find("_check_expandable_segments_compat()")
+    assert mnnvl_pos != -1, "mnnvl disable path moved or renamed"
+    assert guard_pos != -1, "expandable-segments guard call was removed"
+    assert mnnvl_pos < guard_pos, (
+        "guard must sit after the mnnvl self-disable path, not before it"
+    )
+    # And it must be past every `self.disabled = True` disable site.
+    last_disable = src.rfind("self.disabled = True")
+    assert last_disable < guard_pos, (
+        "guard must run after every self-disable path in __init__"
+    )
+
+
 @pytest.mark.parametrize(
     ("major", "local_multicast", "expected"),
     [

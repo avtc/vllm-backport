@@ -91,6 +91,12 @@ def flat_cache_row_count(cache: torch.Tensor) -> int:
     blocks' rows and silently corrupt attention.
     """
     num_blocks, block_size, head_dim = cache.shape
+    assert cache.stride(2) == 1 and cache.stride(1) == head_dim, (
+        f"non-row-contiguous cache view: {tuple(cache.stride())}"
+    )
+    assert cache.stride(0) % head_dim == 0, (
+        f"block stride {cache.stride(0)} not a multiple of head_dim {head_dim}"
+    )
     block_stride_rows = cache.stride(0) // head_dim
     return (num_blocks - 1) * block_stride_rows + block_size
 
@@ -138,14 +144,17 @@ def _fp8_kv_subbatched_forward(
 ) -> torch.Tensor:
     """fp8 gather-dequant + bf16 sparse attention, sub-batched by budget.
 
-    The workspace is [tokens, topk, head_dim] bf16: ~34 MB for decode-sized
+    The workspace is [tokens, topk, head_dim] bf16: ~34 MB for small decode
     batches, but ~1.1 GiB per layer at prefill shape (512 tokens x 2176 topk
     x 512). Sub-batch tokens under a byte budget
     (VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB, default 64 MiB) and reuse one
-    workspace allocation; decode batches always fit a single sub-batch.
+    workspace allocation; batches larger than the budget (big prefills, and
+    decode batches over ~30 rows at GLM shape with the default) sub-batch.
     """
-    flat_indices = topk_indices_global.reshape(-1)
     num_tokens = q.shape[0]
+    if num_tokens == 0:
+        return torch.empty_like(q)
+    flat_indices = topk_indices_global.reshape(-1)
     head_dim = kv_c_and_k_pe_cache.shape[-1]
     topk_width = topk_indices_global.shape[-1]
     num_cache_rows = flat_cache_row_count(kv_c_and_k_pe_cache)
