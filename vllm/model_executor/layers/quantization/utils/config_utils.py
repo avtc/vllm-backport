@@ -94,7 +94,13 @@ def get_quantized_linear_group_size(
     quant_config: "QuantizationConfig | None",
     layer_name: str,
 ) -> int | None:
-    """TP-shard alignment group size for a quantized linear layer."""
+    """TP-shard alignment group size for a quantized linear layer.
+
+    Quark OCP MX keeps its dedicated probe; the compressed-tensors probe is
+    gated by ``VLLM_CT_SHARED_EXPERT_TP_REPLICATE`` (default on; ``0``
+    restores quark-only detection, i.e. compressed-tensors layers probe as
+    "no group" and misaligned shared experts error at TP>2 again).
+    """
     group_size = get_quark_ocp_mx_group_size(quant_config, layer_name)
     if group_size is not None:
         return group_size

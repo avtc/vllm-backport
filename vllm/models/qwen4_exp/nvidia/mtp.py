@@ -200,10 +200,18 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
 
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
         draft_vllm_config = _make_draft_vllm_config(
             vllm_config,
             self.mtp_start_layer_idx,
+        )
+        # Quantized checkpoints also pack embed_tokens (int8 g128 here); the
+        # draft quant config carries the MTP-aware ignore/quant maps, so it
+        # decides whether this embedding builds quantized or bf16.
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            self.hidden_size,
+            quant_config=draft_vllm_config.quant_config,
+            prefix=f"{prefix}.embed_tokens",
         )
         with set_current_vllm_config(draft_vllm_config, prefix=prefix):
             # residual_linear_shared fusion: fc_embedding projects the token
@@ -260,7 +268,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.hyper_connection_mixer = GatedResidual(
             hc_config,
             use_combine=False,
-            quant_config=vllm_config.quant_config,
+            quant_config=draft_vllm_config.quant_config,
             prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -420,6 +428,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:

@@ -72,6 +72,43 @@ CT_CONFIG_DICT = {
                 "type": "int",
             },
         },
+        # Non-GROUP strategies must never yield an alignment constraint: fp8
+        # channelwise (tensor) and 128x128 block scales shard along different
+        # axes and are handled by their own schemes.
+        "group_2_fp8_channel": {
+            "format": "float-quantized",
+            "input_activations": None,
+            "output_activations": None,
+            "targets": ["model.language_model.layers.0.linear_attn.dt_proj"],
+            "weights": {
+                "block_structure": None,
+                "dynamic": False,
+                "group_size": None,
+                "num_bits": 8,
+                "observer": "memoryless_minmax",
+                "scale_dtype": None,
+                "strategy": "tensor",
+                "symmetric": True,
+                "type": "float",
+            },
+        },
+        "group_3_fp8_block": {
+            "format": "float-quantized",
+            "input_activations": None,
+            "output_activations": None,
+            "targets": ["model.language_model.layers.0.self_attn.o_proj"],
+            "weights": {
+                "block_structure": [128, 128],
+                "dynamic": False,
+                "group_size": None,
+                "num_bits": 8,
+                "observer": "memoryless_minmax",
+                "scale_dtype": None,
+                "strategy": "block",
+                "symmetric": True,
+                "type": "float",
+            },
+        },
     },
     "format": "pack-quantized",
     "quant_method": "compressed-tensors",
@@ -99,6 +136,52 @@ def test_probe_ignores_unmatched_layer(ct_config):
     assert get_compressed_tensors_group_size(ct_config, name) is None
 
 
+def test_probe_ignores_non_group_strategies(ct_config):
+    """fp8 tensor/channelwise and block strategies impose no group-size
+    alignment constraint on TP partitions (they shard along other axes or
+    use their own block checks)."""
+    channel = "model.language_model.layers.0.linear_attn.dt_proj"
+    block = "model.language_model.layers.0.self_attn.o_proj"
+    assert get_compressed_tensors_group_size(ct_config, channel) is None
+    assert get_compressed_tensors_group_size(ct_config, block) is None
+
+
+def test_probe_matches_module_name_targets(ct_config, monkeypatch):
+    """Module-name targets resolve through the caller-supplied module's
+    class name, mirroring how the real linear construction resolves them."""
+    dict_with_module_target = dict(CT_CONFIG_DICT)
+    dict_with_module_target["config_groups"] = {
+        **dict_with_module_target["config_groups"],
+        "group_4_module_name": {
+            "format": "pack-quantized",
+            "input_activations": None,
+            "output_activations": None,
+            "targets": ["Qwen3NextMLP"],
+            "weights": {
+                "block_structure": None,
+                "dynamic": False,
+                "group_size": 32,
+                "num_bits": 8,
+                "observer": "memoryless_minmax",
+                "scale_dtype": None,
+                "strategy": "group",
+                "symmetric": True,
+                "type": "int",
+            },
+        },
+    }
+    cfg = CompressedTensorsConfig.from_config(dict_with_module_target)
+
+    class Qwen3NextMLP(torch.nn.Module):
+        pass
+
+    name = "model.language_model.layers.5.mlp.some_proj"
+    # The default dummy nn.Linear does not match a Qwen3NextMLP target...
+    assert get_compressed_tensors_group_size(cfg, name) is None
+    # ...but the caller's module does.
+    assert get_compressed_tensors_group_size(cfg, name, Qwen3NextMLP()) == 32
+
+
 def test_probe_handles_no_quant_config():
     assert get_quantized_linear_group_size(None, LAYER) is None
     assert get_compressed_tensors_group_size(None, LAYER) is None
@@ -117,6 +200,13 @@ def _clear_envs_cache() -> None:
 
     if hasattr(envs.__getattr__, "cache_clear"):
         envs.__getattr__.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_envs_cache():
+    """Leave the envs lru-cache clean so later tests see real env values."""
+    yield
+    _clear_envs_cache()
 
 
 def test_probe_kill_switch_default_on(ct_config):
@@ -172,9 +262,3 @@ def test_group_divisible_sizes_never_replicate():
         )
         is False
     )
-
-
-def test_dummy_module_is_linear():
-    """The probe passes a plain nn.Linear for module-name target matching."""
-    layer = torch.nn.Linear(8, 8)
-    assert get_compressed_tensors_group_size(None, "x", layer) is None

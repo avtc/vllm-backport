@@ -60,8 +60,10 @@ class GatedResidual(nn.Module):
     GEMM) applies through the standard quant_method mechanism. The down and
     inject projections stay split because quantized checkpoints (AutoRound /
     INC int8 group-64) quantize ``input_mix_weight_down`` and
-    ``input_mix_weight_up`` independently — separately-quantized tensors
-    cannot be stacked into one packed merged weight on load.
+    ``input_mix_weight_up`` independently -- separately-quantized tensors
+    cannot be stacked into one packed merged weight on load. The merged
+    variant's deliberate 16-row CuBLAS alignment padding is dropped with it;
+    these skinny GEMMs are not dispatch-critical.
     """
 
     def __init__(
