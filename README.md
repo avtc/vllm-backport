@@ -170,7 +170,7 @@ Third-party AutoRound checkpoints (e.g. [`Minachist/Qwen3.8-Flash-Next-INT4-Mixe
 - The hyper-connection `input_mix_weight_down`/`block_inject_weight` projections load **split** (separately-quantized tensors cannot be stacked into the merged packed weight), and `embed_tokens`/`lm_head` accept `quant_config`.
 - The shared expert (INT6 g64, 640-wide) is **replicated** when its TP partition is not a whole quant group (TP4: 160, TP8: 80) instead of crashing; detected via the compressed-tensors group-size probe. Kill switch: `VLLM_CT_SHARED_EXPERT_TP_REPLICATE=0`.
 
-The checkpoint's MTP head is stored in BF16 (the INT4 regex only matches `model|language_model` prefixes), so no separate draft requant is needed. The MTP draft layer, indexer `index_qk_proj` and the PLE `kv_proj` are TP-replicated by construction; the 2 KV heads use standard GQA replication at TP4/TP8.
+The checkpoint's MTP head is stored in BF16 (the INT4 regex only matches `model|language_model` prefixes), so no separate draft requant is needed. The draft layers are ordinary TP-sharded decoder layers made safe by that BF16 status; the indexer `index_qk_proj` and PLE `kv_proj` are TP-replicated by construction; the 2 KV heads use standard GQA replication at TP4/TP8.
 
 ```bash
 # 8 x 24GB (target topology; ~10-11 GB weights/GPU, PLE table in host RAM)
@@ -182,7 +182,6 @@ VLLM_PLE_CPU_OFFLOAD=1 vllm serve /path/to/qwen3.8-int4-mixed \
   --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3
 ```
 
-- `--enable-expert-parallel` is required at TP4/TP8 (routed experts INT4 g128: 160/80 per rank is not a whole group). Without EP the server exits with an explicit error suggesting EP; with EP the shared expert replicates (~178 MB/GPU).
 - `--enable-expert-parallel` is required at **every** TP size for this checkpoint: the routed experts are INT4 g128 and 640/TP is never a whole group (320 %128 = 64 at TP2, 160/80 at TP4/8). Only the shared expert additionally replicates at TP4/TP8 (640/TP %64 != 0); at TP2 it still shards (320 %64 == 0). Pipeline fallback: `VLLM_PP_LAYER_PARTITION="12,12,13,11"` with `--tensor-parallel-size 2 --pipeline-parallel-size 4` (stage 0 carries embed + the single PLE layer; stage 3 carries lm_head + MTP).
 - `VLLM_PLE_CPU_OFFLOAD=1` pins ~51 GiB fp8 n-gram rows in host RAM — budget for it (>=64 GB RAM).
 

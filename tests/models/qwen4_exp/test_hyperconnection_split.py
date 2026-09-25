@@ -95,10 +95,10 @@ def test_no_merged_hc_name_in_weight_mappers():
     stacked = qwen4_model._EXTRA_WEIGHTS_MAPPER.orig_to_new_stacked
     assert stacked["ple.key_proj"] == ("ple.kv_proj", 0)
     assert stacked["ple.value_proj"] == ("ple.kv_proj", 1)
-    assert (
-        qwen4_model.Qwen4ExpForCausalLM.packed_modules_mapping["kv_proj"]
-        == ["key_proj", "value_proj"]
-    )
+    assert qwen4_model.Qwen4ExpForCausalLM.packed_modules_mapping["kv_proj"] == [
+        "key_proj",
+        "value_proj",
+    ]
     assert "kv_proj" not in qwen4_mtp.Qwen4ExpMTP.packed_modules_mapping
 
 

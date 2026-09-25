@@ -18,7 +18,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm.model_executor.layers.quantization.compressed_tensors import (
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
 )
 from vllm.model_executor.layers.quantization.utils.config_utils import (
