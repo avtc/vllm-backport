@@ -823,6 +823,12 @@ def choose_mp_linear_kernel(
     # Apply --linear-backend filtering when set.
     platform_kernels = _resolve_backend_kernels(platform_kernels, "mixed-precision")
 
+    # VLLM_WNA16_PREFER_KERNEL=marlin|humming moves that family to the front
+    # (prefer-with-fallback: incompatible candidates are still skipped below).
+    from vllm.model_executor.kernels.linear.preference import apply_kernel_preference
+
+    platform_kernels = apply_kernel_preference(platform_kernels)
+
     failure_reasons = []
     for kernel in platform_kernels:
         if kernel.__name__ in envs.VLLM_DISABLED_KERNELS:

@@ -227,6 +227,11 @@ if TYPE_CHECKING:
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
+    # Prefer a WNA16 kernel family (marlin|humming) in kernel-candidate
+    # ordering for both dense MP-linear and WNA16 MoE selection. Incompatible
+    # candidates are still skipped, so unsupported configs fall back to the
+    # remaining kernels (prefer-with-fallback, not force).
+    VLLM_WNA16_PREFER_KERNEL: Literal["auto", "marlin", "humming"] = "auto"
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -1754,6 +1759,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # if None, choose better gemm type automatically
     "VLLM_HUMMING_MOE_GEMM_TYPE": lambda: os.environ.get(
         "VLLM_HUMMING_MOE_GEMM_TYPE", None
+    ),
+    "VLLM_WNA16_PREFER_KERNEL": lambda: os.environ.get(
+        "VLLM_WNA16_PREFER_KERNEL", "auto"
     ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with

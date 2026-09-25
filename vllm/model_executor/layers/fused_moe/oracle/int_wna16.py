@@ -279,6 +279,17 @@ def select_wna16_moe_backend(
     # Select kernels in order of backend.
     AVAILABLE_BACKENDS = _get_priority_backends()
 
+    # VLLM_WNA16_PREFER_KERNEL=marlin|humming moves that family to the front
+    # (prefer-with-fallback: incompatible backends are still skipped below).
+    import vllm.envs as envs
+
+    _prefer = envs.VLLM_WNA16_PREFER_KERNEL
+    if _prefer not in ("", "auto"):
+        AVAILABLE_BACKENDS = sorted(
+            AVAILABLE_BACKENDS,
+            key=lambda b: 0 if b.value.lower().startswith(_prefer) else 1,
+        )
+
     for backend in AVAILABLE_BACKENDS:
         reason = _backend_incompatibility_reason(
             backend,
