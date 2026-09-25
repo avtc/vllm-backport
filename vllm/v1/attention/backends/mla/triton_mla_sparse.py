@@ -80,6 +80,21 @@ def _dequant_gather_fp8_rows_kernel(
         tl.store(out_row + offs, (x_float * ks).to(tl.bfloat16))
 
 
+def flat_cache_row_count(cache: torch.Tensor) -> int:
+    """Number of addressable flat rows in a paged KV cache.
+
+    Mirrors ``flat_kv_row_view``: block-outermost layouts (BLHNC/BLNHC)
+    interleave other layers' pages between this cache's blocks, so valid
+    flat row ids span ``(num_blocks - 1) * block_stride_rows + block_size``
+    rows - strictly more than ``numel() // head_dim`` when strides exceed
+    the block footprint. ``numel``-based bounds would zero-fill the last
+    blocks' rows and silently corrupt attention.
+    """
+    num_blocks, block_size, head_dim = cache.shape
+    block_stride_rows = cache.stride(0) // head_dim
+    return (num_blocks - 1) * block_stride_rows + block_size
+
+
 def dequant_gather_fp8_rows(
     out: torch.Tensor,  # [total_rows, head_dim] bf16
     cache: torch.Tensor,  # [num_blocks, block_size, head_dim] fp8 e4m3
@@ -88,15 +103,18 @@ def dequant_gather_fp8_rows(
 ) -> None:
     """Gather-dequantize fp8 cache rows at ``indices`` into bf16 ``out``."""
     total_rows = indices.shape[0]
+    head_dim = cache.shape[-1]
+    assert out.shape == (total_rows, head_dim), (
+        f"out {tuple(out.shape)} != ({total_rows}, {head_dim})"
+    )
     if total_rows == 0:
         return
-    head_dim = cache.shape[-1]
     assert head_dim % 64 == 0, f"head_dim must be 64-aligned, got {head_dim}"
     assert cache.dtype == torch.float8_e4m3fn, cache.dtype
     # Triton on SM8x cannot handle fp8e4nv pointer types at all; view the
     # storage as raw bytes and decode e4m3fn in the kernel.
     cache_u8 = cache.view(torch.uint8)
-    num_rows = cache_u8.numel() // head_dim
+    num_rows = flat_cache_row_count(cache)
     _dequant_gather_fp8_rows_kernel[(total_rows,)](
         out,
         cache_u8,
@@ -116,6 +134,7 @@ def _fp8_kv_subbatched_forward(
     k_scale: torch.Tensor,
     softmax_scale: float,
     sm_count: int | None,
+    num_kv_splits: int | None = None,
 ) -> torch.Tensor:
     """fp8 gather-dequant + bf16 sparse attention, sub-batched by budget.
 
@@ -129,9 +148,12 @@ def _fp8_kv_subbatched_forward(
     num_tokens = q.shape[0]
     head_dim = kv_c_and_k_pe_cache.shape[-1]
     topk_width = topk_indices_global.shape[-1]
+    num_cache_rows = flat_cache_row_count(kv_c_and_k_pe_cache)
     budget_rows = max(
         1,
-        envs.VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB * 1024 * 1024
+        envs.VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB
+        * 1024
+        * 1024
         // (topk_width * head_dim * 2),
     )
     rows_per_subbatch = min(num_tokens, budget_rows) * topk_width
@@ -145,7 +167,7 @@ def _fp8_kv_subbatched_forward(
         dequant_gather_fp8_rows(
             gathered[: sub.numel()], kv_c_and_k_pe_cache, sub, k_scale
         )
-        remapped = remap_to_gather_rows(sub).view(t1 - t0, 1, -1)
+        remapped = remap_to_gather_rows(sub, num_cache_rows).view(t1 - t0, 1, -1)
         outs.append(
             triton_mla_sparse_attention(
                 q[t0:t1],
@@ -153,22 +175,26 @@ def _fp8_kv_subbatched_forward(
                 remapped,
                 sm_scale=softmax_scale,
                 sm_count=sm_count,
+                num_kv_splits=num_kv_splits,
             )
         )
     return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
 
 
-def remap_to_gather_rows(flat_indices: torch.Tensor) -> torch.Tensor:
+def remap_to_gather_rows(flat_indices: torch.Tensor, num_rows: int) -> torch.Tensor:
     """Remap flat global row ids to ids into the gather-dequant workspace.
 
-    Rows are gathered token-major, so gathered row i came from flat slot i;
-    -1 padding must survive so the bf16 kernel keeps masking those columns.
+    Rows are gathered token-major, so gathered row i came from flat slot i.
+    Padding must survive as -1 so the bf16 kernel keeps masking those
+    columns; out-of-range slots (stale/garbage buffer entries, only possible
+    on a bug) are masked the same way instead of being attended as zeros,
+    mirroring the bf16 kernel's ``(indices >= 0) & (indices < seq_kv)``.
     """
     device = flat_indices.device
     return torch.where(
-        flat_indices >= 0,
+        (flat_indices >= 0) & (flat_indices < num_rows),
         torch.arange(flat_indices.numel(), dtype=torch.int32, device=device),
-        flat_indices,
+        torch.full_like(flat_indices, -1),
     )
 
 

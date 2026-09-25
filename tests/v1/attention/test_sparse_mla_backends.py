@@ -1457,12 +1457,24 @@ def _fake_indexer_vllm_config(max_model_len: int):
     )
 
 
+def _clear_envs_cache() -> None:
+    """Invalidate the cached envs property so monkeypatched vars are seen.
+
+    Harmless when the cache is disabled (the usual test-session state).
+    """
+    import vllm.envs as envs
+
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+
 def test_get_max_prefill_buffer_size_default_factor():
     """Env unset keeps the upstream 40x max_model_len sizing."""
     from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR", None)
+        _clear_envs_cache()
         assert get_max_prefill_buffer_size(_fake_indexer_vllm_config(1048576)) == (
             1048576 * 40
         )
@@ -1476,6 +1488,7 @@ def test_get_max_prefill_buffer_size_env_factor(factor: str):
     from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
     with patch.dict(os.environ, {"VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR": factor}):
+        _clear_envs_cache()
         assert get_max_prefill_buffer_size(_fake_indexer_vllm_config(1000)) == (
             1000 * int(factor)
         )
@@ -1492,6 +1505,7 @@ def test_get_max_prefill_buffer_size_rejects_sub_unit_factor(bad: str):
         patch.dict(os.environ, {"VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR": bad}),
         pytest.raises(ValueError, match="PREFILL_BUFFER_FACTOR"),
     ):
+        _clear_envs_cache()
         get_max_prefill_buffer_size(_fake_indexer_vllm_config(1000))
 
 

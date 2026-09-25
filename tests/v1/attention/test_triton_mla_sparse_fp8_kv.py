@@ -110,11 +110,13 @@ def test_remap_to_gather_rows_preserves_padding():
     topk_global = torch.randint(0, 1000, (num_tokens, 1, topk), dtype=torch.int32)
     topk_global[2, 0, 3:] = -1
     topk_global[4, 0, :] = -1
+    # One deliberately out-of-range id: must be masked to -1 like padding.
+    topk_global[1, 0, 0] = 5000
     flat = topk_global.reshape(-1)
-    remapped = remap_to_gather_rows(flat)
+    remapped = remap_to_gather_rows(flat, num_rows=1000)
     assert remapped.dtype == torch.int32
     for i in range(num_tokens * topk):
-        if flat[i] >= 0:
+        if flat[i] >= 0 and flat[i] < 1000:
             assert remapped[i].item() == i
         else:
             assert remapped[i].item() == -1
@@ -152,7 +154,9 @@ def test_fp8_sparse_attention_parity_vs_bf16(head_dim: int):
     gathered = torch.empty((total_rows, head_dim), dtype=torch.bfloat16, device=DEVICE)
     k_scale = torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
     dequant_gather_fp8_rows(gathered, cache, flat, k_scale)
-    remapped = remap_to_gather_rows(flat).reshape(num_tokens, 1, topk)
+    remapped = remap_to_gather_rows(flat, num_rows=total_rows).reshape(
+        num_tokens, 1, topk
+    )
     out_fp8 = triton_mla_sparse_attention(
         q,
         gathered.view(-1, 1, head_dim),
@@ -187,19 +191,21 @@ def test_fp8_subbatched_parity(head_dim: int, monkeypatch: pytest.MonkeyPatch):
     cache = _make_fp8_cache(rows, BLOCK_SIZE)
     k_scale = torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
 
-    def forward() -> torch.Tensor:
+    def _forward_pinned() -> torch.Tensor:
         if hasattr(envs.__getattr__, "cache_clear"):
             envs.__getattr__.cache_clear()
         return _fp8_kv_subbatched_forward(
-            q, cache, topk_global, k_scale, SM_SCALE, None
+            q, cache, topk_global, k_scale, SM_SCALE, None, num_kv_splits=2
         )
 
     # Huge budget: one sub-batch. 1 MiB -> budget_rows = 8 -> 3 sub-batches
-    # (8/8/4) for 20 tokens.
+    # (8/8/4) for 20 tokens. Pin num_kv_splits so the split heuristic (which
+    # depends on num_tokens) cannot pick different split counts for the two
+    # calls and mask a real difference behind a different reduction order.
     monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB", "1024")
-    single = forward()
+    single = _forward_pinned()
     monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB", "1")
-    subbatched = forward()
+    subbatched = _forward_pinned()
     torch.testing.assert_close(subbatched, single, rtol=0.0, atol=0.0)
 
 

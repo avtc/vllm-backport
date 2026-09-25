@@ -46,9 +46,7 @@ def expandable_segments_blocks_ipc() -> bool:
     VLLM_CUSTOM_AR_ENFORCED_MB path above) because the cached envs
     property may predate worker-side env changes.
     """
-    return "expandable_segments:True" in os.environ.get(
-        "PYTORCH_CUDA_ALLOC_CONF", ""
-    )
+    return "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
 
 
 def _check_expandable_segments_compat() -> None:
@@ -339,11 +337,6 @@ class CustomAllreduce:
             )
             return
 
-        # All self-disable paths are past: this communicator WILL initialize
-        # IPC buffers, so fail fast on configurations that crash at CUDA-graph
-        # capture with an inactionable 'invalid argument' instead.
-        _check_expandable_segments_compat()
-
         self.disabled = False
         # Buffers memory are owned by this Python class and passed to C++.
         # Metadata composes of two parts: metadata for synchronization and a
@@ -402,6 +395,13 @@ class CustomAllreduce:
             )
             self.close()
             self.disabled = True
+            return
+
+        # The communicator is live and will exchange graph-captured buffers
+        # over CUDA-IPC at capture time; fail fast on the VMM allocator combo
+        # that crashes there with an inactionable 'invalid argument'. Placed
+        # after every self-disable path so only live communicators are gated.
+        _check_expandable_segments_compat()
 
     def _init_mnnvl_buffer(self, stage_size: int) -> None:
         if torch_symm_mem is None or not current_platform.is_cuda():
