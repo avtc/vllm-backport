@@ -35,7 +35,7 @@ logger = init_logger(__name__)
 
 
 def expandable_segments_blocks_ipc() -> bool:
-    """Whether the VMM allocator is on without the custom-AR bypass env.
+    """Whether the VMM allocator is on, which custom-AR cannot IPC-export.
 
     ``cudaIpcGetMemHandle`` (used by ``get_graph_buffer_ipc_meta`` and the
     IPC buffer registration in csrc/custom_all_reduce.cuh) only accepts
@@ -46,11 +46,6 @@ def expandable_segments_blocks_ipc() -> bool:
     VLLM_CUSTOM_AR_ENFORCED_MB path above) because the cached envs
     property may predate worker-side env changes.
     """
-    if os.environ.get("VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS", "0").lower() in (
-        "true",
-        "1",
-    ):
-        return False
     return "expandable_segments:True" in os.environ.get(
         "PYTORCH_CUDA_ALLOC_CONF", ""
     )
@@ -260,10 +255,7 @@ class CustomAllreduce:
                 "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: CUDA-IPC "
                 "handle export fails on VMM-backed allocations at CUDA-graph "
                 "capture (custom_all_reduce.cuh, 'invalid argument'). Unset "
-                "expandable_segments:True, or pass --disable-custom-all-reduce. "
-                "Set VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS=1 to bypass this "
-                "check (only sound when no graph buffers are exported, e.g. "
-                "enforce_eager)."
+                "expandable_segments:True, or pass --disable-custom-all-reduce."
             )
 
         if world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:

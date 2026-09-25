@@ -135,10 +135,6 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_CUSTOM_AR_ENFORCE: bool = False
-    # Escape hatch for the expandable_segments x custom-AR incompatibility
-    # guard: CUDA-IPC handle export fails on VMM-backed allocations, so the
-    # combo only works when no graph buffers are exported (e.g. eager mode).
-    VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS: bool = False
     # Disable pinned-host staging for multimodal H2D transfers (fall back to
     # pageable copies). Workaround for cudaHostAlloc failures during encoder
     # profiling under host-memory pressure or memlock limits.
@@ -1304,10 +1300,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_CUSTOM_AR_ENFORCE": lambda: (
         os.getenv("VLLM_CUSTOM_AR_ENFORCE", "0").lower() in ("true", "1")
-    ),
-    "VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS": lambda: (
-        os.getenv("VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS", "0").lower()
-        in ("true", "1")
     ),
     "VLLM_MM_DISABLE_PINNED_H2D": lambda: (
         os.getenv("VLLM_MM_DISABLE_PINNED_H2D", "0").lower() in ("true", "1")
