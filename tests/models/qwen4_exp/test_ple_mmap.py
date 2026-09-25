@@ -21,11 +21,11 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
 
 def test_gather_in_range_rows_only():
     table = torch.arange(0, 24, dtype=torch.bfloat16).reshape(8, 3)
-    ids = torch.tensor([10, 12, 9])  # vocab window [9, 12) -> local [1, 3, 0]
+    ids = torch.tensor([10, 12, 9])  # window [9, 12): 12 is EXCLUDED
     out = _gather_rows_from_table(table, ids, vocab_start=9, vocab_end=12)
     assert out.shape == (3, 3)
     assert torch.equal(out[0], table[1])  # 10 - 9 = 1
-    assert torch.equal(out[1], table[3])  # 12 - 9 = 3
+    assert torch.equal(out[1], torch.zeros(3))  # 12 is out of range
     assert torch.equal(out[2], table[0])  # 9 - 9 = 0
 
 
@@ -38,14 +38,14 @@ def test_gather_out_of_range_rows_are_zero():
     assert torch.equal(out[3], table[7])
 
 
-def test_gather_fp8_rows_as_bytes():
+def test_gather_fp8_rows_bit_exact():
     table = torch.randn(16, 8).to(torch.float8_e4m3fn)
     assert table.dtype in _FP8_STORAGE_DTYPES
     ids = torch.tensor([3, 5])
     out = _gather_rows_from_table(table, ids, vocab_start=0, vocab_end=16)
-    assert out.dtype == torch.uint8
-    assert torch.equal(out[0], table.view(torch.uint8)[3])
-    assert torch.equal(out[1], table.view(torch.uint8)[5])
+    assert out.dtype == torch.float8_e4m3fn
+    assert torch.equal(out.view(torch.uint8)[0], table.view(torch.uint8)[3])
+    assert torch.equal(out.view(torch.uint8)[1], table.view(torch.uint8)[5])
 
 
 def test_gather_empty_ids():
@@ -143,8 +143,10 @@ def test_envs_defaults():
         os.environ.pop("VLLM_PLE_MMAP_REBUILD", None)
         if hasattr(envs.__getattr__, "cache_clear"):
             envs.__getattr__.cache_clear()
+        os.environ.pop("VLLM_PLE_MMAP_PIN_STAGING", None)
         assert envs.VLLM_PLE_MMAP_PATH is None
         assert envs.VLLM_PLE_MMAP_REBUILD is False
+        assert envs.VLLM_PLE_MMAP_PIN_STAGING is True
 
 
 def test_tensor_from_mapping_roundtrip(tmp_path):
@@ -174,3 +176,50 @@ def test_tensor_from_mapping_roundtrip(tmp_path):
             t = torch.frombuffer(arr, dtype=torch.uint8).view(dtype).reshape(rows, dim)
             assert t[5][0] == torch.tensor(1.0).to(dtype)
             assert torch.count_nonzero(t[0].to(torch.uint8)) == 0
+
+
+def test_clamp_cudagraph_mode_for_host_gather():
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+        _clamp_cudagraph_mode_for_host_gather,
+    )
+
+    for mode in (
+        CUDAGraphMode.NONE,
+        CUDAGraphMode.PIECEWISE,
+    ):
+        assert _clamp_cudagraph_mode_for_host_gather(mode, True) == (mode, None)
+        assert _clamp_cudagraph_mode_for_host_gather(mode, False) == (mode, None)
+
+    for mode in (
+        CUDAGraphMode.FULL,
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+    ):
+        clamped, reason = _clamp_cudagraph_mode_for_host_gather(mode, True)
+        assert clamped == CUDAGraphMode.PIECEWISE
+        assert reason is not None
+        clamped, reason = _clamp_cudagraph_mode_for_host_gather(mode, False)
+        assert clamped == CUDAGraphMode.NONE
+        assert reason is not None
+
+
+def test_mmap_marker_roundtrip(tmp_path):
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+        _read_mmap_marker,
+        _write_mmap_marker,
+    )
+
+    table = tmp_path / "table.bin"
+    assert _read_mmap_marker(str(table)) is None
+    meta = {
+        "num_embeddings": 1024,
+        "embedding_dim": 256,
+        "dtype": "torch.bfloat16",
+        "model": "/models/qwen38",
+    }
+    _write_mmap_marker(str(table), meta)
+    assert _read_mmap_marker(str(table)) == meta
+    # corrupted marker json -> None, not a crash
+    (tmp_path / "table.bin.meta.json").write_text("{not json")
+    assert _read_mmap_marker(str(table)) is None

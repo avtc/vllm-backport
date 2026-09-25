@@ -181,6 +181,7 @@ if TYPE_CHECKING:
     # the per-rank file is written on first start and reused after).
     VLLM_PLE_MMAP_PATH: str | None = None
     VLLM_PLE_MMAP_REBUILD: bool = False
+    VLLM_PLE_MMAP_PIN_STAGING: bool = True
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -2443,6 +2444,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_MMAP_PATH": lambda: os.getenv("VLLM_PLE_MMAP_PATH", None),
     "VLLM_PLE_MMAP_REBUILD": lambda: bool(
         int(os.getenv("VLLM_PLE_MMAP_REBUILD", "0"))
+    ),
+    "VLLM_PLE_MMAP_PIN_STAGING": lambda: bool(
+        int(os.getenv("VLLM_PLE_MMAP_PIN_STAGING", "1"))
     ),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
