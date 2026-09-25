@@ -34,6 +34,46 @@ except ImportError:
 logger = init_logger(__name__)
 
 
+def expandable_segments_blocks_ipc() -> bool:
+    """Whether the VMM allocator is on without the custom-AR bypass env.
+
+    ``cudaIpcGetMemHandle`` (used by ``get_graph_buffer_ipc_meta`` and the
+    IPC buffer registration in csrc/custom_all_reduce.cuh) only accepts
+    cudaMalloc'd memory. With ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:
+    True`` every torch allocation is backed by CUDA VMM (cuMemMap) regions,
+    so handle export fails with 'invalid argument' and the worker dies at
+    the first CUDA-graph capture. Read from the raw environment (like the
+    VLLM_CUSTOM_AR_ENFORCED_MB path above) because the cached envs
+    property may predate worker-side env changes.
+    """
+    if os.environ.get("VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS", "0").lower() in (
+        "true",
+        "1",
+    ):
+        return False
+    return "expandable_segments:True" in os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF", ""
+    )
+
+
+def _cumem_allocator_active() -> bool:
+    """Whether the active config routes allocations through CuMemAllocator.
+
+    CuMemAllocator.use_memory_pool toggles expandable_segments off around
+    its pool (see #40812), so IPC-exported buffers land on cudaMalloc'd
+    pages even when the env var is set — the same exemption the
+    KV-connector compat check in config/vllm.py applies.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    return (
+        vllm_config is not None
+        and vllm_config.model_config is not None
+        and vllm_config.model_config.enable_cumem_allocator
+    )
+
+
 def custom_ar_enforced_size_mb_from_config(vllm_config: Any = None) -> int | None:
     """Return the enforced custom-AR cutoff in MiB, sized from the config.
 
@@ -209,6 +249,22 @@ class CustomAllreduce:
         if world_size == 1:
             # No need to initialize custom allreduce for single GPU case.
             return
+
+        # Fail fast on the expandable_segments x CUDA-IPC incompatibility:
+        # graph-buffer IPC export (custom_all_reduce.cuh:164) returns
+        # 'invalid argument' on VMM-backed allocations and kills the worker
+        # at CUDA-graph capture with no actionable message.
+        if expandable_segments_blocks_ipc() and not _cumem_allocator_active():
+            raise ValueError(
+                "Custom all-reduce is incompatible with "
+                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: CUDA-IPC "
+                "handle export fails on VMM-backed allocations at CUDA-graph "
+                "capture (custom_all_reduce.cuh, 'invalid argument'). Unset "
+                "expandable_segments:True, or pass --disable-custom-all-reduce. "
+                "Set VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS=1 to bypass this "
+                "check (only sound when no graph buffers are exported, e.g. "
+                "enforce_eager)."
+            )
 
         if world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
             logger.warning_once(

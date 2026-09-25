@@ -48,6 +48,39 @@ def test_custom_allreduce_filters_dtype(
 
 
 @pytest.mark.parametrize(
+    ("alloc_conf", "allow_env", "expected"),
+    [
+        (None, None, False),
+        ("", None, False),
+        ("max_split_size_mb:512", None, False),
+        ("expandable_segments:True", None, True),
+        ("expandable_segments:True,garbage_collection_threshold:0.9", None, True),
+        ("expandable_segments:False", None, False),
+        ("expandable_segments:True", "1", False),
+        ("expandable_segments:True", "true", False),
+        ("expandable_segments:True", "0", True),
+    ],
+)
+def test_expandable_segments_blocks_ipc(
+    alloc_conf: str | None,
+    allow_env: str | None,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The IPC-export guard must fire exactly when the VMM allocator is on
+    and the escape-hatch env is unset (CUDA-IPC cannot export cuMemMap
+    memory, so custom-AR graph-buffer registration would fail)."""
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    if alloc_conf is not None:
+        monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", alloc_conf)
+    monkeypatch.delenv("VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS", raising=False)
+    if allow_env is not None:
+        monkeypatch.setenv("VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS", allow_env)
+
+    assert car.expandable_segments_blocks_ipc() is expected
+
+
+@pytest.mark.parametrize(
     ("major", "local_multicast", "expected"),
     [
         (8, True, False),

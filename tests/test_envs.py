@@ -590,6 +590,25 @@ class TestVllmMaxNSequences:
 
         assert envs.VLLM_MAX_N_SEQUENCES == 128
 
+
+class TestVllmCustomArAllowExpandableSegments:
+    def test_default_value(self):
+        """Bypass defaults to off so the IPC guard stays active."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS", None)
+            if hasattr(envs.__getattr__, "cache_clear"):
+                envs.__getattr__.cache_clear()
+
+            assert envs.VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS is False
+
+    def test_custom_value(self, monkeypatch: pytest.MonkeyPatch):
+        """Bypass can be enabled for eager-mode custom-AR users."""
+        monkeypatch.setenv("VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS", "1")
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+
+        assert envs.VLLM_CUSTOM_AR_ALLOW_EXPANDABLE_SEGMENTS is True
+
     def test_sampling_params_respects_limit(
         self,
         monkeypatch: pytest.MonkeyPatch,
