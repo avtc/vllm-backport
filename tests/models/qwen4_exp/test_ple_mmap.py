@@ -90,7 +90,7 @@ def test_mmap_table_path_is_per_rank(tmp_path):
         def size(self):
             return 8
 
-    _FakeEtP = type('G', (), {'device_group': _FakeGroup(5)})
+    _FakeEtP = type("G", (), {"device_group": _FakeGroup(5)})
     fake_dist = type(
         "M",
         (),
@@ -118,3 +118,32 @@ def test_envs_defaults():
             envs.__getattr__.cache_clear()
         assert envs.VLLM_PLE_MMAP_PATH is None
         assert envs.VLLM_PLE_MMAP_REBUILD is False
+
+
+def test_tensor_from_mapping_roundtrip(tmp_path):
+    """The allocate path (mmap -> np uint8 -> torch view) holds for bf16 and
+    fp8 storage dtypes and writes through to the file."""
+    import mmap as _mmap
+
+    import numpy as np
+
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        rows, dim = 32, 8
+        nbytes = rows * dim * torch.empty((), dtype=dtype).element_size()
+        path = tmp_path / f"t_{dtype}.bin"
+        with open(path, "w+b") as f:
+            f.truncate(nbytes)
+            with _mmap.mmap(f.fileno(), 0) as mm:
+                arr = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
+                t = (
+                    torch.frombuffer(arr, dtype=torch.uint8)
+                    .view(dtype)
+                    .reshape(rows, dim)
+                )
+                t[5] = torch.full((dim,), 1.0).to(dtype)
+                mm.flush()
+        with open(path, "rb") as f, _mmap.mmap(f.fileno(), nbytes) as mm:
+            arr = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
+            t = torch.frombuffer(arr, dtype=torch.uint8).view(dtype).reshape(rows, dim)
+            assert t[5][0] == torch.tensor(1.0).to(dtype)
+            assert torch.count_nonzero(t[0].to(torch.uint8)) == 0

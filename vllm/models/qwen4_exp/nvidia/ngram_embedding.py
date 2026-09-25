@@ -738,8 +738,8 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             length = nbytes
         self._mmap = _mmap.mmap(self._mmap_file.fileno(), length)
         array = np.frombuffer(self._mmap, dtype=np.uint8, count=nbytes)
-        tensor = (
-            torch.frombuffer(array).view(dtype).reshape(num_embeddings, embedding_dim)
+        tensor = torch.frombuffer(array, dtype=torch.uint8).view(dtype).reshape(
+            num_embeddings, embedding_dim
         )
         logger.info(
             "PLE mmap table %s: rows=%d dim=%d dtype=%s bytes=%d (%s)",
