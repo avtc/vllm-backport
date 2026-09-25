@@ -65,6 +65,10 @@ if TYPE_CHECKING:
     # 5.16 GiB workspace into 540 MB). Must stay >= 1: the chunker cannot
     # split a single request's gather below its full length.
     VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
+    # Byte budget for the Triton sparse-MLA fp8 gather-dequant workspace.
+    # Prefill-shaped MQA batches sub-batch tokens to stay under this; decode
+    # batches (max_num_seqs * next_n rows) always fit the default.
+    VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB: int = 64
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1143,6 +1147,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR", "40")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB", "64")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

@@ -20,6 +20,7 @@ if not current_platform.is_cuda():
         allow_module_level=True,
     )
 
+from vllm import envs
 from vllm.v1.attention.backends.mla.triton_mla_sparse import (
     TritonMLASparseBackend,
     dequant_gather_fp8_rows,
@@ -142,3 +143,44 @@ def test_fp8_sparse_attention_parity_vs_bf16(head_dim: int):
     )
 
     torch.testing.assert_close(out_fp8, out_bf16, rtol=0.05, atol=0.02)
+
+
+@pytest.mark.parametrize("head_dim", [512, 576])
+def test_fp8_subbatched_parity(head_dim: int, monkeypatch: pytest.MonkeyPatch):
+    """The byte-budgeted sub-batch loop must produce the same output as one
+    single gather-dequant + attention call (prefill-shaped batches rely on
+    it to bound the workspace)."""
+    torch.manual_seed(0)
+    num_tokens, topk = 7, 128
+    total_rows = num_tokens * topk
+    rows = torch.randn(total_rows, head_dim, dtype=torch.bfloat16, device=DEVICE)
+    topk_global = torch.arange(total_rows, dtype=torch.int32, device=DEVICE).reshape(
+        num_tokens, 1, topk
+    )
+    q = torch.randn(num_tokens, NUM_HEADS, head_dim, dtype=torch.bfloat16, device=DEVICE)
+
+    def run(budget_rows: int) -> torch.Tensor:
+        cache = _make_fp8_cache(rows, BLOCK_SIZE)
+        k_scale = torch.tensor(1.0, dtype=torch.float32, device=DEVICE)
+        gathered = torch.empty(
+            (budget_rows * topk, head_dim), dtype=torch.bfloat16, device=DEVICE
+        )
+        outs = []
+        for t0 in range(0, num_tokens, budget_rows):
+            t1 = min(t0 + budget_rows, num_tokens)
+            sub = topk_global.reshape(-1)[t0 * topk : t1 * topk]
+            dequant_gather_fp8_rows(gathered[: sub.numel()], cache, sub, k_scale)
+            remapped = remap_to_gather_rows(sub).view(t1 - t0, 1, -1)
+            outs.append(
+                triton_mla_sparse_attention(
+                    q[t0:t1],
+                    gathered[: sub.numel()].view(-1, 1, head_dim),
+                    remapped,
+                    sm_scale=SM_SCALE,
+                )
+            )
+        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
+    single = run(num_tokens)
+    subbatched = run(3)  # 7 tokens -> 3 sub-batches of 3/3/1
+    torch.testing.assert_close(subbatched, single, rtol=0.0, atol=0.0)

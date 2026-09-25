@@ -6,6 +6,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm import envs
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -190,22 +191,44 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         bf16 kernel. Sparse attention touches only the ~topk selected rows
         per token, so the dequant cost stays bounded regardless of context
         length."""
+        flat_indices = topk_indices_global.reshape(-1)
         num_tokens = q.shape[0]
         head_dim = kv_c_and_k_pe_cache.shape[-1]
-        flat_indices = topk_indices_global.reshape(-1)
-        total_rows = flat_indices.numel()
+        topk_width = topk_indices_global.shape[-1]
+        # The gather workspace is [tokens, topk, head_dim] bf16. Decode batches
+        # (<= max_num_seqs * next_n rows) are tiny, but prefill-shaped MQA
+        # batches would allocate ~1.1 GiB per layer at 512 tokens x 2176 topk,
+        # so sub-batch tokens under a byte budget instead and reuse one
+        # workspace allocation across sub-batches.
+        budget_rows = max(
+            1,
+            envs.VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB
+            * 1024
+            * 1024
+            // (topk_width * head_dim * 2),
+        )
+        rows_per_subbatch = min(num_tokens, budget_rows) * topk_width
         gathered = torch.empty(
-            (total_rows, head_dim), dtype=torch.bfloat16, device=q.device
+            (rows_per_subbatch, head_dim), dtype=torch.bfloat16, device=q.device
         )
-        dequant_gather_fp8_rows(gathered, kv_c_and_k_pe_cache, flat_indices, layer._k_scale)
-        remapped = remap_to_gather_rows(flat_indices).view(num_tokens, 1, -1)
-        return triton_mla_sparse_attention(
-            q,
-            gathered.view(-1, 1, head_dim),
-            remapped,
-            sm_scale=self.softmax_scale,
-            sm_count=self._sm_count,
-        )
+        outs = []
+        for t0 in range(0, num_tokens, max(1, budget_rows)):
+            t1 = min(t0 + budget_rows, num_tokens)
+            sub = flat_indices[t0 * topk_width : t1 * topk_width]
+            dequant_gather_fp8_rows(
+                gathered[: sub.numel()], kv_c_and_k_pe_cache, sub, layer._k_scale
+            )
+            remapped = remap_to_gather_rows(sub).view(t1 - t0, 1, -1)
+            outs.append(
+                triton_mla_sparse_attention(
+                    q[t0:t1],
+                    gathered[: sub.numel()].view(-1, 1, head_dim),
+                    remapped,
+                    sm_scale=self.softmax_scale,
+                    sm_count=self._sm_count,
+                )
+            )
+        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
 
     def forward_mqa(
         self,
