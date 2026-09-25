@@ -182,6 +182,10 @@ if TYPE_CHECKING:
     VLLM_PLE_MMAP_PATH: str | None = None
     VLLM_PLE_MMAP_REBUILD: bool = False
     VLLM_PLE_MMAP_PIN_STAGING: bool = True
+    # Run the mmap PLE host gather in the model state's prepare_inputs
+    # instead of forward: removes the per-step D2H sync from the critical
+    # path and keeps forward capturable in FULL cudagraphs.
+    VLLM_PLE_MMAP_PREPARE_OUTSIDE: bool = False
     # QSA fp8 main-KV read path: "" (bf16 only), "decode" (in-kernel e4m3
     # decode) or "gather" (bf16 workspace pre-pass) for A/B comparison.
     VLLM_QSA_FP8_KV: str = ""
@@ -2450,6 +2454,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_PLE_MMAP_PIN_STAGING": lambda: bool(
         int(os.getenv("VLLM_PLE_MMAP_PIN_STAGING", "1"))
+    ),
+    "VLLM_PLE_MMAP_PREPARE_OUTSIDE": lambda: bool(
+        int(os.getenv("VLLM_PLE_MMAP_PREPARE_OUTSIDE", "0"))
     ),
     "VLLM_QSA_FP8_KV": lambda: os.getenv("VLLM_QSA_FP8_KV", ""),
     # Debug logging for --enable-mfu-metrics

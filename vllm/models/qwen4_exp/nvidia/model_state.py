@@ -7,6 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.distributed.utils import get_pp_indices
@@ -50,6 +51,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
                     "VLLM_PP_LAYER_PARTITION or run with PP=1."
                 )
         self.uses_ngram_embedding = has_ple_layers and pp_group.is_first_rank
+        self._ple_ngram_modules: list[nn.Module] | None = None
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -121,11 +123,42 @@ class Qwen4ExpModelState(MambaHybridModelState):
         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
         # Represent unused capacity as trailing zero-length requests.
         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
+        if envs.VLLM_PLE_MMAP_PREPARE_OUTSIDE:
+            self._prefetch_ple_outside_forward(
+                model_inputs.get("input_ids"), query_start_loc, ngram_context
+            )
         return model_inputs
+
+    def _prefetch_ple_outside_forward(
+        self,
+        input_ids: torch.Tensor | None,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """Stage PLE embeddings before forward so forward stays graph-capturable.
+
+        The D2H sync of the mmap gather is what makes FULL cudagraphs
+        impossible inside forward; running it here puts it on the scheduler
+        side, overlapped with the previous step's GPU work.
+        """
+        if input_ids is None:
+            return
+        from .ngram_embedding import Qwen4ExpNGramEmbedding
+
+        modules = self._ple_ngram_modules
+        if modules is None:
+            modules = self._ple_ngram_modules = [
+                module
+                for module in self.model.modules()
+                if isinstance(module, Qwen4ExpNGramEmbedding)
+            ]
+        for module in modules:
+            module.prefetch_outside_forward(input_ids, query_start_loc, ngram_context)
 
     def prepare_dummy_inputs(
         self,

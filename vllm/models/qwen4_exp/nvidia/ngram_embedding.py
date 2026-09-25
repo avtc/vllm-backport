@@ -69,6 +69,9 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
     """ETP-sharded PLE table shared by device and pinned-host backends."""
 
     supports_prefetch: ClassVar[bool] = False
+    # Whether the model state runs this backend's gather before forward
+    # (set by the mmap backend; other backends keep the default).
+    prefetch_runs_outside_forward: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -676,14 +679,18 @@ def _mode_includes_full(mode: CUDAGraphMode) -> bool:
 
 
 def _clamp_cudagraph_mode_for_host_gather(
-    mode: CUDAGraphMode, breakable_enabled: bool
+    mode: CUDAGraphMode,
+    breakable_enabled: bool,
+    gather_outside_forward: bool = False,
 ) -> tuple[CUDAGraphMode, str | None]:
     """FULL cudagraphs cannot capture the mmap PLE's host-side gather.
 
     PIECEWISE with breakable cudagraphs runs the gather in eager breaks
     between graph segments; without breaks only NONE (no graphs) is sound.
+    With ``gather_outside_forward`` the gather runs in prepare_inputs, so
+    forward is pure GPU ops and any mode (FULL included) is capturable.
     """
-    if not _mode_includes_full(mode):
+    if gather_outside_forward or not _mode_includes_full(mode):
         return mode, None
     if breakable_enabled:
         return CUDAGraphMode.PIECEWISE, (
@@ -738,10 +745,12 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
     ``VLLM_PLE_MMAP_PIN_STAGING=0`` trades the pinned staging buffer for
     pageable memory (slower H2D, but no pinned allocations at all).
 
-    Cudagraphs: the host gather cannot be captured inside a FULL graph,
-    so construction downgrades a FULL cudagraph_mode to PIECEWISE (eager
-    breaks, requires VLLM_USE_BREAKABLE_CUDAGRAPH=1) or NONE.
+    Cudagraphs: unless VLLM_PLE_MMAP_PREPARE_OUTSIDE moves the host
+    gather into prepare_inputs, construction downgrades a FULL
+    cudagraph_mode to PIECEWISE (eager breaks, requires
+    VLLM_USE_BREAKABLE_CUDAGRAPH=1) or NONE.
     """
+
 
     def __init__(
         self,
@@ -757,9 +766,16 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         data_parallel_rank: int = 0,
     ) -> None:
         self._vllm_cfg = get_current_vllm_config()
+        # With VLLM_PLE_MMAP_PREPARE_OUTSIDE the host gather runs in the
+        # model state's prepare_inputs (before forward), so forward holds
+        # only GPU ops and FULL cudagraphs stay sound.
+        self.prefetch_runs_outside_forward = bool(
+            envs.VLLM_PLE_MMAP_PREPARE_OUTSIDE
+        )
         clamped, reason = _clamp_cudagraph_mode_for_host_gather(
             self._vllm_cfg.compilation_config.cudagraph_mode,
             is_breakable_cudagraph_enabled(),
+            gather_outside_forward=self.prefetch_runs_outside_forward,
         )
         if reason is not None:
             logger.warning("PLE mmap backend: %s", reason)
@@ -1257,12 +1273,42 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         embedding = self.ngram_embedding
         if not embedding.supports_prefetch:
             return
+        if embedding.prefetch_runs_outside_forward:
+            # The model state already staged the embeddings in
+            # prepare_inputs; forward must stay pure GPU ops (FULL graphs).
+            return
         ngram_ids = self.compute_ngram_ids(
             input_ids,
             query_start_loc,
             ngram_context,
         )
         embedding.start_prefetch(hidden_states, ngram_ids)
+
+    def prefetch_outside_forward(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> bool:
+        """Stage the PLE lookup before forward (VLLM_PLE_MMAP_PREPARE_OUTSIDE).
+
+        The n-gram ids depend only on inputs the model state prepares, so
+        the D2H sync, host gather, and H2D run ahead of forward - off the
+        per-step critical path. Forward's start_prefetch then skips the
+        gather and only finalizes the already-staged buffer.
+        """
+        embedding = self.ngram_embedding
+        if not embedding.supports_prefetch:
+            return False
+        if not embedding.prefetch_runs_outside_forward:
+            return False
+        ngram_ids = self.compute_ngram_ids(
+            input_ids,
+            query_start_loc,
+            ngram_context,
+        )
+        embedding.start_prefetch(None, ngram_ids)
+        return True
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""

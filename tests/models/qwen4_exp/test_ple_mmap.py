@@ -202,6 +202,16 @@ def test_clamp_cudagraph_mode_for_host_gather():
         clamped, reason = _clamp_cudagraph_mode_for_host_gather(mode, False)
         assert clamped == CUDAGraphMode.NONE
         assert reason is not None
+        # With the gather moved to prepare_inputs, forward is pure GPU ops
+        # and FULL graphs stay sound: every mode passes through untouched.
+        assert _clamp_cudagraph_mode_for_host_gather(mode, False, True) == (
+            mode,
+            None,
+        )
+        assert _clamp_cudagraph_mode_for_host_gather(mode, True, True) == (
+            mode,
+            None,
+        )
 
 
 def test_mmap_marker_roundtrip(tmp_path):
