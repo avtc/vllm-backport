@@ -141,17 +141,12 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
 ]
 
 # The checkpoint stores these projections separately; runtime packs each group
-# into adjacent logical shards of a MergedColumnParallelLinear.
+# into adjacent logical shards of a MergedColumnParallelLinear. The
+# hyper-connection projections intentionally stay out: quantized checkpoints
+# (AutoRound/INC int8 group-64) quantize each piece independently, and
+# separately-quantized tensors cannot be stacked into one packed weight.
 _EXTRA_WEIGHTS_MAPPER = WeightsMapper(
     orig_to_new_stacked={
-        "hyper_connection.input_mix_weight_down.weight": (
-            "hyper_connection.input_mix_weight_down_block_inject.weight",
-            0,
-        ),
-        "hyper_connection.block_inject_weight.weight": (
-            "hyper_connection.input_mix_weight_down_block_inject.weight",
-            1,
-        ),
         "ple.key_proj": ("ple.kv_proj", 0),
         "ple.value_proj": ("ple.kv_proj", 1),
     }
@@ -265,10 +260,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
         self.attn_hyper_connection = GatedResidual(
             hc_config,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "attn_hyper_connection"),
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
 
@@ -386,6 +383,7 @@ class Qwen4ExpModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+        quant_config = vllm_config.quant_config
         self.config = config
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
@@ -397,7 +395,12 @@ class Qwen4ExpModel(nn.Module):
             if layer_type == "full_attention"
             and getattr(config, "indexer_n_heads", None) is not None
         )
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
+        )
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
@@ -433,6 +436,7 @@ class Qwen4ExpModel(nn.Module):
             self.hyper_connection_mixer = GatedResidual(
                 hc_config,
                 use_combine=False,
+                quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
             )
         else:
@@ -644,11 +648,6 @@ class Qwen4ExpForCausalLM(
         "kv_proj": ["key_proj", "value_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
-        "input_mix_weight_down_block_inject": [
-            "input_mix_weight_down",
-            "block_inject_weight",
-            "_input_mix_padding",
-        ],
     }
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={"model.language_model.": "model."}
@@ -674,6 +673,7 @@ class Qwen4ExpForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
@@ -879,11 +879,6 @@ class Qwen4ExpForConditionalGeneration(
 
     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping | {
         "kv_proj": ["key_proj", "value_proj"],
-        "input_mix_weight_down_block_inject": [
-            "input_mix_weight_down",
-            "block_inject_weight",
-            "_input_mix_padding",
-        ],
     }
 
     @staticmethod

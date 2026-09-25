@@ -260,6 +260,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.hyper_connection_mixer = GatedResidual(
             hc_config,
             use_combine=False,
+            quant_config=vllm_config.quant_config,
             prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -391,11 +392,6 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
-        "input_mix_weight_down_block_inject": [
-            "input_mix_weight_down",
-            "block_inject_weight",
-            "_input_mix_padding",
-        ],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:

@@ -25,10 +25,8 @@ Typical usage inside a transformer decoder layer::
 import torch
 from torch import nn
 
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    ReplicatedLinear,
-)
+from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import maybe_prefix
 
 from ..common.hyperconnection import (
@@ -50,23 +48,27 @@ from .ops.hc import (
 class GatedResidual(nn.Module):
     """Gated HyperConnection with learnable low-rank mixing and injection.
 
-    ``combine_and_mix()`` runs the pre pipeline (grouped GemmaRMSNorm -> merged
-    low-rank down+inject GEMM -> silu -> up GEMM -> sigmoid -> gated mean
+    ``combine_and_mix()`` runs the pre pipeline (grouped GemmaRMSNorm -> split
+    low-rank down and inject GEMMs -> silu -> up GEMM -> sigmoid -> gated mean
     over the HC streams). When passed a pending block output, it fuses its
     residual combine with the RMSNorm. A missing injection selects unit-weight
     combine. Final mixers use ``use_combine=False`` and do not produce a new
     injection.
 
     Weights: the norm owns the grouped GemmaRMSNorm affine; the projections
-    are vLLM Linear modules (merged replicated linear for down+inject), so
-    GEMM dispatch (e.g. the low-latency skinny GEMM) applies through the
-    standard quant_method mechanism.
+    are vLLM Linear modules, so GEMM dispatch (e.g. the low-latency skinny
+    GEMM) applies through the standard quant_method mechanism. The down and
+    inject projections stay split because quantized checkpoints (AutoRound /
+    INC int8 group-64) quantize ``input_mix_weight_down`` and
+    ``input_mix_weight_up`` independently — separately-quantized tensors
+    cannot be stacked into one packed merged weight on load.
     """
 
     def __init__(
         self,
         config: HyperConnectionConfig,
         use_combine: bool = True,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -90,39 +92,39 @@ class GatedResidual(nn.Module):
         )
 
         # -- vLLM Linear weights --------------------------------------------
-        # The merged skinny-GEMM shape is physically padded to 16 rows to ensure
-        # good alignment and performant implementation chosen by CuBLAS heuristics.
-        self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
+        # Split projections, checkpoint-native. All are replicated: the skinny
+        # shapes do not benefit from TP sharding and the checkpoint quantizes
+        # down/up (but not block_inject) with group-64 scales.
+        self.input_mix_weight_down = ReplicatedLinear(
+            self.hyper_hidden_size,
+            self.lora_rank,
+            bias=False,
+            params_dtype=config.params_dtype,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "input_mix_weight_down"),
+            return_bias=False,
+            disable_tp=True,
+        )
         if use_combine:
-            self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
+            self.block_inject_weight = ReplicatedLinear(
                 self.hyper_hidden_size,
-                [self.lora_rank, self.hc_count]
-                + ([self.pad_size] if self.pad_size else []),
+                self.hc_count,
                 bias=False,
                 params_dtype=config.params_dtype,
                 quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
+                prefix=maybe_prefix(prefix, "block_inject_weight"),
                 return_bias=False,
                 disable_tp=True,
-            )
-        else:
-            self.input_mix_weight_down = ReplicatedLinear(
-                self.hyper_hidden_size,
-                self.lora_rank,
-                bias=False,
-                params_dtype=config.params_dtype,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down"),
-                return_bias=False,
             )
         self.input_mix_weight_up = ReplicatedLinear(
             self.lora_rank,
             self.hyper_hidden_size,
             bias=False,
             params_dtype=config.params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
+            disable_tp=True,
         )
 
     def mix(
@@ -135,14 +137,8 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        if self.use_combine:
-            # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
-        else:
-            lora = self.input_mix_weight_down(xn)
-            injection = None
+        injection = self.block_inject_weight(xn) if self.use_combine else None
+        lora = self.input_mix_weight_down(xn)
 
         lora = hc_silu(lora, self.hc_count)
         gate = self.input_mix_weight_up(lora)  # [M, D]
@@ -172,14 +168,8 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        if self.use_combine:
-            # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
-        else:
-            lora = self.input_mix_weight_down(xn)
-            injection = None
+        injection = self.block_inject_weight(xn) if self.use_combine else None
+        lora = self.input_mix_weight_down(xn)
 
         lora = hc_silu(lora, self.hc_count)
         gate = self.input_mix_weight_up(lora)  # [M, D]
