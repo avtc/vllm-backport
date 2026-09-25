@@ -628,6 +628,10 @@ class TestCTSharedExpertTPReplicate:
     """VLLM_CT_SHARED_EXPERT_TP_REPLICATE gates the compressed-tensors
     shared-expert group-size probe (kill switch restores quark-only)."""
 
+    def teardown_method(self):
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+
     def test_default_on(self):
         if hasattr(envs.__getattr__, "cache_clear"):
             envs.__getattr__.cache_clear()

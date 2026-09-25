@@ -69,8 +69,9 @@ QWEN4_EXP_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
         1: SkinnyGemmConfig(1, 64, 4, k_unroll=2),
         2: SkinnyGemmConfig(2, 32, 4, k_unroll=2),
     },
-    # HC merged down/injection projection, replicated in a TP=4 deployment.
-    (336, 10240): {
+    # HC low-rank down projection (split layout, replicated in a TP=4
+    # deployment; the [hc_count, 10240] injection GEMM is too small to plan).
+    (320, 10240): {
         1: SkinnyGemmConfig(1, 128, 1, static_k=10240),
         2: SkinnyGemmConfig(2, 128, 1, static_k=10240),
         4: SkinnyGemmConfig(4, 128, 2, static_k=10240),
@@ -127,14 +128,9 @@ QWEN4_EXP_SM90_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = 
         1: SkinnyGemmConfig(1, 64, 2, vector_width=2, static_k=2560),
         2: SkinnyGemmConfig(2, 64, 2, vector_width=2, static_k=2560),
     },
-    # HC merged down/injection projection, replicated in a TP=4 deployment.
-    (336, 10240): {
-        1: SkinnyGemmConfig(1, 256, 1, k_unroll=5),
-        2: SkinnyGemmConfig(2, 256, 3, static_k=10240),
-        4: SkinnyGemmConfig(4, 256, 3, static_k=10240),
-        8: SkinnyGemmConfig(8, 256, 3, static_k=10240),
-    },
-    # Final HC down projection, replicated in a TP=4 deployment.
+    # HC low-rank down projection (split layout; the merged 336-row variant
+    # is gone and the [hc_count, 10240] injection GEMM is too small to plan).
+    # Replicated in a TP=4 deployment.
     (320, 10240): {
         1: SkinnyGemmConfig(1, 256, 1, static_k=10240),
         2: SkinnyGemmConfig(2, 128, 1, k_unroll=10),

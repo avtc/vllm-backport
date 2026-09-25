@@ -60,17 +60,16 @@ def test_gated_residual_split_projections(use_combine: bool, quantized: bool):
 
 
 def _fake_quant_config():
-    """Stand-in quant config whose get_quant_method yields the unquantized
-    method, so construction runs on CPU while attribute plumbing is still
-    observable."""
+    """Stand-in quant config resolving to the unquantized method, so
+    construction runs on CPU while attribute plumbing stays observable
+    (resolve_quant_method reads online_quantization_config unconditionally)."""
     from unittest.mock import SimpleNamespace
 
-    from vllm.model_executor.layers.quantization.unquantized import (
-        UnquantizedLinearMethod,
-    )
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
     return SimpleNamespace(
-        get_quant_method=lambda layer, prefix="": UnquantizedLinearMethod()
+        get_quant_method=lambda layer, prefix="": UnquantizedLinearMethod(),
+        online_quantization_config=None,
     )
 
 
@@ -90,12 +89,17 @@ def test_no_merged_hc_name_in_weight_mappers():
         assert merged not in mapping
         assert merged not in str(mapping.values())
 
-    for mapping in (
-        qwen4_model._EXTRA_WEIGHTS_MAPPER.orig_to_new_stacked,
-        qwen4_model.Qwen4ExpForCausalLM.packed_modules_mapping,
-        qwen4_mtp.Qwen4ExpMTP.packed_modules_mapping,
-    ):
-        assert mapping.get("ple.kv_proj", mapping.get("kv_proj")) is not None
+    # PLE kv stacking: checkpoint stores ple.key_proj/ple.value_proj, the
+    # stacked mapper folds them into ple.kv_proj and the language-model
+    # packed mapping declares the components. The MTP draft has no PLE.
+    stacked = qwen4_model._EXTRA_WEIGHTS_MAPPER.orig_to_new_stacked
+    assert stacked["ple.key_proj"] == ("ple.kv_proj", 0)
+    assert stacked["ple.value_proj"] == ("ple.kv_proj", 1)
+    assert (
+        qwen4_model.Qwen4ExpForCausalLM.packed_modules_mapping["kv_proj"]
+        == ["key_proj", "value_proj"]
+    )
+    assert "kv_proj" not in qwen4_mtp.Qwen4ExpMTP.packed_modules_mapping
 
 
 def test_checkpoint_split_names_load_directly():
@@ -110,3 +114,35 @@ def test_checkpoint_split_names_load_directly():
         "hyper_connection.input_mix_weight_up.weight",
     ):
         assert name not in stacked
+
+
+def test_split_weights_load_via_autoweights_loader():
+    """Split checkpoint names must load into the split projections through
+    the standard AutoWeightsLoader path (no stacked-name remapping)."""
+    import torch
+
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+
+    hc = GatedResidual(_config(), use_combine=True)
+    down = torch.randn(LOWRANK, HC_COUNT * HIDDEN, dtype=torch.bfloat16)
+    inject = torch.randn(HC_COUNT, HC_COUNT * HIDDEN, dtype=torch.bfloat16)
+    up = torch.randn(HC_COUNT * HIDDEN, LOWRANK, dtype=torch.bfloat16)
+    norm = torch.randn(HC_COUNT * HIDDEN, dtype=torch.bfloat16)
+
+    loaded = AutoWeightsLoader(hc).load_weights(
+        [
+            ("input_mix_weight_down.weight", down),
+            ("block_inject_weight.weight", inject),
+            ("input_mix_weight_up.weight", up),
+            ("hc_norm.weight", norm),
+        ]
+    )
+    assert loaded == {
+        "input_mix_weight_down.weight",
+        "block_inject_weight.weight",
+        "input_mix_weight_up.weight",
+        "hc_norm.weight",
+    }
+    assert torch.equal(hc.input_mix_weight_down.weight.data, down)
+    assert torch.equal(hc.block_inject_weight.weight.data, inject)
+    assert torch.equal(hc.input_mix_weight_up.weight.data, up)

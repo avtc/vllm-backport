@@ -183,7 +183,7 @@ VLLM_PLE_CPU_OFFLOAD=1 vllm serve /path/to/qwen3.8-int4-mixed \
 ```
 
 - `--enable-expert-parallel` is required at TP4/TP8 (routed experts INT4 g128: 160/80 per rank is not a whole group). Without EP the server exits with an explicit error suggesting EP; with EP the shared expert replicates (~178 MB/GPU).
-- At TP2 no EP is needed (experts 320 %128 == 0, shared expert 320 %64 == 0); for a pipeline fallback use `VLLM_PP_LAYER_PARTITION="12,12,13,11"` with `--tensor-parallel-size 2 --pipeline-parallel-size 4` (stage 0 carries embed + the single PLE layer; stage 3 carries lm_head + MTP).
+- `--enable-expert-parallel` is required at **every** TP size for this checkpoint: the routed experts are INT4 g128 and 640/TP is never a whole group (320 %128 = 64 at TP2, 160/80 at TP4/8). Only the shared expert additionally replicates at TP4/TP8 (640/TP %64 != 0); at TP2 it still shards (320 %64 == 0). Pipeline fallback: `VLLM_PP_LAYER_PARTITION="12,12,13,11"` with `--tensor-parallel-size 2 --pipeline-parallel-size 4` (stage 0 carries embed + the single PLE layer; stage 3 carries lm_head + MTP).
 - `VLLM_PLE_CPU_OFFLOAD=1` pins ~51 GiB fp8 n-gram rows in host RAM — budget for it (>=64 GB RAM).
 
 #### DeepSeek V4 Flash (Preview, 0731, Vision-Exp)

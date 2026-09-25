@@ -211,7 +211,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self.vocab_size,
             self.hidden_size,
             quant_config=draft_vllm_config.quant_config,
-            prefix=f"{prefix}.embed_tokens",
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         with set_current_vllm_config(draft_vllm_config, prefix=prefix):
             # residual_linear_shared fusion: fc_embedding projects the token
