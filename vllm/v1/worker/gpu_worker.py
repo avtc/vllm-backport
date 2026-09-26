@@ -176,6 +176,41 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+def _defer_pp_recv() -> bool:
+    return bool(envs.VLLM_PP_DEFER_RECV)
+
+
+class DeferredRecvIntermediateTensors(AsyncIntermediateTensors):
+    """AsyncIntermediateTensors that also defers the receive itself.
+
+    ``irecv_tensor_dict`` starts with a blocking receive of the pickled tensor
+    metadata over the CPU group, which only arrives once the previous PP rank
+    has launched its forward. Calling it at the top of ``execute_model`` makes
+    this rank's whole input and attention-metadata preparation wait for that,
+    so on every non-first rank the host preparation runs after the previous
+    rank's launch instead of alongside the previous rank's GPU work. When the
+    per-rank GPU time is short (decode), that host work becomes the step time.
+
+    The model runner only reads ``.tensors`` right before the forward, so the
+    receive is issued there. The order of device operations on this rank is
+    unchanged: receive, forward, send.
+    """
+
+    def __init__(self, recv: Callable[[], tuple]) -> None:
+        super().__init__({})
+        self._recv = recv
+
+    def wait_for_comm(self) -> None:
+        if object.__getattribute__(self, "_comm_waited"):
+            return
+        tensor_dict, handles, postprocess = object.__getattribute__(self, "_recv")()
+        assert tensor_dict is not None
+        object.__setattr__(self, "tensors", tensor_dict)
+        object.__setattr__(self, "_comm_handles", handles)
+        object.__setattr__(self, "_comm_postprocess", postprocess)
+        super().wait_for_comm()
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -366,9 +401,7 @@ class Worker(WorkerBase):
                 custom_ar_enforced_size_mb_from_config,
             )
 
-            enforced_mb = custom_ar_enforced_size_mb_from_config(
-                self.vllm_config
-            )
+            enforced_mb = custom_ar_enforced_size_mb_from_config(self.vllm_config)
             if enforced_mb is not None:
                 os.environ["VLLM_CUSTOM_AR_ENFORCED_MB"] = str(enforced_mb)
 
@@ -1221,7 +1254,20 @@ class Worker(WorkerBase):
                 )
             }
 
-        if forward_pass and not get_pp_group().is_first_rank:
+        if (
+            forward_pass
+            and not get_pp_group().is_first_rank
+            and self.use_v2_model_runner
+            and _defer_pp_recv()
+        ):
+            pp_group, tp_group = get_pp_group(), get_tp_group()
+            intermediate_tensors = DeferredRecvIntermediateTensors(
+                lambda: pp_group.irecv_tensor_dict(
+                    all_gather_group=tp_group,
+                    all_gather_tensors=all_gather_tensors,
+                )
+            )
+        elif forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
@@ -1239,6 +1285,9 @@ class Worker(WorkerBase):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            if isinstance(intermediate_tensors, DeferredRecvIntermediateTensors):
+                # Match the previous rank's send even if nothing read it.
+                intermediate_tensors.wait_for_comm()
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model

@@ -198,6 +198,10 @@ if TYPE_CHECKING:
     # Fused Triton kernels for the pack-quantized INT8 hyper-connection
     # projections at decode batch sizes (0 restores the Marlin path).
     VLLM_HC_FUSED_INT8: bool = True
+    # Defer the pipeline-parallel receive until the model runner first reads
+    # the intermediate tensors, so host-side input preparation on non-first
+    # ranks overlaps the previous rank's GPU work (0 restores the old order).
+    VLLM_PP_DEFER_RECV: bool = True
     # QSA fp8 main-KV read path: "" (bf16 only), "decode" (in-kernel e4m3
     # decode) or "gather" (bf16 workspace pre-pass) for A/B comparison.
     VLLM_QSA_FP8_KV: str = ""
@@ -2476,6 +2480,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_PLE_PREFETCH_BATCH", "1024")
     ),
     "VLLM_HC_FUSED_INT8": lambda: bool(int(os.getenv("VLLM_HC_FUSED_INT8", "1"))),
+    "VLLM_PP_DEFER_RECV": lambda: bool(int(os.getenv("VLLM_PP_DEFER_RECV", "1"))),
     "VLLM_QSA_FP8_KV": lambda: os.getenv("VLLM_QSA_FP8_KV", ""),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
