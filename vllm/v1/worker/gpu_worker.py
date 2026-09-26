@@ -203,7 +203,13 @@ class DeferredRecvIntermediateTensors(AsyncIntermediateTensors):
     def wait_for_comm(self) -> None:
         if object.__getattribute__(self, "_comm_waited"):
             return
-        tensor_dict, handles, postprocess = object.__getattribute__(self, "_recv")()
+        try:
+            tensor_dict, handles, postprocess = object.__getattribute__(self, "_recv")()
+        except Exception:
+            # The receive failed; retrying cannot succeed and a second
+            # attempt from a trailing wait would mask the original error.
+            object.__setattr__(self, "_comm_waited", True)
+            raise
         assert tensor_dict is not None
         object.__setattr__(self, "tensors", tensor_dict)
         object.__setattr__(self, "_comm_handles", handles)
@@ -1282,12 +1288,15 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
-            if isinstance(intermediate_tensors, DeferredRecvIntermediateTensors):
-                # Match the previous rank's send even if nothing read it.
-                intermediate_tensors.wait_for_comm()
+            try:
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+            finally:
+                if isinstance(intermediate_tensors, DeferredRecvIntermediateTensors):
+                    # Match the previous rank's send even if nothing read it
+                    # or the execution raised before reading it.
+                    intermediate_tensors.wait_for_comm()
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model

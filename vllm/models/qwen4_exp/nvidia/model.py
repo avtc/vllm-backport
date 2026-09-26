@@ -827,11 +827,18 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
                 reasons.append("routing variant")
             if routed.activation.name != "SILU":
                 reasons.append(f"activation {routed.activation}")
+            # RoutedExperts leaves the swiglu knobs at None by default; only
+            # a set limit or a non-default alpha/beta (or the situ betas,
+            # which live on the moe_config) rules the fused path out.
             if (
                 getattr(routed, "swiglu_limit", None) is not None
-                or getattr(routed, "swiglu_alpha", 1.0) != 1.0
-                or getattr(routed, "swiglu_beta", 0.0) != 0.0
-                or getattr(routed, "activation_situ_linear_beta", None) is not None
+                or getattr(routed, "swiglu_alpha", None) not in (None, 1.0)
+                or getattr(routed, "swiglu_beta", None) not in (None, 0.0)
+                or getattr(routed.moe_config, "activation_situ_beta", None) is not None
+                or getattr(
+                    routed.moe_config, "activation_situ_linear_beta", None
+                )
+                is not None
             ):
                 reasons.append("swiglu activation config")
             if getattr(routed, "w13_bias", None) is not None or hasattr(
@@ -903,6 +910,9 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
     def _forward_decode(self, x: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
             _fused_marlin_moe,
+        )
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+            get_marlin_input_dtype,
         )
 
         st = self._decode_state
@@ -998,6 +1008,7 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
             activation=routed.activation,
             topk_ids=topk_ids,
             workspace=getattr(routed, "workspace", None),
+            input_dtype=get_marlin_input_dtype(),
         )
         out = torch.empty_like(x)
         if self._shared_int6_decode:

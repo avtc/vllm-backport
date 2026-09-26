@@ -45,3 +45,23 @@ def test_deferred_recv_wait_for_comm_is_idempotent():
     assert calls == [1]
     assert t._comm_handles == ["h"]
     assert t._comm_waited is True
+
+
+def test_deferred_recv_wait_for_comm_swallows_secondary_errors():
+    """The trailing wait must not mask the original exception when the recv
+    itself also fails (the caller only cares about the forward's error)."""
+    calls = []
+
+    def bad_recv():
+        calls.append(1)
+        raise RuntimeError("recv failed")
+
+    t = DeferredRecvIntermediateTensors(bad_recv)
+    try:
+        _ = t.tensors
+    except RuntimeError as e:
+        assert "recv failed" in str(e)
+    assert calls == [1]
+    # A second wait does not re-run the broken recv.
+    t.wait_for_comm()
+    assert calls == [1]

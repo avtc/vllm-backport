@@ -70,11 +70,13 @@ def test_int6_planes_both_or_neither():
         _use_int6_planes,
     )
 
-    class _WNA16:
-        def __init__(self, num_bits=6, symmetric=True, group_size=64):
-            self.num_bits = num_bits
-            self.symmetric = symmetric
-            self.group_size = group_size
+    # The eligibility check matches the scheme by class NAME.
+    def _WNA16(num_bits=6, symmetric=True, group_size=64):
+        return type(
+            "CompressedTensorsWNA16",
+            (),
+            {"num_bits": num_bits, "symmetric": symmetric, "group_size": group_size},
+        )()
 
     class _Lin(nn.Module):
         def __init__(self, k, n, scheme):
