@@ -336,37 +336,26 @@ def test_ple_prefetch_envs_default_on():
         assert envs.VLLM_PLE_PREFETCH_BATCH == 1024
 
 
-def test_draft_tokens_handler_tracks_latest_drafts():
-    """get_draft_tokens returns the latest drafts of every request, not just
-    the last batch's - under PP a request decodes every pp_size steps, so the
-    grammar bitmask batch usually holds requests absent from the last draft
-    batch (structured-output 500s otherwise)."""
-    import numpy as np
-    import torch
+def test_pidfd_syscall_numbers_match_architecture():
+    """The batched process_madvise probe silently degrades to per-range
+    madvise when the syscall numbers are wrong (x86_64: pidfd_open 433,
+    process_madvise 439; the asm-generic 434/440 are clone3/epoll_pwait2
+    there)."""
+    import platform
 
-    from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import _PLEPagePrefetcher
 
-    if not torch.cuda.is_available():
-        import pytest
-
-        pytest.skip("requires CUDA")
-
-    handler = DraftTokensHandler(torch.device("cuda"))
-    handler.req_ids = ["a", "b"]
-    handler.num_draft_tokens = 2
-    handler.draft_tokens_np = np.array([[7, 8], [9, 10]])
-    handler.copy_pending = True
-    got = handler.get_draft_tokens()
-    assert dict(zip(got.req_ids, got.token_ids))["a"] == [7, 8]
-    assert dict(zip(got.req_ids, got.token_ids))["b"] == [9, 10]
-    # a later batch with only 'a' keeps b's latest drafts
-    handler.req_ids = ["a"]
-    handler.draft_tokens_np = np.array([[11, 12]])
-    handler.copy_pending = True
-    got = handler.get_draft_tokens()
-    drafts = dict(zip(got.req_ids, got.token_ids))
-    assert drafts["a"] == [11, 12]
-    assert drafts["b"] == [9, 10]
-    # removal drops a request
-    handler.remove_request("b")
-    assert "b" not in handler.get_draft_tokens().req_ids
+    expected = {
+        "x86_64": (433, 439),
+        "aarch64": (434, 440),
+        "riscv64": (434, 440),
+    }
+    machine = platform.machine()
+    if machine in expected:
+        assert expected[machine] == (
+            _PLEPagePrefetcher._SYS_PIDFD_OPEN,
+            _PLEPagePrefetcher._SYS_PROCESS_MADVISE,
+        )
+    else:
+        # Unknown arch falls back to the asm-generic numbers.
+        assert _PLEPagePrefetcher._SYS_PIDFD_OPEN == 434

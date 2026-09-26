@@ -85,3 +85,69 @@ def test_hc_fused_env_default_on():
         if hasattr(envs.__getattr__, "cache_clear"):
             envs.__getattr__.cache_clear()
         assert envs.VLLM_HC_FUSED_INT8 is True
+
+
+def _quantize_int8(w: torch.Tensor, gs: int):
+    """Symmetric group quantization in the uint8b128 layout the kernels read:
+    q = value + 128 per group-scaled int8, plus the [N, K // gs] scales."""
+    n, k = w.shape
+    wg = w.float().reshape(n, k // gs, gs)
+    scale = wg.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 127.0
+    q = torch.round(wg / scale).clamp(-128, 127) + 128
+    dequant = (q - 128) * scale
+    return (
+        q.reshape(n, k).to(torch.uint8).contiguous(),
+        scale.reshape(n, k // gs).float().contiguous(),
+        dequant.reshape(n, k).to(w.dtype),
+    )
+
+
+def test_fused_projection_matches_quantized_reference():
+    """_project_fused (Triton INT8 GEMVs) must match the unfused path on the
+    same dequantized weights for M = 1..4 tokens."""
+    if not torch.cuda.is_available():
+        import pytest
+
+        pytest.skip("needs CUDA to launch the Triton kernels")
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.common.hyperconnection import HyperConnectionConfig
+    from vllm.models.qwen4_exp.nvidia.hyperconnection import GatedResidual
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    hidden, hc_count, rank = 512, 4, 128  # hyper = 2048 (kernel tile width)
+    config = HyperConnectionConfig(
+        hc_count=hc_count,
+        hidden_size=hidden,
+        hc_lowrank=rank,
+        params_dtype=torch.bfloat16,
+    )
+    mod = GatedResidual(
+        config, use_combine=True, quant_config=None, prefix="test_hc"
+    ).to(dev)
+    mod._hc_fused = False
+
+    for gs in (64, 128):
+        for name in ("input_mix_weight_down", "input_mix_weight_up"):
+            linear = getattr(mod, name)
+            hc_q, hc_scale, dequant = _quantize_int8(linear.weight.data, gs)
+            linear.hc_q = hc_q
+            linear.hc_scale = hc_scale
+            linear.scheme = SimpleNamespace(group_size=gs)
+            with torch.no_grad():
+                linear.weight.copy_(dequant)
+
+        for m in (1, 2, 3, 4):
+            xn = torch.randn(m, hc_count * hidden, device=dev, dtype=torch.bfloat16)
+            with torch.no_grad():
+                _, block_ref, inj_ref = mod._project(xn)
+                mod._hc_fused = True
+                _, block_fused, inj_fused = mod._project_fused(xn)
+                mod._hc_fused = False
+            torch.testing.assert_close(
+                inj_fused.float(), inj_ref.float(), rtol=2e-2, atol=2e-2
+            )
+            torch.testing.assert_close(
+                block_fused.float(), block_ref.float(), rtol=2e-2, atol=2e-2
+            )

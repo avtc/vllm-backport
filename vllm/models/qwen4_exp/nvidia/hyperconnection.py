@@ -54,7 +54,9 @@ from .ops.hc import (
 # mix over the HC streams. That replaces six kernels, ~32 us -> ~13 us per
 # module at one token, 96 modules per token. Larger batches use a Triton
 # W8A16 GEMM on the same weights (faster than Marlin on these shapes at 512
-# tokens). Numerics round to BF16 at the same points as the unfused path.
+# tokens). Outputs round to BF16 at the same points as the unfused path;
+# the in-register weight dequant stays fp32 (slightly more precise than
+# the prefill GEMM, which rounds dequantized tiles to BF16 before the MMA).
 #
 # The pack-quantized INT8 layout is plain bytes: the int32 words hold four
 # values, least significant byte first, so weight_packed viewed as uint8 is
@@ -329,11 +331,11 @@ class _HCInt8Scheme:
         return y.view(*shape[:-1], y.shape[-1])
 
 
-def _use_hc_int8_scheme(linear: nn.Module) -> bool:
-    """Swap in _HCInt8Scheme when the projection is pack-quantized INT8."""
+def _hc_int8_group_size(linear: nn.Module) -> int | None:
+    """Group size if the projection qualifies for the fused INT8 path."""
     scheme = getattr(linear, "scheme", None)
     if scheme is None or type(scheme).__name__ != "CompressedTensorsWNA16":
-        return False
+        return None
     group_size = getattr(scheme, "group_size", -1)
     if (
         scheme.num_bits != 8
@@ -341,6 +343,20 @@ def _use_hc_int8_scheme(linear: nn.Module) -> bool:
         or group_size not in (32, 64, 128)
         or linear.input_size_per_partition % group_size
     ):
+        return None
+    return group_size
+
+
+def _use_hc_int8_scheme(linear: nn.Module) -> bool:
+    """Swap in _HCInt8Scheme when the projection is pack-quantized INT8.
+
+    Check eligibility for every projection first (via _hc_int8_group_size)
+    and only then call this: it mutates ``linear.scheme`` as a side effect,
+    and a short-circuited ``and`` would leave the first projection swapped
+    while the fused path stays disabled.
+    """
+    group_size = _hc_int8_group_size(linear)
+    if group_size is None:
         return False
     linear.scheme = _HCInt8Scheme(group_size)
     return True
@@ -443,9 +459,11 @@ class GatedResidual(nn.Module):
             and self.hidden_size % 8 == 0
         ):
             down, up = self.input_mix_weight_down, self.input_mix_weight_up
+            # Both projections must qualify, or neither is touched.
             if all(
                 type(getattr(m, "scheme", None)).__name__ == "CompressedTensorsWNA16"
                 and m.scheme.num_bits == 8
+                and _hc_int8_group_size(m) is not None
                 for m in (down, up)
             ):
                 self._hc_fused = _use_hc_int8_scheme(down) and _use_hc_int8_scheme(up)
@@ -563,7 +581,9 @@ class GatedResidual(nn.Module):
             HC=self.hc_count,
             GS=up.scheme.group_size,
             BLOCK_H=block_h,
-            BLOCK_K=64,
+            # The up kernel reshapes BLOCK_K into (NG, GS) groups; BLOCK_K
+            # must cover at least one full group (GS can be 128).
+            BLOCK_K=max(64, up.scheme.group_size),
             num_warps=4,
         )
         return block_input, (injection if self.use_combine else None)

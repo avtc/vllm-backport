@@ -83,3 +83,100 @@ def test_uint8_view_preserves_strides():
     k8 = key_cache.view(torch.uint8)
     assert k8.shape == key_cache.shape
     assert k8.stride() == key_cache.stride()
+
+
+def test_gather_workspace_pads_invalid_columns():
+    """The synthetic selection buffer must -1-pad columns past each row's
+    valid count (the expand kernel's contract): the sparse GQA kernel only
+    masks columns via logical_token >= 0, so identity indices everywhere
+    would make the last tile read the untouched workspace memory."""
+    if not torch.cuda.is_available():
+        import pytest
+
+        pytest.skip("needs CUDA to build the workspace")
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_gather_dequant_workspace
+
+    rows, topk, heads, dim = 4, 8, 2, 32
+    device = "cuda"
+    logical = torch.full((rows, topk + 1), -1, dtype=torch.int32, device=device)
+    logical[:, :3] = torch.arange(3, dtype=torch.int32, device=device)  # count 3
+    logical[:, topk] = 3
+    k_cache = torch.randn(  # PAGE_SIZE=topk
+        rows * 2, topk, heads, dim, device=device, dtype=torch.bfloat16
+    )
+    v_cache = torch.randn_like(k_cache)
+    k_scale = torch.ones(1, device=device)
+    v_scale = torch.ones(1, device=device)
+    block_table = torch.arange(rows, dtype=torch.int32, device=device)[:, None]
+    token_to_req = torch.arange(rows, dtype=torch.int32, device=device)
+
+    k_ws, v_ws, packed, _, _ = qsa_gather_dequant_workspace(
+        k_cache, v_cache, logical, block_table, token_to_req, k_scale, v_scale
+    )
+    # identity within valid count, -1 beyond, trailing count preserved
+    assert packed[:, :3].tolist() == [[0, 1, 2]] * rows
+    assert (packed[:, 3:topk] == -1).all().item()
+    assert (packed[:, topk] == 3).all().item()
+    # gathered rows match the cache selection for the valid columns
+    torch.testing.assert_close(k_ws[:, :3], k_cache[:rows, :3])
+    torch.testing.assert_close(v_ws[:, :3], v_cache[:rows, :3])
+
+
+def test_gather_workspace_matches_dense_attention():
+    """End-to-end gather + sparse kernel equals a dense softmax reference."""
+    if not torch.cuda.is_available():
+        import pytest
+
+        pytest.skip("needs CUDA to launch the kernels")
+
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+        qsa_gather_dequant_workspace,
+        qsa_sparse_paged_attention,
+    )
+
+    rows, topk, heads, dim = 3, 8, 2, 32
+    device = "cuda"
+    torch.manual_seed(0)
+    logical = torch.full((rows, topk + 1), -1, dtype=torch.int32, device=device)
+    counts = [5, 8, 2]
+    for r, c in enumerate(counts):
+        logical[r, :c] = torch.arange(c, dtype=torch.int32, device=device)
+    logical[:, topk] = torch.tensor(counts, dtype=torch.int32, device=device)
+
+    # One cache page per row; the row's selections are tokens [0, count).
+    k_cache = torch.randn(rows, topk, heads, dim, device=device, dtype=torch.bfloat16)
+    v_cache = torch.randn(rows, topk, heads, dim, device=device, dtype=torch.bfloat16)
+    k_scale = torch.ones(1, device=device)
+    v_scale = torch.ones(1, device=device)
+    block_table = torch.arange(rows, dtype=torch.int32, device=device)[:, None]
+    token_to_req = torch.arange(rows, dtype=torch.int32, device=device)
+
+    k_ws, v_ws, packed, synth_bt, synth_req = qsa_gather_dequant_workspace(
+        k_cache, v_cache, logical, block_table, token_to_req, k_scale, v_scale
+    )
+    q = torch.randn(rows, heads * 4, dim, device=device, dtype=torch.bfloat16)
+    out = qsa_sparse_paged_attention(
+        q,
+        k_ws,
+        v_ws,
+        packed,
+        synth_bt,
+        synth_req,
+        use_prefill_config=False,
+        kv_fp8=False,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+    # Dense reference: softmax over each row's valid selections only.
+    # Query head h attends kv head h // GROUP_SIZE (GROUP_SIZE=4).
+    q_ref = q.reshape(rows, heads * 4, 1, dim).float()
+    ref = torch.empty_like(out, dtype=torch.float32)
+    for r, c in enumerate(counts):
+        for h in range(heads * 4):
+            kv = h // 4
+            k = k_cache[r, :c, kv].float()  # [c, dim]
+            scores = (q_ref[r, h, 0] @ k.T) / (dim**0.5)
+            p = torch.softmax(scores, dim=-1)
+            ref[r, h] = p @ v_cache[r, :c, kv].float()
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)

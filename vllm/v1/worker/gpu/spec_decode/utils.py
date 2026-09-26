@@ -26,18 +26,19 @@ class DraftTokensHandler:
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
     ) -> None:
-        self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
-            # the scheduler for this batch.
+            # the scheduler for this batch. Collect any pending copy first:
+            # its drafts must survive into latest_drafts, and dropping the
+            # array with the copy still pending would crash _collect().
+            self._collect()
             self.draft_tokens_np = None
             return
+        self.req_ids = input_batch.req_ids
         # Batches without structured-output requests never invalidate the
-        # drafts collected earlier (see get_draft_tokens).
-        for req_id in input_batch.req_ids:
-            if req_id not in self.req_ids:
-                self.latest_drafts.pop(req_id, None)
+        # drafts collected earlier (see get_draft_tokens); requests leave
+        # latest_drafts only via remove_request.
 
         # For spec decoding + structured outputs, we must transfer the
         # draft tokens back to the scheduler for grammar validation.
@@ -57,7 +58,10 @@ class DraftTokensHandler:
         if not self.copy_pending:
             return
         self.copy_pending = False
-        assert self.draft_tokens_np is not None
+        if self.draft_tokens_np is None:
+            # A batch without structured-output requests cleared the array
+            # after collecting; nothing to move.
+            return
         self.copy_event.synchronize()
         for req_id, drafts in zip(self.req_ids, self.draft_tokens_np.tolist()):
             self.latest_drafts[req_id] = drafts

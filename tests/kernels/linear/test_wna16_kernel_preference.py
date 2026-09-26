@@ -83,6 +83,16 @@ def test_preference_is_case_insensitive():
         assert apply_kernel_preference(CANDIDATES)[0].__name__ == "MarlinLinearKernel"
 
 
+@pytest.mark.parametrize("prefer", ["Marlin", "MARLIN", "marlin", "Humming"])
+def test_preference_matches_any_case(prefer):
+    expected = "Marlin" if prefer.lower() == "marlin" else "Humming"
+    with patch.dict(os.environ, {"VLLM_WNA16_PREFER_KERNEL": prefer}):
+        _clear_envs_cache()
+        assert apply_kernel_preference(CANDIDATES)[0].__name__ == (
+            expected + "LinearKernel"
+        )
+
+
 def test_unknown_family_is_noop():
     with patch.dict(os.environ, {"VLLM_WNA16_PREFER_KERNEL": "conch"}):
         _clear_envs_cache()

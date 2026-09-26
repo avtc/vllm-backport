@@ -25,6 +25,7 @@ def apply_kernel_preference(items: list[_Named]) -> list[_Named]:
     prefer = envs.VLLM_WNA16_PREFER_KERNEL
     if prefer in ("", "auto"):
         return items
+    prefer = prefer.lower()
     return sorted(
         items, key=lambda it: 0 if it.__name__.lower().startswith(prefer) else 1
     )

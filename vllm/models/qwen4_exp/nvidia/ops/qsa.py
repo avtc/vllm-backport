@@ -546,11 +546,11 @@ def _qsa_gather_dequant_kv_kernel(
     )
     values = tl.load(
         v_cache_ptr
-        + safe_page[:, None] * stride_v_block
-        + page_offset[:, None] * stride_v_token
+        + safe_page[None, :] * stride_v_block
+        + page_offset[None, :] * stride_v_token
         + kv_head * stride_v_head
-        + dims[None, :],
-        mask=valid[:, None],
+        + dims[:, None],
+        mask=valid[None, :],
         other=0,
     )
     if KV_FP8:
@@ -629,8 +629,18 @@ def qsa_gather_dequant_workspace(
     )
 
     packed = torch.empty((rows, packed_width), dtype=torch.int32, device=device)
-    packed[:, :topk] = torch.arange(topk, dtype=torch.int32, device=device)
-    packed[:, topk] = logical_indices[:, topk]
+    # -1-pad columns past each row's valid count (the selection buffer's
+    # contract): the sparse GQA kernel masks invalid columns via
+    # logical_token >= 0, so without the padding it would read the
+    # untouched torch.empty workspace in the last tile and fold it into
+    # the softmax.
+    counts = logical_indices[:, topk]
+    packed[:, :topk] = torch.where(
+        counts[:, None] > torch.arange(topk, dtype=torch.int32, device=device),
+        torch.arange(topk, dtype=torch.int32, device=device),
+        torch.full((topk,), -1, dtype=torch.int32, device=device),
+    )
+    packed[:, topk] = counts
     synth_block_table = torch.arange(rows, dtype=torch.int32, device=device)[:, None]
     synth_token_to_req = torch.arange(rows, dtype=torch.int32, device=device)
     return k_ws, v_ws, packed, synth_block_table, synth_token_to_req

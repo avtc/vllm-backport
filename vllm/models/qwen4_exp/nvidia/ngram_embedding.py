@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
+import ctypes
 import json
 import os
+import platform
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import ClassVar
@@ -710,8 +712,18 @@ class _PLEPagePrefetcher:
     the kernel.
     """
 
-    _SYS_PIDFD_OPEN = 434
-    _SYS_PROCESS_MADVISE = 440
+    # pidfd_open / process_madvise syscall numbers per architecture.
+    # The asm-generic numbers (434/440) are wrong on x86_64, where 434 is
+    # clone3 and 440 epoll_pwait2.
+    _SYS_NUMBERS = {
+        "x86_64": (433, 439),
+        "aarch64": (434, 440),
+        "riscv64": (434, 440),
+        "loongarch64": (434, 440),
+    }
+    _SYS_PIDFD_OPEN, _SYS_PROCESS_MADVISE = _SYS_NUMBERS.get(
+        platform.machine(), (434, 440)
+    )
     _MADV_WILLNEED = 3
     _IOV_MAX = 1024
     _PAGE_SHIFT = 12
@@ -723,7 +735,6 @@ class _PLEPagePrefetcher:
         row_bytes: int,
         batch_rows: int,
     ) -> None:
-        import ctypes
         import queue
         import threading
 
@@ -769,7 +780,6 @@ class _PLEPagePrefetcher:
         the first and last page of every row, duplicates included (the kernel
         skips resident pages quickly), with a preallocated iovec array.
         """
-        import ctypes
 
         n = rows.size
         if not self._batched or 2 * n > self._IOV_MAX:
@@ -839,7 +849,6 @@ class _PLEPagePrefetcher:
 
     def _advise_batched(self, starts: np.ndarray, ends: np.ndarray) -> bool:
         """Call process_madvise with iovec arrays. Returns False if it fails."""
-        import ctypes
 
         shift = self._PAGE_SHIFT
         for i in range(0, starts.size, self._IOV_MAX):
@@ -869,7 +878,6 @@ class _PLEPagePrefetcher:
         return True
 
     def _probe_process_madvise(self) -> bool:
-        import ctypes
 
         pidfd = self._libc.syscall(self._SYS_PIDFD_OPEN, os.getpid(), 0)
         if pidfd < 0:
@@ -982,11 +990,9 @@ def _mmap_table_path() -> str:
 
 
 def _mode_includes_full(mode: CUDAGraphMode) -> bool:
-    if mode == CUDAGraphMode.FULL:
-        return True
-    # Combined modes store plain int tuples (e.g. (2, 1)); enum members
-    # never equal their int values, so compare the member's value.
-    return isinstance(mode.value, tuple) and CUDAGraphMode.FULL.value in mode.value
+    # has_mode covers both the plain enum and combined int-tuple values
+    # (an enum member never equals its int value).
+    return mode.has_mode(CUDAGraphMode.FULL)
 
 
 def _clamp_cudagraph_mode_for_host_gather(
@@ -1208,7 +1214,6 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             self._mmap_prebuilt = True
             self._storage_scale = float(fp8_marker["scale"])
             self._compute_dtype = dtype
-            self._mmap_table_path_used = fp8_path
             logger.info(
                 "PLE mmap table %s: rows=%d dim=%d fp8 storage, scale=%.3e "
                 "(%.2f GiB, prebuilt copy-on-write)",
@@ -1366,18 +1371,21 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
     ) -> torch.Tensor:
         """Host-gather rows from the mmap table into GPU output storage."""
         expected_shape = (*input_ids.shape, self.embedding_dim)
+        # fp8-stored tables dequantize during the gather: outputs are in the
+        # compute dtype even though the weight itself is fp8.
+        out_dtype = self._compute_dtype
         if output is None:
             output = torch.empty(
-                expected_shape, dtype=self.weight.dtype, device=input_ids.device
+                expected_shape, dtype=out_dtype, device=input_ids.device
             )
         elif (
             tuple(output.shape) != expected_shape
-            or output.dtype != self.weight.dtype
+            or output.dtype != out_dtype
             or output.device != input_ids.device
         ):
             raise ValueError(
-                "PLE prefetch output must match the input shape, weight dtype, "
-                "and input device"
+                "PLE prefetch output must match the input shape, compute "
+                "dtype, and input device"
             )
 
         flat_ids = input_ids.reshape(-1).to("cpu", non_blocking=False).long()
@@ -1776,7 +1784,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ids = _ple_ngram_rows_numpy(
                 token_ids, multipliers, sizes, offsets, eos_token_id, heads_per_ngram
             )
-            return ids[start:].reshape(-1)
+            ids = ids[start:].reshape(-1)
+            # _ple_ngram_rows_numpy returns GLOBAL table row ids; the
+            # prefetcher advises pages of this rank's shard. Localize and
+            # drop out-of-shard rows (other ranks prefetch their own copy).
+            vocab_start = int(
+                self.ngram_embedding.shard_indices.org_vocab_start_index
+            )
+            local = ids - vocab_start
+            return local[(local >= 0) & (local < self.ngram_embedding.weight.shape[0])]
 
         submit(req_id, rows)
 
