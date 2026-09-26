@@ -12,6 +12,15 @@ class _Named(Protocol):
     __name__: str
 
 
+def preferred_first(name: str, prefer: str) -> bool:
+    """Whether the candidate ``name`` belongs to the preferred kernel family.
+
+    Case-insensitive prefix match, shared by the dense MP-linear and the
+    WNA16 MoE backend selection (VLLM_WNA16_PREFER_KERNEL).
+    """
+    return name.lower().startswith(prefer.lower())
+
+
 def apply_kernel_preference(items: list[_Named]) -> list[_Named]:
     """Stable-reorder ``items`` moving the preferred WNA16 kernel family first.
 
@@ -25,7 +34,6 @@ def apply_kernel_preference(items: list[_Named]) -> list[_Named]:
     prefer = envs.VLLM_WNA16_PREFER_KERNEL
     if prefer in ("", "auto"):
         return items
-    prefer = prefer.lower()
     return sorted(
-        items, key=lambda it: 0 if it.__name__.lower().startswith(prefer) else 1
+        items, key=lambda it: 0 if preferred_first(it.__name__, prefer) else 1
     )

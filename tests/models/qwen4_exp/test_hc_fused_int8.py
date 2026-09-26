@@ -13,8 +13,18 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch import nn
+
+
+@pytest.fixture(autouse=True)
+def _clean_envs_cache():
+    yield
+    import vllm.envs as envs
+
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
 
 
 class _FakeWNA16:
@@ -151,3 +161,22 @@ def test_fused_projection_matches_quantized_reference():
             torch.testing.assert_close(
                 block_fused.float(), block_ref.float(), rtol=2e-2, atol=2e-2
             )
+
+
+@pytest.mark.parametrize("m", [5, 17, 33])
+def test_w8a16_gemm_matches_dequantized_reference(m):
+    """The prefill-path Triton W8A16 GEMM (batch > 4) matches a reference
+    GEMM on identically dequantized (BF16-rounded) weights."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA to launch the kernel")
+    from vllm.models.qwen4_exp.nvidia.hyperconnection import _w8a16_gemm
+
+    torch.manual_seed(0)
+    n, k, gs = 320, 2048, 64
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    hc_q, hc_scale, dequant = _quantize_int8(w, gs)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+
+    got = _w8a16_gemm(x, hc_q, hc_scale, gs)
+    ref = x @ dequant.T
+    torch.testing.assert_close(got, ref, atol=2e-1, rtol=2e-2)

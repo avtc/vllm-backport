@@ -285,10 +285,11 @@ def select_wna16_moe_backend(
 
     _prefer = envs.VLLM_WNA16_PREFER_KERNEL
     if _prefer not in ("", "auto"):
-        _prefer = _prefer.lower()
+        from vllm.model_executor.kernels.linear.preference import preferred_first
+
         AVAILABLE_BACKENDS = sorted(
             AVAILABLE_BACKENDS,
-            key=lambda b: 0 if b.value.lower().startswith(_prefer) else 1,
+            key=lambda b: 0 if preferred_first(b.value, _prefer) else 1,
         )
 
     for backend in AVAILABLE_BACKENDS:

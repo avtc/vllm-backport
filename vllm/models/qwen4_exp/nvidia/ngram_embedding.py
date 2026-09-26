@@ -6,6 +6,7 @@ import ctypes
 import json
 import os
 import platform
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import ClassVar
@@ -878,7 +879,6 @@ class _PLEPagePrefetcher:
         return True
 
     def _probe_process_madvise(self) -> bool:
-
         pidfd = self._libc.syscall(self._SYS_PIDFD_OPEN, os.getpid(), 0)
         if pidfd < 0:
             logger.info(
@@ -898,6 +898,8 @@ class _PLEPagePrefetcher:
         )
         if rc < 0:
             err = ctypes.get_errno()
+            os.close(pidfd)
+            self._pidfd = -1
             logger.info(
                 "process_madvise unavailable (%s; under podman it needs "
                 "cap_add SYS_PTRACE); PLE page prefetch uses per-range madvise",
@@ -987,6 +989,12 @@ def _mmap_table_path() -> str:
     assert base, "VLLM_PLE_MMAP_PATH must be set for the mmap PLE table"
     rank = torch.distributed.get_rank(get_etp_group().device_group)
     return f"{base}.rank{rank}"
+
+
+# The table file is keyed per ETP rank only, so a second PLE layer (its own
+# row count) on the same rank would truncate the first layer's file mid-run.
+# Map each live path to its owning embedding and reject the second claimant.
+_MMAP_TABLE_OWNERS: dict[str, weakref.ref] = {}
 
 
 def _mode_includes_full(mode: CUDAGraphMode) -> bool:
@@ -1086,6 +1094,14 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         # model state's prepare_inputs (before forward), so forward holds
         # only GPU ops and FULL cudagraphs stay sound.
         self.prefetch_runs_outside_forward = bool(envs.VLLM_PLE_MMAP_PREPARE_OUTSIDE)
+        if self.prefetch_runs_outside_forward and self.etp_data_parallel_size > 1:
+            # prepare_inputs runs outside set_forward_context; the DP gather
+            # slot needs that context. Fail at init instead of an opaque
+            # assertion at the first step.
+            raise NotImplementedError(
+                "VLLM_PLE_MMAP_PREPARE_OUTSIDE does not support embeddings "
+                "sharded across DP ranks (etp_data_parallel_size > 1)"
+            )
         clamped, reason = _clamp_cudagraph_mode_for_host_gather(
             self._vllm_cfg.compilation_config.cudagraph_mode,
             is_breakable_cudagraph_enabled(),
@@ -1186,6 +1202,14 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         import mmap as _mmap
 
         path = _mmap_table_path()
+        owner = _MMAP_TABLE_OWNERS.get(path)
+        if owner is not None and owner() is not None and owner() is not self:
+            raise RuntimeError(
+                f"VLLM_PLE_MMAP_PATH table {path} is already owned by "
+                "another PLE layer on this rank; multiple PLE layers are "
+                "not supported by the mmap table backend"
+            )
+        _MMAP_TABLE_OWNERS[path] = weakref.ref(self)
         itemsize = torch.empty((), dtype=dtype).element_size()
         nbytes = num_embeddings * embedding_dim * itemsize
         fp8_path = path + ".fp8"
@@ -1788,9 +1812,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # _ple_ngram_rows_numpy returns GLOBAL table row ids; the
             # prefetcher advises pages of this rank's shard. Localize and
             # drop out-of-shard rows (other ranks prefetch their own copy).
-            vocab_start = int(
-                self.ngram_embedding.shard_indices.org_vocab_start_index
-            )
+            vocab_start = int(self.ngram_embedding.shard_indices.org_vocab_start_index)
             local = ids - vocab_start
             return local[(local >= 0) & (local < self.ngram_embedding.weight.shape[0])]
 

@@ -18,6 +18,15 @@ import pytest
 import torch
 
 
+@pytest.fixture(autouse=True)
+def _clean_envs_cache():
+    yield
+    import vllm.envs as envs
+
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+
 def _reload_qsa():
     import importlib
 
@@ -179,4 +188,57 @@ def test_gather_workspace_matches_dense_attention():
             scores = (q_ref[r, h, 0] @ k.T) / (dim**0.5)
             p = torch.softmax(scores, dim=-1)
             ref[r, h] = p @ v_cache[r, :c, kv].float()
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_sparse_attention_fp8_decode_matches_dequantized_reference():
+    """The in-kernel e4m3 decode branch (VLLM_QSA_FP8_KV=decode) equals a
+    dense softmax over the dequantized cache."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA to launch the kernel")
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
+
+    rows, topk, kv_heads, group, dim = 3, 8, 2, 4, 32
+    device = "cuda"
+    torch.manual_seed(0)
+    logical = (
+        torch.arange(topk, dtype=torch.int32, device=device)
+        .expand(rows, topk)
+        .contiguous()
+    )
+    counts = torch.full((rows, 1), topk, dtype=torch.int32, device=device)
+    packed = torch.cat([logical, counts], dim=1)
+    block_table = torch.arange(rows, dtype=torch.int32, device=device)[:, None]
+    token_to_req = torch.arange(rows, dtype=torch.int32, device=device)
+
+    bf16 = torch.randn(rows, topk, kv_heads, dim, device=device, dtype=torch.bfloat16)
+    k8 = bf16.to(torch.float8_e4m3fn)
+    v8 = bf16.to(torch.float8_e4m3fn)
+    k_scale = torch.ones((), dtype=torch.float32, device=device)
+    v_scale = torch.ones((), dtype=torch.float32, device=device)
+
+    q = torch.randn(rows, kv_heads * group, dim, device=device, dtype=torch.bfloat16)
+    out = qsa_sparse_paged_attention(
+        q,
+        k8,
+        v8,
+        packed,
+        block_table,
+        token_to_req,
+        use_prefill_config=False,
+        kv_fp8=True,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+    k_ref = k8.to(torch.bfloat16).float()
+    v_ref = v8.to(torch.bfloat16).float()
+    q_ref = q.reshape(rows, kv_heads * group, 1, dim).float()
+    ref = torch.empty_like(out, dtype=torch.float32)
+    for r in range(rows):
+        for h in range(kv_heads * group):
+            kv = h // group
+            scores = (q_ref[r, h, 0] @ k_ref[r, :, kv].T) / (dim**0.5)
+            p = torch.softmax(scores, dim=-1)
+            ref[r, h] = p @ v_ref[r, :, kv]
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)

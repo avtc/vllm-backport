@@ -56,13 +56,28 @@ def test_structured_then_plain_batch_does_not_crash(handler):
     # Would previously assert: draft_tokens_np=None with copy_pending=True.
     result = handler.get_draft_tokens()
     assert result is not None
-    assert result.token_ids["r0"] == [0, 1]
+    assert dict(zip(result.req_ids, result.draft_token_ids)) == {"r0": [0, 1]}
 
 
 def test_plain_batch_before_any_structured_batch_is_noop(handler):
     handler.set_draft_tokens(_batch(["r0"], False), _drafts(1, 2))
     assert handler.copy_pending is False
-    assert handler.get_draft_tokens() is None
+    # No drafts collected: the handler reports an empty batch (not None).
+    result = handler.get_draft_tokens()
+    assert result is not None
+    assert result.req_ids == []
+    assert result.draft_token_ids == []
+
+
+def test_consecutive_structured_batches_keep_earlier_drafts(handler):
+    """Batch-queue mode can run two structured batches with no take between
+    them; the second set_draft_tokens must not drop the first batch's
+    pending copy."""
+    handler.set_draft_tokens(_batch(["a"], True), _drafts(1, 2))
+    handler.set_draft_tokens(_batch(["b"], True), _drafts(1, 2))
+    got = handler.get_draft_tokens()
+    drafts = dict(zip(got.req_ids, got.draft_token_ids))
+    assert drafts == {"a": [0, 1], "b": [0, 1]}
 
 
 def test_draft_tokens_handler_tracks_latest_drafts(handler):
@@ -70,7 +85,10 @@ def test_draft_tokens_handler_tracks_latest_drafts(handler):
     handler.set_draft_tokens(_batch(["a", "b"], True), drafts)
     got = handler.get_draft_tokens()
     assert got is not None
-    assert got.token_ids == {"a": [0, 1, 2], "b": [3, 4, 5]}
+    assert dict(zip(got.req_ids, got.draft_token_ids)) == {
+        "a": [0, 1, 2],
+        "b": [3, 4, 5],
+    }
 
 
 def test_remove_request_evicts_drafts(handler):
@@ -78,8 +96,9 @@ def test_remove_request_evicts_drafts(handler):
     handler.remove_request("a")
     got = handler.get_draft_tokens()
     assert got is not None
-    assert "a" not in got.token_ids
-    assert got.token_ids["b"] == [2, 3]
+    drafts = dict(zip(got.req_ids, got.draft_token_ids))
+    assert "a" not in drafts
+    assert drafts["b"] == [2, 3]
 
 
 def test_remove_request_with_pending_copy(handler):

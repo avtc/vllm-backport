@@ -27,12 +27,14 @@ class DraftTokensHandler:
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
     ) -> None:
         self.num_draft_tokens = draft_tokens.shape[1]
+        # A previous async copy may still be pending (batch-queue mode can
+        # run two structured batches back to back without a take between
+        # them); move its drafts into latest_drafts before overwriting.
+        self._collect()
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
-            # the scheduler for this batch. Collect any pending copy first:
-            # its drafts must survive into latest_drafts, and dropping the
-            # array with the copy still pending would crash _collect().
-            self._collect()
+            # the scheduler for this batch; the pending copy above already
+            # moved any drafts into latest_drafts.
             self.draft_tokens_np = None
             return
         self.req_ids = input_batch.req_ids

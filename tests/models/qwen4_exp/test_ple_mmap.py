@@ -20,6 +20,15 @@ from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clean_envs_cache():
+    yield
+    import vllm.envs as envs
+
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+
 def test_gather_in_range_rows_only():
     table = torch.arange(0, 24, dtype=torch.bfloat16).reshape(8, 3)
     ids = torch.tensor([10, 12, 9])  # window [9, 12): 12 is EXCLUDED
@@ -359,3 +368,35 @@ def test_pidfd_syscall_numbers_match_architecture():
     else:
         # Unknown arch falls back to the asm-generic numbers.
         assert _PLEPagePrefetcher._SYS_PIDFD_OPEN == 434
+
+
+def test_mmap_lookup_output_dtype_is_compute_dtype():
+    """The mmap _lookup accepts (and allocates) outputs in the compute dtype
+    even when the stored table is fp8 (weight dtype != compute dtype)."""
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+        Qwen4ExpPLEMmapHostEmbedding,
+    )
+
+    rows, dim = 8, 16
+    emb = Qwen4ExpPLEMmapHostEmbedding.__new__(Qwen4ExpPLEMmapHostEmbedding)
+    emb.embedding_dim = dim
+    emb._storage_scale = 0.01
+    emb._compute_dtype = torch.bfloat16
+    emb.shard_indices = SimpleNamespace(
+        org_vocab_start_index=0, org_vocab_end_index=rows
+    )
+    emb.weight = torch.randn(rows, dim).to(torch.float8_e4m3fn)
+    emb._staging = torch.empty(rows, dim, dtype=torch.bfloat16).pin_memory()
+    emb._page_prefetcher = None
+
+    ids = torch.arange(rows)
+    out = torch.empty(rows, dim, dtype=torch.bfloat16)
+    returned = emb._lookup(ids, out)
+    assert returned.dtype == torch.bfloat16  # not the fp8 weight dtype
+    assert returned is out
+
+    allocated = emb._lookup(ids)  # output=None allocates the compute dtype
+    assert allocated.dtype == torch.bfloat16
+    torch.testing.assert_close(allocated, out)
