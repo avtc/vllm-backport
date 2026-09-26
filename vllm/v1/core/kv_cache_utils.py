@@ -1612,6 +1612,25 @@ def validate_kv_cache_layout(
         )
 
 
+
+def _group_layers_by_spec(
+    group: "KVCacheGroupSpec",
+) -> "defaultdict[KVCacheSpec, list[str]]":
+    """Map each distinct spec to this rank's layers of the group.
+
+    kv_cache_specs lists the layers of all pipeline ranks; keep only this
+    group's layers on this rank, which can be none."""
+    layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+        owned = set(group.layer_names)
+        for layer_name, spec in group.kv_cache_spec.kv_cache_specs.items():
+            if layer_name in owned:
+                layers_by_spec[spec].append(layer_name)
+    elif group.layer_names:
+        layers_by_spec[group.kv_cache_spec].extend(group.layer_names)
+    return layers_by_spec
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1725,17 +1744,7 @@ def get_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
-        group_spec = group.kv_cache_spec
-        layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
-        if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            # kv_cache_specs lists the layers of all pipeline ranks. Keep only
-            # this group's layers on this rank, which can be none.
-            owned = set(group.layer_names)
-            for layer_name, spec in group_spec.kv_cache_specs.items():
-                if layer_name in owned:
-                    layers_by_spec[spec].append(layer_name)
-        elif group.layer_names:
-            layers_by_spec[group_spec].extend(group.layer_names)
+        layers_by_spec = _group_layers_by_spec(group)
 
         byte_offset = 0
         for spec, layer_names in layers_by_spec.items():

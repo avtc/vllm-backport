@@ -428,3 +428,46 @@ def test_setup_fused_decode_rejects_large_topk():
     block.experts = type(block.experts)(routed_experts=routed)
     block._setup_fused_decode()
     assert block._decode_state is None
+
+
+def test_setup_fused_decode_accepts_default_swiglu_and_rejects_nondefault():
+    """RoutedExperts leaves swiglu_alpha/beta at None; the gate must accept
+    None (and 1.0/0.0) and only reject actually-set knobs."""
+    routed = _fake_block().experts.routed_experts
+    routed.swiglu_limit = None
+    routed.swiglu_alpha = None
+    routed.swiglu_beta = None
+    routed.moe_config.activation_situ_beta = None
+    routed.moe_config.activation_situ_linear_beta = None
+    block = _fake_block()
+    block.experts = type(block.experts)(routed_experts=routed)
+    block._setup_fused_decode()
+    assert block._decode_state is not None
+
+    routed2 = _fake_block().experts.routed_experts
+    routed2.swiglu_alpha = 1.5
+    block2 = _fake_block()
+    block2.experts = type(block2.experts)(routed_experts=routed2)
+    block2._setup_fused_decode()
+    assert block2._decode_state is None
+
+    routed3 = _fake_block().experts.routed_experts
+    routed3.moe_config.activation_situ_linear_beta = 0.25
+    block3 = _fake_block()
+    block3.experts = type(block3.experts)(routed_experts=routed3)
+    block3._setup_fused_decode()
+    assert block3._decode_state is None
+
+
+def test_setup_fused_decode_rejects_non_bf16_params():
+    from types import SimpleNamespace
+
+    routed = _fake_block().experts.routed_experts
+    block = _fake_block()
+    block.experts = type(block.experts)(routed_experts=routed)
+    block.gate = SimpleNamespace(
+        quant_method=type("UnquantizedLinearMethod", (), {})(),
+        weight=torch.zeros(512, 512, dtype=torch.float16),
+    )
+    block._setup_fused_decode()
+    assert block._decode_state is None

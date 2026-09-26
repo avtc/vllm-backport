@@ -697,8 +697,17 @@ class _Int6PlanesScheme:
         self.group_size = group_size
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
+        if getattr(layer, "weight_packed", None) is None and hasattr(layer, "i6_lo"):
+            # Already relaid out (weight reload); the registered buffers keep
+            # their storage, so captured decode graphs stay valid.
+            return
         K = layer.input_size_per_partition
-        layer.i6_lo, layer.i6_hi = _int6_to_planes(layer.weight_packed.data, K)
+        lo, hi = _int6_to_planes(layer.weight_packed.data, K)
+        # Registered as non-persistent buffers so weight-reload paths that
+        # copy parameters and buffers in place (sleep-mode wake, layerwise
+        # update) preserve the storage the decode CUDA graphs captured.
+        layer.register_buffer("i6_lo", lo, persistent=False)
+        layer.register_buffer("i6_hi", hi, persistent=False)
         layer.i6_scale = layer.weight_scale.data
         # The planes replace the packed weight (same bytes).
         layer.weight_packed = None
@@ -835,9 +844,7 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
                 or getattr(routed, "swiglu_alpha", None) not in (None, 1.0)
                 or getattr(routed, "swiglu_beta", None) not in (None, 0.0)
                 or getattr(routed.moe_config, "activation_situ_beta", None) is not None
-                or getattr(
-                    routed.moe_config, "activation_situ_linear_beta", None
-                )
+                or getattr(routed.moe_config, "activation_situ_linear_beta", None)
                 is not None
             ):
                 reasons.append("swiglu activation config")
@@ -845,6 +852,8 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
                 routed, "w13_weight_zero_point"
             ):
                 reasons.append("bias / zero points")
+            if getattr(qm, "input_quant", None) is not None:
+                reasons.append("static input quantization")
             if routed.global_num_experts & (routed.global_num_experts - 1):
                 reasons.append("expert count not a power of two")
             # The alignment loop above writes at most four expert_ids blocks
@@ -863,6 +872,9 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
         hidden = self.gate.weight.shape[1]
         if hidden % 512:
             reasons.append(f"hidden size {hidden}")
+        # The fused kernels round and store at BF16 points.
+        if self.gate.weight.dtype != torch.bfloat16:
+            reasons.append(f"params dtype {self.gate.weight.dtype}")
         if reasons:
             logger.info_once(
                 "Qwen4Exp fused MoE decode disabled: %s", ", ".join(reasons)
@@ -924,6 +936,9 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
         for block_size_m in (8, 16, 32, 48, 64):
             if M * topk / E / block_size_m < 0.9:
                 break
+        input_dtype = get_marlin_input_dtype()
+        if input_dtype is not None and input_dtype.itemsize == 1:
+            block_size_m = max(block_size_m, 16)
         dev = x.device
         numel = M * topk
         max_pad = min(numel * block_size_m, numel + E * (block_size_m - 1))
@@ -1008,7 +1023,7 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
             activation=routed.activation,
             topk_ids=topk_ids,
             workspace=getattr(routed, "workspace", None),
-            input_dtype=get_marlin_input_dtype(),
+            input_dtype=input_dtype,
         )
         out = torch.empty_like(x)
         if self._shared_int6_decode:

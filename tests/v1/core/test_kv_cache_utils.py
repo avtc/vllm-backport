@@ -3992,3 +3992,54 @@ def test_deepseek_v4_annotation_requires_model_type():
     )
 
     assert not any(g.is_eagle_group for g in groups)
+
+
+def test_group_layers_by_spec_keeps_only_owned_layers():
+    """kv_cache_specs lists the layers of ALL pipeline ranks; a rank owning
+    none of a group's layers must not allocate for them, a rank owning a
+    subset keeps exactly its own."""
+
+    from vllm.v1.core.kv_cache_utils import _group_layers_by_spec
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        UniformTypeKVCacheSpecs,
+    )
+
+    def _spec(block_size=16):
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=2,
+            head_size=8,
+            dtype=torch.float16,
+        )
+
+    specs = {
+        "model.layers.0.self_attn": _spec(),
+        "model.layers.1.self_attn": _spec(),
+        "model.layers.2.self_attn": _spec(),  # other ranks' layers
+        "model.layers.3.self_attn": _spec(),  # other ranks' layers
+    }
+    uniform = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs)
+
+    # PP rank owning layers 0-1 only
+    group = KVCacheGroupSpec(
+        layer_names=["model.layers.0.self_attn", "model.layers.1.self_attn"],
+        kv_cache_spec=uniform,
+    )
+    layers = _group_layers_by_spec(group)
+    kept = [n for names in layers.values() for n in names]
+    assert sorted(kept) == ["model.layers.0.self_attn", "model.layers.1.self_attn"]
+
+    # PP rank owning none of the group's layers
+    empty_group = KVCacheGroupSpec(layer_names=[], kv_cache_spec=uniform)
+    assert not any(_group_layers_by_spec(empty_group).values())
+
+    # Non-uniform spec falls back to the group's own layer list.
+    plain_group = KVCacheGroupSpec(
+        layer_names=["model.layers.0.self_attn"], kv_cache_spec=_spec()
+    )
+    layers = _group_layers_by_spec(plain_group)
+    assert [n for names in layers.values() for n in names] == [
+        "model.layers.0.self_attn"
+    ]

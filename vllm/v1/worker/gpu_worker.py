@@ -204,17 +204,20 @@ class DeferredRecvIntermediateTensors(AsyncIntermediateTensors):
         if object.__getattribute__(self, "_comm_waited"):
             return
         try:
-            tensor_dict, handles, postprocess = object.__getattribute__(self, "_recv")()
+            tensor_dict, handles, postprocess = object.__getattribute__(
+                self, "_recv"
+            )()
+            assert tensor_dict is not None
+            object.__setattr__(self, "tensors", tensor_dict)
+            object.__setattr__(self, "_comm_handles", handles)
+            object.__setattr__(self, "_comm_postprocess", postprocess)
+            super().wait_for_comm()
         except Exception:
-            # The receive failed; retrying cannot succeed and a second
-            # attempt from a trailing wait would mask the original error.
+            # Any failure (receive, handle wait, postprocess) is one-shot:
+            # retrying cannot succeed, and a second attempt from a trailing
+            # wait would mask the original error.
             object.__setattr__(self, "_comm_waited", True)
             raise
-        assert tensor_dict is not None
-        object.__setattr__(self, "tensors", tensor_dict)
-        object.__setattr__(self, "_comm_handles", handles)
-        object.__setattr__(self, "_comm_postprocess", postprocess)
-        super().wait_for_comm()
 
 
 class Worker(WorkerBase):
