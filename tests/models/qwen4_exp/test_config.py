@@ -140,14 +140,12 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
     assert draft_config.n_predict == 1
 
 
-@pytest.mark.parametrize("ple_layer_ids", [[1], []])
-def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
-    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
-    rest of the architecture is PP-capable, so the refusal must be conditional
-    -- and must land before the engine spends time loading weights."""
-    vllm_config = SimpleNamespace(
+def _pp_config(ple_layer_ids, num_hidden_layers=2) -> SimpleNamespace:
+    return SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
+            hf_text_config=_text_config(
+                ple_layer_ids=ple_layer_ids, num_hidden_layers=num_hidden_layers
+            ),
             multimodal_config=None,
         ),
         parallel_config=SimpleNamespace(
@@ -155,16 +153,35 @@ def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> Non
         ),
         speculative_config=None,
     )
+
+
+@pytest.mark.parametrize(
+    ("ple_layer_ids", "num_hidden_layers"),
+    [([], 2), ([1], 2)],  # no PLE / PLE layer 1 -> decoder layer 0, stage 0
+)
+def test_qwen4_exp_accepts_pipeline_parallel_with_first_stage_ple(
+    ple_layer_ids, num_hidden_layers
+) -> None:
+    """PP is fine while every PLE layer lives on the first pipeline rank."""
     with patch.object(
         Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
     ):
-        if ple_layer_ids:
-            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
-                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
-                    vllm_config
-                )
-        else:
-            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
+            _pp_config(ple_layer_ids, num_hidden_layers)
+        )
+
+
+def test_qwen4_exp_rejects_pipeline_parallel_with_stranded_ple() -> None:
+    """PLE needs raw input_ids, which non-first pipeline ranks never see;
+    a partition stranding a PLE layer on a later rank must be rejected
+    before the engine spends time loading weights."""
+    with (
+        patch.object(Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"),
+        pytest.raises(NotImplementedError, match="strands decoder"),
+    ):
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
+            _pp_config([2], num_hidden_layers=2)
+        )
 
 
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:

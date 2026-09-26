@@ -874,6 +874,31 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             raise NotImplementedError(
                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
             )
+        # PLE needs raw input_ids, which only the first pipeline rank sees;
+        # reject partitions that strand PLE layers on later ranks before any
+        # weights load (the model state repeats the check at init).
+        pp_size = parallel_config.pipeline_parallel_size
+        if text_config.ple_layer_ids and pp_size > 1:
+            from vllm.distributed.utils import get_pp_indices
+
+            first_start, first_end = get_pp_indices(
+                int(text_config.num_hidden_layers), 0, pp_size
+            )
+            stranded = sorted(
+                abs_id - 1
+                for abs_id in text_config.ple_layer_ids
+                if not (first_start <= abs_id - 1 < first_end)
+            )
+            if stranded:
+                raise NotImplementedError(
+                    "Qwen4Exp N-gram PLE embedding needs every PLE layer on "
+                    "the first pipeline rank, because later ranks do not "
+                    "receive the raw input_ids it consumes. "
+                    f"pipeline_parallel_size={pp_size} strands decoder "
+                    f"layer(s) {stranded} outside the first rank's range "
+                    f"[{first_start}, {first_end}). Run with PP=1, or "
+                    "repartition with VLLM_PP_LAYER_PARTITION."
+                )
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)

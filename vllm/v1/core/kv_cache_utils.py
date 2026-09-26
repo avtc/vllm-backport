@@ -1728,8 +1728,12 @@ def get_kv_cache_config_from_groups(
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            # kv_cache_specs lists the layers of all pipeline ranks. Keep only
+            # this group's layers on this rank, which can be none.
+            owned = set(group.layer_names)
             for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
+                if layer_name in owned:
+                    layers_by_spec[spec].append(layer_name)
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)
 
