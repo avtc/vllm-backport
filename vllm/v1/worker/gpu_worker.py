@@ -204,9 +204,7 @@ class DeferredRecvIntermediateTensors(AsyncIntermediateTensors):
         if object.__getattribute__(self, "_comm_waited"):
             return
         try:
-            tensor_dict, handles, postprocess = object.__getattribute__(
-                self, "_recv"
-            )()
+            tensor_dict, handles, postprocess = object.__getattribute__(self, "_recv")()
             assert tensor_dict is not None
             object.__setattr__(self, "tensors", tensor_dict)
             object.__setattr__(self, "_comm_handles", handles)

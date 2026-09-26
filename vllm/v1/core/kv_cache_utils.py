@@ -1612,7 +1612,6 @@ def validate_kv_cache_layout(
         )
 
 
-
 def _group_layers_by_spec(
     group: "KVCacheGroupSpec",
 ) -> "defaultdict[KVCacheSpec, list[str]]":
@@ -2341,6 +2340,8 @@ def update_kv_cache_capacity(
         f"{max_model_len:,}",
         max_concurrency,
     )
+
+
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
