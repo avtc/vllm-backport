@@ -63,15 +63,16 @@ def test_use_hc_int8_scheme_rejects_other_schemes():
 
 
 def test_int8_byte_layout_q_is_value_plus_128():
-    """The kernels read weight_packed as uint8 with q = value + 128 (LSB
-    first in the int32 words); the reference dequant used by the test below
-    relies on that layout."""
+    """The kernels read weight_packed as uint8 with q = value + 128, LSB
+    first in the int32 words - the compressed-tensors uint8b128 zero-point
+    format (ScalarType.uint(8, 128)), not two's-complement bytes."""
     import numpy as np
 
-    values = np.array([-128, -1, 0, 1, 127, -5, 42, 7], dtype=np.int8)  # one int32 word
-    packed = np.asarray([values.view(np.int32).item()], dtype=np.int32)
-    q = torch.from_numpy(packed.copy()).view(torch.uint8).numpy()
-    assert np.array_equal(q.astype(np.int32) - 128, values.astype(np.int32))
+    values = np.array([-128, -1, 0, 1, 127, -5, 42, 7], dtype=np.int64)
+    q_bytes = ((values + 128) % 256).astype(np.uint8)
+    packed = torch.from_numpy(q_bytes.copy().view(np.int32))
+    q = packed.view(torch.uint8).numpy()
+    assert np.array_equal(q.astype(np.int64) - 128, values)
 
 
 def test_hc_fused_env_default_on():
