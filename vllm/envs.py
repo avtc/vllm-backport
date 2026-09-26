@@ -2485,9 +2485,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_HC_FUSED_INT8": lambda: bool(int(os.getenv("VLLM_HC_FUSED_INT8", "1"))),
     "VLLM_PP_DEFER_RECV": lambda: bool(int(os.getenv("VLLM_PP_DEFER_RECV", "1"))),
-    "VLLM_MOE_FUSED_DECODE": lambda: bool(
-        int(os.getenv("VLLM_MOE_FUSED_DECODE", "1"))
-    ),
+    "VLLM_MOE_FUSED_DECODE": lambda: bool(int(os.getenv("VLLM_MOE_FUSED_DECODE", "1"))),
     "VLLM_QSA_FP8_KV": lambda: os.getenv("VLLM_QSA_FP8_KV", ""),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(

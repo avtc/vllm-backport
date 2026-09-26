@@ -340,8 +340,10 @@ def _moe_router_kernel(
         )
         tl.debug_barrier()
         tl.store(sorted_ptr + first_of * BS + rank, flat, mask=valid)
-        # An expert holds at most MPAD <= 4 entries, one block when BS >= 8
-        # (always, for 512 experts); the loop covers smaller BS.
+        # An expert holds at most M * TOPK entries; the gating caps that at
+        # _MOE_DECODE_MAX_TOKENS * top_k <= 32 flat entries, i.e. ceil(32/BS)
+        # <= 4 blocks at BS >= 8 (the marlin block sizes). The loop covers
+        # exactly those blocks.
         for q in tl.static_range(4):
             tl.store(
                 expert_ids_ptr + blk_before + q,
@@ -825,12 +827,26 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
                 reasons.append("routing variant")
             if routed.activation.name != "SILU":
                 reasons.append(f"activation {routed.activation}")
+            if (
+                getattr(routed, "swiglu_limit", None) is not None
+                or getattr(routed, "swiglu_alpha", 1.0) != 1.0
+                or getattr(routed, "swiglu_beta", 0.0) != 0.0
+                or getattr(routed, "activation_situ_linear_beta", None) is not None
+            ):
+                reasons.append("swiglu activation config")
             if getattr(routed, "w13_bias", None) is not None or hasattr(
                 routed, "w13_weight_zero_point"
             ):
                 reasons.append("bias / zero points")
             if routed.global_num_experts & (routed.global_num_experts - 1):
                 reasons.append("expert count not a power of two")
+            # The alignment loop above writes at most four expert_ids blocks
+            # per expert and the router grid needs E // ROWS >= 1 programs.
+            if (
+                routed.top_k * _MOE_DECODE_MAX_TOKENS > 32
+                or routed.global_num_experts < 2
+            ):
+                reasons.append(f"top-k {routed.top_k} / expert count too small")
         if shared is None or shared.expert_gate is None or self.replicate_shared_expert:
             reasons.append("shared expert layout")
         if type(self.gate.quant_method).__name__ != "UnquantizedLinearMethod":

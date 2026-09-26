@@ -16,8 +16,16 @@ from torch import nn
 
 
 def _pack_int6(vals: torch.Tensor) -> torch.Tensor:
-    """Inverse of the compressed-tensors int6 unpack: biased 6-bit values in
-    a 192-bit LSB-first stream per 32 values, six int32 words."""
+    """Pack via the real compressed-tensors packer when importable (pins the
+    actual checkpoint format), else the hand-rolled equivalent."""
+    try:
+        from compressed_tensors.compressors.pack_quantized.helpers import (
+            pack_to_int32,
+        )
+
+        return pack_to_int32(vals.to(torch.int8), num_bits=6, packed_dim=1)
+    except ImportError:
+        pass
     N, K = vals.shape
     bits = vals.reshape(N, K // 32, 32).to(torch.int64) + 32
     stream = torch.zeros(N, K // 32, 192, dtype=torch.int64)
@@ -247,3 +255,174 @@ def test_moe_router_topk_matches_reference():
             assert (valid_sorted == j).sum().item() == 1, (m, e, j)
         assert int(valid_sorted.min()) >= 0
         assert ticket.item() == 0  # reset for the next launch
+
+
+def _quantize_int6(w: torch.Tensor, gs: int = 64):
+    """Symmetric group int6 in the pack format, plus scales and dequant."""
+    n, k = w.shape
+    wg = w.float().reshape(n, k // gs, gs)
+    scale = wg.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 31.0
+    q = torch.round(wg / scale).clamp(-32, 31)
+    return (
+        q.reshape(n, k).to(torch.int32),
+        scale.reshape(n, k // gs),
+        ((q * scale).reshape(n, k).to(w.dtype)),
+    )
+
+
+def test_w6a16_gemm_matches_dequantized_reference():
+    """The prefill-path Triton W6A16 GEMM matches a reference GEMM on
+    identically dequantized (BF16-rounded) weights."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA to launch the kernel")
+    from vllm.models.qwen4_exp.nvidia.model import (
+        _int6_to_planes,
+        _w6a16_gemm,
+    )
+
+    torch.manual_seed(0)
+    n, k = 1280, 512
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    q, scale, dequant = _quantize_int6(w)
+    packed = _pack_int6(q)
+    lo, hi = _int6_to_planes(packed.cpu(), k)
+    lo, hi, scale_d = lo.cuda(), hi.cuda(), scale.cuda()
+
+    for m in (5, 17, 33):
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        got = _w6a16_gemm(x, lo, hi, scale_d, 64)
+        ref = x @ dequant.T
+        torch.testing.assert_close(got, ref, atol=2e-1, rtol=2e-2)
+
+
+def test_se_gate_up_act_matches_reference():
+    """_se_gate_up_act_kernel: INT6 GEMV pair with SiluAndMul fused, bf16
+    rounding at the unfused path's points."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA to launch the kernel")
+
+    from vllm.models.qwen4_exp.nvidia.model import (
+        _int6_to_planes,
+        _se_gate_up_act_kernel,
+    )
+
+    torch.manual_seed(0)
+    k, inter, gs = 512, 128
+    w = torch.randn(2 * inter, k, device="cuda", dtype=torch.bfloat16)
+    q, scale, dequant = _quantize_int6(w)
+    packed = _pack_int6(q)
+    lo, hi = _int6_to_planes(packed.cpu(), k)
+    lo, hi, scale_d = lo.cuda(), hi.cuda(), scale.float().cuda()
+
+    for m in (1, 2, 4):
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        act = torch.empty(m, inter, device="cuda", dtype=torch.bfloat16)
+        _se_gate_up_act_kernel[(inter // 4,)](
+            x,
+            lo,
+            hi,
+            scale_d,
+            act,
+            x.stride(0),
+            act.stride(0),
+            M=m,
+            K=k,
+            INTER=inter,
+            GS=gs,
+            BLOCK_I=4,
+            BLOCK_K=512,
+            STAGES=3,
+            num_warps=2,
+        )
+        gu = (x.float() @ dequant.float().T).to(torch.bfloat16).float()
+        g, u = gu[:, :inter], gu[:, inter:]
+        ref = (g * torch.sigmoid(g) * u).to(torch.bfloat16)
+        torch.testing.assert_close(act, ref, atol=2e-1, rtol=2e-2)
+
+
+def test_se_down_combine_matches_reference():
+    """_se_down_combine_kernel: down GEMV fused with the routed sum +
+    sigmoid-gated shared combine, bf16 rounding like the unfused path."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA to launch the kernel")
+
+    from vllm.models.qwen4_exp.nvidia.model import (
+        _int6_to_planes,
+        _se_down_combine_kernel,
+    )
+
+    torch.manual_seed(0)
+    inter, n, gs, topk = 128, 512, 64, 8
+    w = torch.randn(n, inter, device="cuda", dtype=torch.bfloat16)
+    q, scale, dequant = _quantize_int6(w)
+    packed = _pack_int6(q)
+    lo, hi = _int6_to_planes(packed.cpu(), inter)
+    lo, hi, scale_d = lo.cuda(), hi.cuda(), scale.float().cuda()
+
+    for m in (1, 3, 4):
+        act = torch.randn(m, inter, device="cuda", dtype=torch.bfloat16)
+        routed = torch.randn(m, topk, n, device="cuda", dtype=torch.bfloat16)
+        sgate = torch.randn(m, device="cuda", dtype=torch.float32)
+        out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+        _se_down_combine_kernel[(n // 8,)](
+            act,
+            lo,
+            hi,
+            scale_d,
+            routed,
+            sgate,
+            out,
+            act.stride(0),
+            out.stride(0),
+            M=m,
+            K=inter,
+            N=n,
+            GS=gs,
+            TOPK=topk,
+            BLOCK_N=8,
+            BLOCK_K=128,
+            STAGES=3,
+            num_warps=1,
+        )
+        shared = (act.float() @ dequant.float().T).to(torch.bfloat16).float()
+        g = torch.sigmoid(sgate).to(torch.bfloat16).float()
+        shg = (shared * g[:, None]).to(torch.bfloat16).float()
+        rsum = routed.float().sum(dim=1).to(torch.bfloat16).float()
+        ref = (rsum + shg).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=2e-1, rtol=2e-2)
+
+
+def test_moe_combine_kernel_matches_reference():
+    """_moe_combine_kernel: moe_sum (bf16) + sigmoid-gated shared (bf16) +
+    add, matching the unfused combine exactly."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA to launch the kernel")
+    import triton
+
+    from vllm.models.qwen4_exp.nvidia.model import _moe_combine_kernel
+
+    torch.manual_seed(0)
+    m, k, topk = 4, 512, 8
+    routed = torch.randn(m, topk, k, device="cuda", dtype=torch.bfloat16)
+    shared = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    sgate = torch.randn(m, device="cuda", dtype=torch.float32)
+    out = torch.empty(m, k, device="cuda", dtype=torch.bfloat16)
+    _moe_combine_kernel[(m, triton.cdiv(k, 512))](
+        routed, shared, sgate, out, K=k, TOPK=topk, BLOCK=512, num_warps=4
+    )
+    rsum = routed.float().sum(dim=1).to(torch.bfloat16).float()
+    g = torch.sigmoid(sgate).to(torch.bfloat16).float()
+    shg = (shared.float() * g[:, None]).to(torch.bfloat16).float()
+    ref = (rsum + shg).to(torch.bfloat16)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def test_setup_fused_decode_rejects_large_topk():
+    """The alignment loop covers at most four expert_ids blocks per expert:
+    top_k * _MOE_DECODE_MAX_TOKENS must stay <= 32 flat entries."""
+    block = _fake_block()
+    routed = _fake_block().experts.routed_experts
+    routed.top_k = 16
+    block.experts = type(block.experts)(routed_experts=routed)
+    block._setup_fused_decode()
+    assert block._decode_state is None
