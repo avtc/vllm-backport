@@ -18,6 +18,10 @@ class DraftTokensHandler:
         self.req_ids: list[str] = []
         self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
+        # Latest drafts of every running request whose batch had structured
+        # output requests, by request id. See get_draft_tokens().
+        self.latest_drafts: dict[str, list[int]] = {}
+        self.copy_pending = False
 
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
@@ -29,6 +33,11 @@ class DraftTokensHandler:
             # the scheduler for this batch.
             self.draft_tokens_np = None
             return
+        # Batches without structured-output requests never invalidate the
+        # drafts collected earlier (see get_draft_tokens).
+        for req_id in input_batch.req_ids:
+            if req_id not in self.req_ids:
+                self.latest_drafts.pop(req_id, None)
 
         # For spec decoding + structured outputs, we must transfer the
         # draft tokens back to the scheduler for grammar validation.
@@ -41,8 +50,38 @@ class DraftTokensHandler:
             # memory before the async copy executes.
             draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
+        self.copy_pending = True
+
+    def _collect(self) -> None:
+        """Moves the drafts of the last batch into latest_drafts."""
+        if not self.copy_pending:
+            return
+        self.copy_pending = False
+        assert self.draft_tokens_np is not None
+        self.copy_event.synchronize()
+        for req_id, drafts in zip(self.req_ids, self.draft_tokens_np.tolist()):
+            self.latest_drafts[req_id] = drafts
+
+    def remove_request(self, req_id: str) -> None:
+        self._collect()
+        self.latest_drafts.pop(req_id, None)
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
+        self._collect()
+        if self.latest_drafts:
+            # With pipeline parallelism several batches are in flight and a
+            # request decodes only every pp_size steps, so the batch whose
+            # grammar bitmask the scheduler is about to build usually holds
+            # requests that were not in the last batch. Without their drafts
+            # the scheduler leaves them as -1 and masks the bonus position
+            # with the grammar state before the draft, while the GPU still
+            # verifies the real draft: a token the grammar rejects gets
+            # sampled and the request ends with an internal error. Return
+            # the latest drafts of every request instead; a request's next
+            # verification uses exactly these.
+            req_ids = list(self.latest_drafts)
+            draft_token_ids = [self.latest_drafts[r] for r in req_ids]
+            return DraftTokenIds(req_ids, draft_token_ids)
         if self.draft_tokens_np is not None:
             self.copy_event.synchronize()
             draft_token_ids = self.draft_tokens_np.tolist()
