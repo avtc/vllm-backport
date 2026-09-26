@@ -641,6 +641,264 @@ _STORAGE_TORCH_DTYPES = {1: torch.int8, 2: torch.int16, 4: torch.int32}
 _E4M3FN_F32_LUT: np.ndarray | None = None
 
 
+# Look-ahead page prefetch for the mmap PLE table.
+#
+# Qwen4ExpPLEMmapHostEmbedding._lookup gathers rows with np.take over the
+# mmap. Each page not in the page cache is a synchronous 4 KiB read at queue
+# depth 1, ~232 us on a DRAM-less QLC drive. A 512-token chunk touches ~8.7k
+# pages and takes ~1.9 s cold, so a cold 42k-token prompt spent ~100 s before
+# its first token (measured by Minachist on 3x3090).
+#
+# The drive reads ~40k random pages/s with a deep queue. The n-gram rows
+# depend only on the prompt, so they are known at admission: a background
+# thread computes them and passes their pages to process_madvise
+# (MADV_WILLNEED) in position order, ahead of the gather. Advising a cached
+# page costs ~1 us.
+#
+# process_madvise takes up to 1024 ranges per call (podman's seccomp allows
+# it only with CAP_SYS_PTRACE); without it the thread falls back to one
+# madvise per range - same NVMe throughput, ~20x the CPU time.
+#
+# VLLM_PLE_PREFETCH=0 disables the prefetch entirely.
+
+# Gathers of at most this many rows (decode batches) advise their pages
+# first, so the faults below overlap instead of reading one page at a time.
+_PLE_GATHER_ADVISE_MAX_ROWS = 256
+
+
+def _ple_ngram_rows_numpy(
+    tokens,
+    multipliers: np.ndarray,
+    sizes: np.ndarray,
+    offsets: np.ndarray,
+    eos_token_id: int,
+    heads_per_ngram: int,
+) -> np.ndarray:
+    """NumPy version of the n-gram ids kernel for a whole request.
+
+    Returns the ``[num_tokens, num_heads]`` int64 table rows for ``tokens``,
+    with an all-EOS context before position 0. Must match the Triton kernel
+    bit for bit: int64 products wrap, the remainder follows torch.remainder,
+    and context tokens before the most recent EOS are treated as EOS. A wrong
+    row only prefetches the wrong page - the forward never reads these rows.
+    """
+    tokens = np.asarray(tokens, dtype=np.int64).reshape(-1)
+    num_tokens = tokens.size
+    context_len = multipliers.size - 1
+    num_heads = sizes.size
+    order = np.arange(num_heads, dtype=np.int64) // heads_per_ngram + 2
+    with np.errstate(over="ignore"):
+        mixed = np.repeat((tokens * multipliers[0])[:, None], num_heads, axis=1)
+        crossed = np.zeros(num_tokens, dtype=bool)
+        for shift in range(1, context_len + 1):
+            candidate = np.full(num_tokens, eos_token_id, dtype=np.int64)
+            candidate[shift:] = tokens[:-shift]
+            candidate[crossed] = eos_token_id
+            crossed |= candidate == eos_token_id
+            term = candidate * multipliers[shift]
+            mixed[:, order > shift] ^= term[:, None]
+        return mixed % sizes + offsets
+
+
+class _PLEPagePrefetcher:
+    """Background thread that loads a request's PLE pages into the page cache.
+
+    submit() takes a callable that returns the request's rows in position
+    order. The thread advises the kernel ``batch_rows`` rows at a time.
+    cancel() stops a finished or preempted request between batches. The
+    thread never touches the mapped data; it only passes address ranges to
+    the kernel.
+    """
+
+    _SYS_PIDFD_OPEN = 434
+    _SYS_PROCESS_MADVISE = 440
+    _MADV_WILLNEED = 3
+    _IOV_MAX = 1024
+    _PAGE_SHIFT = 12
+
+    def __init__(
+        self,
+        base_address: int,
+        nbytes: int,
+        row_bytes: int,
+        batch_rows: int,
+    ) -> None:
+        import ctypes
+        import queue
+        import threading
+
+        self._base = int(base_address)
+        self._num_pages = (nbytes + (1 << self._PAGE_SHIFT) - 1) >> self._PAGE_SHIFT
+        self._row_bytes = int(row_bytes)
+        self._batch_rows = max(int(batch_rows), 1)
+        self._libc = ctypes.CDLL(None, use_errno=True)
+        self._libc.syscall.restype = ctypes.c_long
+        self._libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        self._libc.madvise.restype = ctypes.c_int
+        self._pidfd = -1
+        self._iov_now: np.ndarray | None = None
+        self._batched = self._probe_process_madvise()
+        self._lock = threading.Lock()
+        self._inflight: dict[str, int] = {}  # req_id -> job token
+        self._next_token = 0
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._run, name="ple-page-prefetch", daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def batched(self) -> bool:
+        return self._batched
+
+    def submit(self, req_id: str, rows_fn) -> None:
+        with self._lock:
+            self._next_token += 1
+            token = self._next_token
+            self._inflight[req_id] = token
+        self._queue.put((req_id, token, rows_fn))
+
+    def cancel(self, req_id: str) -> None:
+        with self._lock:
+            self._inflight.pop(req_id, None)
+
+    def advise_now(self, rows: np.ndarray) -> None:
+        """Advise the pages of a few ``rows`` from the calling thread.
+
+        The decode-path variant of ``_advise``: one process_madvise call over
+        the first and last page of every row, duplicates included (the kernel
+        skips resident pages quickly), with a preallocated iovec array.
+        """
+        import ctypes
+
+        n = rows.size
+        if not self._batched or 2 * n > self._IOV_MAX:
+            self._advise(np.asarray(rows, dtype=np.int64))
+            return
+        iov = self._iov_now
+        if iov is None:
+            iov = self._iov_now = np.empty((self._IOV_MAX, 2), dtype=np.uint64)
+            iov[:, 1] = 1 << self._PAGE_SHIFT
+        offs = rows.astype(np.uint64, copy=False) * np.uint64(self._row_bytes)
+        mask = np.uint64(~((1 << self._PAGE_SHIFT) - 1) & 0xFFFFFFFFFFFFFFFF)
+        base = np.uint64(self._base)
+        iov[:n, 0] = (offs & mask) + base
+        iov[n : 2 * n, 0] = ((offs + np.uint64(self._row_bytes - 1)) & mask) + base
+        rc = self._libc.syscall(
+            self._SYS_PROCESS_MADVISE,
+            self._pidfd,
+            ctypes.c_void_p(iov.ctypes.data),
+            2 * n,
+            self._MADV_WILLNEED,
+            0,
+        )
+        if rc < 0:
+            self._batched = False
+
+    def _live(self, req_id: str, token: int) -> bool:
+        with self._lock:
+            return self._inflight.get(req_id) == token
+
+    def _run(self) -> None:
+        while True:
+            req_id, token, rows_fn = self._queue.get()
+            try:
+                if not self._live(req_id, token):
+                    continue
+                rows = np.asarray(rows_fn(), dtype=np.int64).reshape(-1)
+                for start in range(0, rows.size, self._batch_rows):
+                    if not self._live(req_id, token):
+                        break
+                    self._advise(rows[start : start + self._batch_rows])
+            except Exception:
+                logger.exception("PLE page prefetch failed for request %s", req_id)
+            finally:
+                with self._lock:
+                    if self._inflight.get(req_id) == token:
+                        del self._inflight[req_id]
+
+    def _advise(self, rows: np.ndarray) -> None:
+        shift = self._PAGE_SHIFT
+        offsets = rows * self._row_bytes
+        pages = np.unique(
+            np.concatenate((offsets >> shift, (offsets + self._row_bytes - 1) >> shift))
+        )
+        pages = pages[(pages >= 0) & (pages < self._num_pages)]
+        if not pages.size:
+            return
+        # Merge adjacent pages into ranges (rare for random rows).
+        breaks = np.flatnonzero(np.diff(pages) != 1) + 1
+        starts = np.concatenate((pages[:1], pages[breaks]))
+        ends = np.concatenate((pages[breaks - 1], pages[-1:])) + 1
+        if self._batched and self._advise_batched(starts, ends):
+            return
+        base = self._base
+        madvise = self._libc.madvise
+        for s, e in zip(starts.tolist(), ends.tolist()):
+            madvise(base + (s << shift), (e - s) << shift, self._MADV_WILLNEED)
+
+    def _advise_batched(self, starts: np.ndarray, ends: np.ndarray) -> bool:
+        """Call process_madvise with iovec arrays. Returns False if it fails."""
+        import ctypes
+
+        shift = self._PAGE_SHIFT
+        for i in range(0, starts.size, self._IOV_MAX):
+            s = starts[i : i + self._IOV_MAX]
+            e = ends[i : i + self._IOV_MAX]
+            # struct iovec (iov_base, iov_len) is two uint64 on x86_64.
+            iov = np.empty((s.size, 2), dtype=np.uint64)
+            iov[:, 0] = (self._base + (s << shift)).astype(np.uint64)
+            iov[:, 1] = ((e - s) << shift).astype(np.uint64)
+            rc = self._libc.syscall(
+                self._SYS_PROCESS_MADVISE,
+                self._pidfd,
+                ctypes.c_void_p(iov.ctypes.data),
+                int(s.size),
+                self._MADV_WILLNEED,
+                0,
+            )
+            if rc < 0:
+                err = ctypes.get_errno()
+                logger.warning(
+                    "process_madvise(MADV_WILLNEED) failed (%s); PLE page "
+                    "prefetch falls back to per-range madvise",
+                    os.strerror(err),
+                )
+                self._batched = False
+                return False
+        return True
+
+    def _probe_process_madvise(self) -> bool:
+        import ctypes
+
+        pidfd = self._libc.syscall(self._SYS_PIDFD_OPEN, os.getpid(), 0)
+        if pidfd < 0:
+            logger.info(
+                "pidfd_open unavailable (%s); PLE page prefetch uses madvise",
+                os.strerror(ctypes.get_errno()),
+            )
+            return False
+        self._pidfd = pidfd
+        iov = np.array([[self._base, 1 << self._PAGE_SHIFT]], dtype=np.uint64)
+        rc = self._libc.syscall(
+            self._SYS_PROCESS_MADVISE,
+            pidfd,
+            ctypes.c_void_p(iov.ctypes.data),
+            1,
+            self._MADV_WILLNEED,
+            0,
+        )
+        if rc < 0:
+            err = ctypes.get_errno()
+            logger.info(
+                "process_madvise unavailable (%s; under podman it needs "
+                "cap_add SYS_PTRACE); PLE page prefetch uses per-range madvise",
+                os.strerror(err),
+            )
+            return False
+        return True
+
+
 def _e4m3fn_decode_lut() -> np.ndarray:
     """float32 values of all 256 e4m3fn byte encodings (NaN maps to 0).
 
@@ -862,6 +1120,33 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             # Capture-time dummy forwards read the buffer before any real
             # gather; zeros keep those reads defined.
             self._prefetch_buffer.zero_()
+        # The prefetcher needs the mapping address, so it is created after
+        # the base constructor mapped the weight. row_bytes follows the
+        # storage dtype (fp8 sidecars halve it).
+        self._page_prefetcher = None
+        if envs.VLLM_PLE_PREFETCH and getattr(self, "_mmap_array", None) is not None:
+            self._page_prefetcher = _PLEPagePrefetcher(
+                base_address=self._mmap_array.ctypes.data,
+                nbytes=int(self._mmap_array.nbytes),
+                row_bytes=self.embedding_dim * self.weight.dtype.itemsize,
+                batch_rows=envs.VLLM_PLE_PREFETCH_BATCH * num_ngram_heads,
+            )
+            logger.info(
+                "PLE page prefetch on: %d tokens per batch, %s",
+                envs.VLLM_PLE_PREFETCH_BATCH,
+                "process_madvise"
+                if self._page_prefetcher.batched
+                else "per-range madvise",
+            )
+
+    def prefetch_request(self, req_id: str, rows_fn) -> None:
+        """Queue a new request's rows for page prefetch."""
+        if self._page_prefetcher is not None:
+            self._page_prefetcher.submit(req_id, rows_fn)
+
+    def cancel_prefetch(self, req_id: str) -> None:
+        if self._page_prefetcher is not None:
+            self._page_prefetcher.cancel(req_id)
 
     def start_prefetch(
         self,
@@ -1096,6 +1381,18 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             )
 
         flat_ids = input_ids.reshape(-1).to("cpu", non_blocking=False).long()
+        prefetcher = self._page_prefetcher
+        if prefetcher is not None and flat_ids.shape[0] <= _PLE_GATHER_ADVISE_MAX_ROWS:
+            # Decode: the rows of the token just sampled could not have been
+            # prefetched at admission. Ask for all their pages at once so the
+            # faults in the gather overlap instead of reading one page at a
+            # time.
+            vocab_start = int(self.shard_indices.org_vocab_start_index)
+            vocab_end = int(self.shard_indices.org_vocab_end_index)
+            ids_np = flat_ids.numpy()
+            local = np.clip(ids_np - vocab_start, 0, self.weight.shape[0] - 1)
+            in_range = (ids_np >= vocab_start) & (ids_np < vocab_end)
+            prefetcher.advise_now(local[in_range])
         rows = _gather_rows_from_table(
             self.weight,
             flat_ids,
@@ -1442,6 +1739,52 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
+    # Look-ahead page prefetch (mmap backend only).
+    _ple_hash_np: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+
+    def _ple_hash_numpy(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # CPU copies of the hash buffers, reused across requests.
+        # load_weights() clears them.
+        cached = self._ple_hash_np
+        if cached is None:
+            cached = tuple(
+                buffer.detach().cpu().numpy().astype(np.int64)
+                for buffer in (
+                    self.layer_multipliers,
+                    self.ngram_heads_vocab_sizes,
+                    self.ngram_heads_offsets,
+                )
+            )
+            self._ple_hash_np = cached
+        return cached
+
+    def prefetch_request(self, req_id: str, token_ids, start: int = 0) -> None:
+        """Prefetch the PLE pages for ``token_ids[start:]`` of a new request.
+
+        Called from the model state when a request is admitted. The rows are
+        computed on the prefetch thread. Does nothing unless the backend
+        reads a mmap.
+        """
+        submit = getattr(self.ngram_embedding, "prefetch_request", None)
+        if submit is None or not token_ids:
+            return
+        multipliers, sizes, offsets = self._ple_hash_numpy()
+        eos_token_id = self.eos_token_id
+        heads_per_ngram = self.heads_per_ngram
+
+        def rows() -> np.ndarray:
+            ids = _ple_ngram_rows_numpy(
+                token_ids, multipliers, sizes, offsets, eos_token_id, heads_per_ngram
+            )
+            return ids[start:].reshape(-1)
+
+        submit(req_id, rows)
+
+    def cancel_prefetch(self, req_id: str) -> None:
+        cancel = getattr(self.ngram_embedding, "cancel_prefetch", None)
+        if cancel is not None:
+            cancel(req_id)
+
     def start_prefetch(
         self,
         hidden_states: torch.Tensor,
@@ -1557,6 +1900,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         finalize = getattr(self.ngram_embedding, "finalize_mmap_cache", None)
         if finalize is not None:
             finalize()
+        self._ple_hash_np = None  # hash buffers changed
         return loaded
 
 

@@ -279,3 +279,58 @@ def test_gather_scale_requires_fp8_table():
     table = torch.randn(8, 4, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="fp8 table storage"):
         _gather_rows_from_table(table, torch.tensor([1]), 0, 8, scale=0.5)
+
+
+def test_ple_ngram_rows_numpy_matches_reference():
+    """The prefetch row computation must match the kernel's math bit for bit
+    (a wrong row only prefetches a wrong page, but systematic drift wastes IO).
+    Reference: independent torch implementation of the same hash."""
+    import numpy as np
+    import torch
+
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import _ple_ngram_rows_numpy
+
+    def rows_torch(tokens, multipliers, sizes, offsets, eos, hpg):
+        t = torch.tensor(tokens, dtype=torch.int64)
+        n = t.numel()
+        heads = len(sizes)
+        order = torch.arange(heads) // hpg + 2
+        mixed = (t * multipliers[0]).unsqueeze(1).repeat(1, heads)
+        crossed = torch.zeros(n, dtype=torch.bool)
+        for shift in range(1, len(multipliers) - 1 + 1):
+            cand = torch.full((n,), eos, dtype=torch.int64)
+            cand[shift:] = t[:-shift]
+            cand[crossed] = eos
+            crossed |= cand == eos
+            mixed[:, order > shift] ^= (cand * multipliers[shift]).unsqueeze(1)
+        return torch.remainder(mixed, torch.tensor(sizes)) + torch.tensor(offsets)
+
+    rng = np.random.default_rng(0)
+    eos = 99
+    for trial in range(20):
+        hpg = int(rng.integers(1, 5))
+        ctx = int(rng.integers(1, 4))
+        heads = hpg * ctx
+        vocab = int(rng.integers(50, 2000))
+        tokens = rng.integers(0, vocab, size=int(rng.integers(1, 64))).tolist()
+        if trial % 3 == 0:
+            for i in range(0, len(tokens), max(1, len(tokens) // 4)):
+                tokens[i] = eos
+        multipliers = rng.integers(1, 2**62, size=ctx + 1).astype(np.int64)
+        sizes = rng.integers(1, vocab, size=heads).astype(np.int64)
+        offsets = rng.integers(0, vocab, size=heads).astype(np.int64)
+        got = _ple_ngram_rows_numpy(tokens, multipliers, sizes, offsets, eos, hpg)
+        ref = rows_torch(tokens, multipliers, sizes, offsets, eos, hpg).numpy()
+        assert np.array_equal(got, ref), trial
+
+
+def test_ple_prefetch_envs_default_on():
+    from vllm import envs
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("VLLM_PLE_PREFETCH", None)
+        os.environ.pop("VLLM_PLE_PREFETCH_BATCH", None)
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+        assert envs.VLLM_PLE_PREFETCH is True
+        assert envs.VLLM_PLE_PREFETCH_BATCH == 1024

@@ -190,6 +190,11 @@ if TYPE_CHECKING:
     # finalize as a .fp8 sidecar): halves NVMe footprint and warm page cache;
     # gathers decode through a 256-entry LUT.
     VLLM_PLE_MMAP_STORE_FP8: bool = False
+    # Background process_madvise(MADV_WILLNEED) prefetch of a new request's
+    # PLE table pages (cold-prompt first-token latency), and its batch size
+    # in tokens.
+    VLLM_PLE_PREFETCH: bool = True
+    VLLM_PLE_PREFETCH_BATCH: int = 1024
     # QSA fp8 main-KV read path: "" (bf16 only), "decode" (in-kernel e4m3
     # decode) or "gather" (bf16 workspace pre-pass) for A/B comparison.
     VLLM_QSA_FP8_KV: str = ""
@@ -2453,9 +2458,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This environment variable may be removed in a future release.
     "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "0"))),
     "VLLM_PLE_MMAP_PATH": lambda: os.getenv("VLLM_PLE_MMAP_PATH", None),
-    "VLLM_PLE_MMAP_REBUILD": lambda: bool(
-        int(os.getenv("VLLM_PLE_MMAP_REBUILD", "0"))
-    ),
+    "VLLM_PLE_MMAP_REBUILD": lambda: bool(int(os.getenv("VLLM_PLE_MMAP_REBUILD", "0"))),
     "VLLM_PLE_MMAP_PIN_STAGING": lambda: bool(
         int(os.getenv("VLLM_PLE_MMAP_PIN_STAGING", "1"))
     ),
@@ -2464,6 +2467,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_PLE_MMAP_STORE_FP8": lambda: bool(
         int(os.getenv("VLLM_PLE_MMAP_STORE_FP8", "0"))
+    ),
+    "VLLM_PLE_PREFETCH": lambda: bool(int(os.getenv("VLLM_PLE_PREFETCH", "1"))),
+    "VLLM_PLE_PREFETCH_BATCH": lambda: int(
+        os.getenv("VLLM_PLE_PREFETCH_BATCH", "1024")
     ),
     "VLLM_QSA_FP8_KV": lambda: os.getenv("VLLM_QSA_FP8_KV", ""),
     # Debug logging for --enable-mfu-metrics

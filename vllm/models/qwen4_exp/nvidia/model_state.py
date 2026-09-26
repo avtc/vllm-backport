@@ -51,7 +51,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
                     "VLLM_PP_LAYER_PARTITION or run with PP=1."
                 )
         self.uses_ngram_embedding = has_ple_layers and pp_group.is_first_rank
-        self._ple_ngram_modules: list[nn.Module] | None = None
+        self._ple_ngram_modules_cache: list[nn.Module] | None = None
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -134,6 +134,35 @@ class Qwen4ExpModelState(MambaHybridModelState):
             )
         return model_inputs
 
+    def add_request(self, req_index: int, new_req_data) -> None:
+        super().add_request(req_index, new_req_data)
+        # Look-ahead: prefetch the prompt's PLE pages while the request
+        # waits for its first prefill chunk.
+        modules = self._ple_ngram_modules()
+        for module in modules:
+            module.prefetch_request(
+                new_req_data.req_id,
+                new_req_data.prefill_token_ids,
+                new_req_data.num_computed_tokens,
+            )
+
+    def remove_request(self, req_id: str) -> None:
+        super().remove_request(req_id)
+        for module in self._ple_ngram_modules():
+            module.cancel_prefetch(req_id)
+
+    def _ple_ngram_modules(self):
+        from .ngram_embedding import Qwen4ExpNGramEmbedding
+
+        modules = self._ple_ngram_modules_cache
+        if modules is None:
+            modules = self._ple_ngram_modules_cache = [
+                module
+                for module in self.model.modules()
+                if isinstance(module, Qwen4ExpNGramEmbedding)
+            ]
+        return modules
+
     def _prefetch_ple_outside_forward(
         self,
         input_ids: torch.Tensor | None,
@@ -148,16 +177,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         """
         if input_ids is None:
             return
-        from .ngram_embedding import Qwen4ExpNGramEmbedding
-
-        modules = self._ple_ngram_modules
-        if modules is None:
-            modules = self._ple_ngram_modules = [
-                module
-                for module in self.model.modules()
-                if isinstance(module, Qwen4ExpNGramEmbedding)
-            ]
-        for module in modules:
+        for module in self._ple_ngram_modules():
             module.prefetch_outside_forward(input_ids, query_start_loc, ngram_context)
 
     def prepare_dummy_inputs(
