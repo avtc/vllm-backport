@@ -609,7 +609,11 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         output: torch.Tensor,
     ) -> None:
         """Join the side stream, reduce ETP shards, and select local rows."""
-        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        if not self.prefetch_runs_outside_forward:
+            # In outside mode the gather ran on the calling stream ahead of
+            # the forward, so no cross-stream join exists - and one would be
+            # illegal inside a FULL cudagraph (cudaErrorStreamCaptureIsolation).
+            torch.cuda.current_stream().wait_stream(self._prefetch_stream)
         slot_size, slot_offset = self._get_dp_gather_slot(output.shape[0])
         active_output = prefetch_output[: slot_size * self.etp_data_parallel_size]
         embeddings = self._reduce_etp_embeddings(active_output)
@@ -853,6 +857,32 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         )
         self._init_prefetch_resources(
             num_ngram_heads, max_total_tokens, self._compute_dtype
+        )
+        if self.prefetch_runs_outside_forward:
+            # Capture-time dummy forwards read the buffer before any real
+            # gather; zeros keep those reads defined.
+            self._prefetch_buffer.zero_()
+
+    def start_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        ngram_ids: torch.Tensor,
+    ) -> None:
+        """Run the host gather on the calling stream when hoisted outside.
+
+        No side stream and no events: the forward (or its graph replay) is
+        enqueued on the same stream after this, so ordering is implicit, and
+        a cross-stream join inside a FULL cudagraph is illegal
+        (cudaErrorStreamCaptureIsolation).
+        """
+        if not self.prefetch_runs_outside_forward:
+            super().start_prefetch(hidden_states, ngram_ids)
+            return
+        slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
+        gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
+        self._lookup(
+            gathered_ids,
+            output=self._prefetch_buffer[: gathered_ids.shape[0]],
         )
 
     def allocate_embedding_weight(

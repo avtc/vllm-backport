@@ -189,6 +189,13 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        if envs.VLLM_PLE_MMAP_PREPARE_OUTSIDE:
+            # Graph capture reads the prefetch buffer too; cudagraph_utils
+            # calls this before torch.cuda.graph(), so the gather stays out
+            # of the capture. Dummy tokens only need the buffer filled.
+            self._prefetch_ple_outside_forward(
+                model_inputs.get("input_ids"), query_start_loc, ngram_context
+            )
         return model_inputs
 
 
