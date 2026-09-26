@@ -5,7 +5,6 @@
 import ctypes
 import json
 import os
-import platform
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -713,18 +712,11 @@ class _PLEPagePrefetcher:
     the kernel.
     """
 
-    # pidfd_open / process_madvise syscall numbers per architecture.
-    # The asm-generic numbers (434/440) are wrong on x86_64, where 434 is
-    # clone3 and 440 epoll_pwait2.
-    _SYS_NUMBERS = {
-        "x86_64": (433, 439),
-        "aarch64": (434, 440),
-        "riscv64": (434, 440),
-        "loongarch64": (434, 440),
-    }
-    _SYS_PIDFD_OPEN, _SYS_PROCESS_MADVISE = _SYS_NUMBERS.get(
-        platform.machine(), (434, 440)
-    )
+    # pidfd_open / process_madvise syscall numbers. These are uniform
+    # across x86_64 (syscall_64.tbl) and the asm-generic table (aarch64,
+    # riscv64): 434 pidfd_open, 440 process_madvise.
+    _SYS_PIDFD_OPEN = 434
+    _SYS_PROCESS_MADVISE = 440
     _MADV_WILLNEED = 3
     _IOV_MAX = 1024
     _PAGE_SHIFT = 12
@@ -983,8 +975,6 @@ def _gather_rows_from_table(
 
 def _mmap_table_path() -> str:
     """Per-ETP-rank table file path from VLLM_PLE_MMAP_PATH."""
-    from vllm.distributed import get_etp_group
-
     base = envs.VLLM_PLE_MMAP_PATH
     assert base, "VLLM_PLE_MMAP_PATH must be set for the mmap PLE table"
     rank = torch.distributed.get_rank(get_etp_group().device_group)
@@ -995,6 +985,18 @@ def _mmap_table_path() -> str:
 # row count) on the same rank would truncate the first layer's file mid-run.
 # Map each live path to its owning embedding and reject the second claimant.
 _MMAP_TABLE_OWNERS: dict[str, weakref.ref] = {}
+
+
+def _claim_mmap_table(path: str, owner: "Qwen4ExpPLEMmapHostEmbedding") -> None:
+    """Claim ``path`` for ``owner``; raise if another live embedding holds it."""
+    current = _MMAP_TABLE_OWNERS.get(path)
+    if current is not None and current() is not None and current() is not owner:
+        raise RuntimeError(
+            f"VLLM_PLE_MMAP_PATH table {path} is already owned by another "
+            "PLE layer on this rank; multiple PLE layers are not supported "
+            "by the mmap table backend"
+        )
+    _MMAP_TABLE_OWNERS[path] = weakref.ref(owner)
 
 
 def _mode_includes_full(mode: CUDAGraphMode) -> bool:
@@ -1094,14 +1096,6 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         # model state's prepare_inputs (before forward), so forward holds
         # only GPU ops and FULL cudagraphs stay sound.
         self.prefetch_runs_outside_forward = bool(envs.VLLM_PLE_MMAP_PREPARE_OUTSIDE)
-        if self.prefetch_runs_outside_forward and self.etp_data_parallel_size > 1:
-            # prepare_inputs runs outside set_forward_context; the DP gather
-            # slot needs that context. Fail at init instead of an opaque
-            # assertion at the first step.
-            raise NotImplementedError(
-                "VLLM_PLE_MMAP_PREPARE_OUTSIDE does not support embeddings "
-                "sharded across DP ranks (etp_data_parallel_size > 1)"
-            )
         clamped, reason = _clamp_cudagraph_mode_for_host_gather(
             self._vllm_cfg.compilation_config.cudagraph_mode,
             is_breakable_cudagraph_enabled(),
@@ -1124,6 +1118,15 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             max_total_tokens=max_total_tokens,
             data_parallel_rank=data_parallel_rank,
         )
+        # Checked after the base ctor: it computes etp_data_parallel_size.
+        # prepare_inputs runs outside set_forward_context, so the DP gather
+        # slot's context lookup would fail with an opaque assertion at the
+        # first step instead of this clear error at init.
+        if self.prefetch_runs_outside_forward and self.etp_data_parallel_size > 1:
+            raise NotImplementedError(
+                "VLLM_PLE_MMAP_PREPARE_OUTSIDE does not support embeddings "
+                "sharded across DP ranks (etp_data_parallel_size > 1)"
+            )
         # fp8 table storage dequantizes on gather, so every buffer the model
         # consumes stays in the checkpoint (compute) dtype chosen in
         # allocate_embedding_weight.
@@ -1202,14 +1205,7 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         import mmap as _mmap
 
         path = _mmap_table_path()
-        owner = _MMAP_TABLE_OWNERS.get(path)
-        if owner is not None and owner() is not None and owner() is not self:
-            raise RuntimeError(
-                f"VLLM_PLE_MMAP_PATH table {path} is already owned by "
-                "another PLE layer on this rank; multiple PLE layers are "
-                "not supported by the mmap table backend"
-            )
-        _MMAP_TABLE_OWNERS[path] = weakref.ref(self)
+        _claim_mmap_table(path, self)
         itemsize = torch.empty((), dtype=dtype).element_size()
         nbytes = num_embeddings * embedding_dim * itemsize
         fp8_path = path + ".fp8"

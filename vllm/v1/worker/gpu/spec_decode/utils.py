@@ -29,15 +29,19 @@ class DraftTokensHandler:
         self.num_draft_tokens = draft_tokens.shape[1]
         # A previous async copy may still be pending (batch-queue mode can
         # run two structured batches back to back without a take between
-        # them); move its drafts into latest_drafts before overwriting.
+        # them); move its drafts into latest_drafts while self.req_ids still
+        # names the batch that enqueued it.
         self._collect()
+        # Track every batch: sync scheduling re-populates each request's
+        # spec_token_ids from the carriers get_draft_tokens builds for the
+        # current batch.
+        self.req_ids = input_batch.req_ids
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
             # the scheduler for this batch; the pending copy above already
             # moved any drafts into latest_drafts.
             self.draft_tokens_np = None
             return
-        self.req_ids = input_batch.req_ids
         # Batches without structured-output requests never invalidate the
         # drafts collected earlier (see get_draft_tokens); requests leave
         # latest_drafts only via remove_request.
@@ -87,6 +91,14 @@ class DraftTokensHandler:
             # verification uses exactly these.
             req_ids = list(self.latest_drafts)
             draft_token_ids = [self.latest_drafts[r] for r in req_ids]
+            # Sync scheduling keeps spec slots alive only through the
+            # carriers returned here: requests of the current batch without
+            # collected drafts get -1 rows (the historical plain-batch
+            # carrier) instead of dropping out of speculative decoding.
+            for req_id in self.req_ids:
+                if req_id not in self.latest_drafts:
+                    req_ids.append(req_id)
+                    draft_token_ids.append([-1] * self.num_draft_tokens)
             return DraftTokenIds(req_ids, draft_token_ids)
         if self.draft_tokens_np is not None:
             self.copy_event.synchronize()

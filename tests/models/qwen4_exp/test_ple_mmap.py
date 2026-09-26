@@ -345,29 +345,15 @@ def test_ple_prefetch_envs_default_on():
         assert envs.VLLM_PLE_PREFETCH_BATCH == 1024
 
 
-def test_pidfd_syscall_numbers_match_architecture():
-    """The batched process_madvise probe silently degrades to per-range
-    madvise when the syscall numbers are wrong (x86_64: pidfd_open 433,
-    process_madvise 439; the asm-generic 434/440 are clone3/epoll_pwait2
-    there)."""
-    import platform
-
+def test_pidfd_syscall_numbers():
+    """pidfd_open=434 and process_madvise=440 are uniform across x86_64
+    (syscall_64.tbl: 434 pidfd_open, 440 process_madvise) and the
+    asm-generic table (aarch64/riscv64); wrong numbers silently degrade
+    the batched prefetch to per-range madvise."""
     from vllm.models.qwen4_exp.nvidia.ngram_embedding import _PLEPagePrefetcher
 
-    expected = {
-        "x86_64": (433, 439),
-        "aarch64": (434, 440),
-        "riscv64": (434, 440),
-    }
-    machine = platform.machine()
-    if machine in expected:
-        assert expected[machine] == (
-            _PLEPagePrefetcher._SYS_PIDFD_OPEN,
-            _PLEPagePrefetcher._SYS_PROCESS_MADVISE,
-        )
-    else:
-        # Unknown arch falls back to the asm-generic numbers.
-        assert _PLEPagePrefetcher._SYS_PIDFD_OPEN == 434
+    assert _PLEPagePrefetcher._SYS_PIDFD_OPEN == 434
+    assert _PLEPagePrefetcher._SYS_PROCESS_MADVISE == 440
 
 
 def test_mmap_lookup_output_dtype_is_compute_dtype():
@@ -400,3 +386,30 @@ def test_mmap_lookup_output_dtype_is_compute_dtype():
     allocated = emb._lookup(ids)  # output=None allocates the compute dtype
     assert allocated.dtype == torch.bfloat16
     torch.testing.assert_close(allocated, out)
+
+
+def test_mmap_table_path_single_owner_per_layer():
+    """A second PLE layer claiming the same per-rank table file fails loudly
+    (its different row count would truncate the first layer's file)."""
+    from vllm.models.qwen4_exp.nvidia import ngram_embedding as ne
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import _claim_mmap_table
+
+    class _Owner:
+        pass
+
+    first, second = _Owner(), _Owner()
+    path = "/tmp/fake-ple-table.rank0"
+    ne._MMAP_TABLE_OWNERS.clear()
+    try:
+        _claim_mmap_table(path, first)
+        _claim_mmap_table(path, first)  # re-claim by the same owner is fine
+        with pytest.raises(RuntimeError, match="another PLE layer"):
+            _claim_mmap_table(path, second)
+        # A dead owner (embedding freed) does not block a new claimant.
+        del first
+        import gc
+
+        gc.collect()
+        _claim_mmap_table(path, second)
+    finally:
+        ne._MMAP_TABLE_OWNERS.clear()

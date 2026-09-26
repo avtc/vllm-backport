@@ -27,14 +27,6 @@ def _clean_envs_cache():
         envs.__getattr__.cache_clear()
 
 
-def _reload_qsa():
-    import importlib
-
-    import vllm.models.qwen4_exp.nvidia.qsa as qsa
-
-    return importlib.reload(qsa)
-
-
 def test_fp8_mode_env_parsing():
     from vllm.models.qwen4_exp.nvidia.qsa import _qsa_fp8_kv_mode
 

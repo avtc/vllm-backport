@@ -59,14 +59,15 @@ def test_structured_then_plain_batch_does_not_crash(handler):
     assert dict(zip(result.req_ids, result.draft_token_ids)) == {"r0": [0, 1]}
 
 
-def test_plain_batch_before_any_structured_batch_is_noop(handler):
+def test_plain_batch_carries_minus_one_rows_for_sync_scheduling(handler):
+    """After a plain batch the handler returns -1 carriers for the batch's
+    requests: sync scheduling re-populates request.spec_token_ids (and so
+    the draft slots) only from these carriers."""
     handler.set_draft_tokens(_batch(["r0"], False), _drafts(1, 2))
     assert handler.copy_pending is False
-    # No drafts collected: the handler reports an empty batch (not None).
     result = handler.get_draft_tokens()
-    assert result is not None
-    assert result.req_ids == []
-    assert result.draft_token_ids == []
+    assert result.req_ids == ["r0"]
+    assert result.draft_token_ids == [[-1, -1]]
 
 
 def test_consecutive_structured_batches_keep_earlier_drafts(handler):
@@ -78,6 +79,18 @@ def test_consecutive_structured_batches_keep_earlier_drafts(handler):
     got = handler.get_draft_tokens()
     drafts = dict(zip(got.req_ids, got.draft_token_ids))
     assert drafts == {"a": [0, 1], "b": [0, 1]}
+
+
+def test_current_batch_missing_from_latest_drafts_gets_carriers(handler):
+    """Structured batch, then a plain batch with a new request: the new
+    request must still receive a -1 carrier so it stays in speculative
+    decoding under sync scheduling."""
+    handler.set_draft_tokens(_batch(["a"], True), _drafts(1, 2))
+    handler.set_draft_tokens(_batch(["a", "b"], False), _drafts(2, 2))
+    got = handler.get_draft_tokens()
+    drafts = dict(zip(got.req_ids, got.draft_token_ids))
+    assert drafts["a"] == [0, 1]  # collected from the structured batch
+    assert drafts["b"] == [-1, -1]  # plain-batch carrier
 
 
 def test_draft_tokens_handler_tracks_latest_drafts(handler):
