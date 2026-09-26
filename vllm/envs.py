@@ -195,6 +195,9 @@ if TYPE_CHECKING:
     # in tokens.
     VLLM_PLE_PREFETCH: bool = True
     VLLM_PLE_PREFETCH_BATCH: int = 1024
+    # Fused Triton kernels for the pack-quantized INT8 hyper-connection
+    # projections at decode batch sizes (0 restores the Marlin path).
+    VLLM_HC_FUSED_INT8: bool = True
     # QSA fp8 main-KV read path: "" (bf16 only), "decode" (in-kernel e4m3
     # decode) or "gather" (bf16 workspace pre-pass) for A/B comparison.
     VLLM_QSA_FP8_KV: str = ""
@@ -2472,6 +2475,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_PREFETCH_BATCH": lambda: int(
         os.getenv("VLLM_PLE_PREFETCH_BATCH", "1024")
     ),
+    "VLLM_HC_FUSED_INT8": lambda: bool(int(os.getenv("VLLM_HC_FUSED_INT8", "1"))),
     "VLLM_QSA_FP8_KV": lambda: os.getenv("VLLM_QSA_FP8_KV", ""),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
