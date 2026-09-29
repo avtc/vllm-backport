@@ -140,9 +140,14 @@ def test_fused_projection_matches_quantized_reference():
         config, use_combine=True, quant_config=None, prefix="test_hc"
     ).to(dev)
     mod._hc_fused = False
-    # vLLM creates linear weights uninitialized; give the (unquantized)
-    # injection projection real values or both paths read NaN garbage.
+    # vLLM creates linear weights uninitialized (torch.empty): a fresh
+    # process gets zeroed pages, a full-suite run gets dirty allocator
+    # memory with NaN patterns. Initialize every projection before
+    # quantizing or both paths project garbage.
     with torch.no_grad():
+        for name in ("input_mix_weight_down", "input_mix_weight_up"):
+            w = getattr(mod, name).weight
+            w.copy_(torch.randn_like(w))
         mod.block_inject_weight.weight.copy_(
             torch.randn_like(mod.block_inject_weight.weight)
         )
