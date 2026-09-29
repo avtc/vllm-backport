@@ -99,7 +99,9 @@ def test_mmap_roundtrip_persists_rows(tmp_path):
     def read() -> torch.Tensor:
         f = open(path, "rb")  # noqa: SIM115
         try:
-            mm = _mmap.mmap(f.fileno(), 0)
+            # Unix mmap defaults to a write mapping; a read-only fd needs
+            # the explicit access or errno 13 (EACCES).
+            mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
             try:
                 arr = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
                 t = torch.frombuffer(arr, dtype=torch.uint8)
@@ -118,6 +120,8 @@ def test_mmap_roundtrip_persists_rows(tmp_path):
 
 
 def test_mmap_table_path_is_per_rank(tmp_path):
+    from types import SimpleNamespace
+
     from vllm.models.qwen4_exp.nvidia import ngram_embedding as ne
 
     class _FakeGroup:
@@ -127,7 +131,7 @@ def test_mmap_table_path_is_per_rank(tmp_path):
         def size(self):
             return 8
 
-    _FakeEtP = type("G", (), {"device_group": _FakeGroup(5)})
+    _FakeEtP = SimpleNamespace(device_group=_FakeGroup(5))
     fake_dist = type(
         "M",
         (),
@@ -136,7 +140,7 @@ def test_mmap_table_path_is_per_rank(tmp_path):
     with (
         patch.dict(os.environ, {"VLLM_PLE_MMAP_PATH": str(tmp_path / "ple")}),
         patch.object(torch, "distributed", fake_dist),
-        patch.object(ne, "get_etp_group", lambda: _FakeEtP(5)),
+        patch.object(ne, "get_etp_group", lambda: _FakeEtP),
     ):
         from vllm import envs
 
@@ -181,11 +185,16 @@ def test_tensor_from_mapping_roundtrip(tmp_path):
                 )
                 t[5] = torch.full((dim,), 1.0).to(dtype)
                 mm.flush()
-        with open(path, "rb") as f, _mmap.mmap(f.fileno(), nbytes) as mm:
+                del t, arr  # exported pointers block the mapping close
+        with (
+            open(path, "rb") as f,
+            _mmap.mmap(f.fileno(), nbytes, access=_mmap.ACCESS_READ) as mm,
+        ):
             arr = np.frombuffer(mm, dtype=np.uint8, count=nbytes)
             t = torch.frombuffer(arr, dtype=torch.uint8).view(dtype).reshape(rows, dim)
             assert t[5][0] == torch.tensor(1.0).to(dtype)
             assert torch.count_nonzero(t[0].to(torch.uint8)) == 0
+            del t, arr
 
 
 def test_clamp_cudagraph_mode_for_host_gather():
