@@ -10,7 +10,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
@@ -180,9 +180,10 @@ logger = init_logger(__name__)
 # Values are rounded to BF16 at the same points as the unfused path.
 # VLLM_MOE_FUSED_DECODE=0 keeps the unfused path.
 #
-# Only the single-GPU MoE layout is covered: the fused alignment and combine
-# skip FusedMoE's dispatch/combine reductions, so anything other than
-# MoE tp_size=1 without EP falls back (checked in _setup_fused_decode).
+# No-EP layouts only: the fused alignment and combine skip FusedMoE's
+# dispatch/combine, so EP (or DP/PCP) falls back. MoE-TP works - routing
+# and alignment run identically on every rank and a post-combine
+# all-reduce replaces the elided reduction (checked in _setup_fused_decode).
 _MOE_DECODE_MAX_TOKENS = 4
 
 
@@ -381,8 +382,10 @@ def _moe_combine_kernel(
 # ---------------------------------------------------------------------------
 #
 # The shared expert's gate/up (1280 x 2560) and down (2560 x 640) projections
-# are INT6 group-64 (compressed-tensors pack-quantized: a tight little-endian
-# bit stream, 32 values in six int32 words, value + 32). Humming runs these
+# are INT6 group-64 (compressed-tensors pack-quantized: five values per int32
+# word at bits [6j, 6j+6), value + 32, two padding bits per word - this
+# fork's 0.17.0-style format as vLLM's unpack_quantized_values_into_int32
+# reads it). Humming runs these
 # small shapes at ~250 GB/s at one token. _Int6PlanesScheme splits the same
 # 6 bits per weight into a 4-bit and a 2-bit plane once at load time (same
 # memory), which the kernels below decode with shifts:
@@ -398,36 +401,37 @@ def _moe_combine_kernel(
 def _int6_to_planes(
     packed: torch.Tensor, K: int, rows_per_chunk: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tight pack-quantized INT6 [N, K * 6 / 32] int32 -> lo/hi planes.
+    """Padded pack-quantized INT6 [N, ceil(K / 5)] int32 -> lo/hi planes.
 
-    lo [N, K / 8] int32 holds bits 0..3 of eight values per word, hi
-    [N, K / 16] int32 bits 4..5 of sixteen. Done in row chunks so the
-    load-time temporaries stay a few MB (they would otherwise stay reserved
-    by the caching allocator next to a full GPU).
+    This fork's checkpoints (compressed-tensors 0.17.0 packer, and vLLM's
+    unpack_quantized_values_into_int32) store five 6-bit values per int32
+    word - value j of each group of five at bits [6j, 6j+6), the remaining
+    two bits padding - NOT the dense split-across-boundaries stream newer
+    compressed-tensors writes. lo [N, K / 8] int32 holds bits 0..3 of eight
+    values per word, hi [N, K / 16] int32 bits 4..5 of sixteen. Done in row
+    chunks so the load-time temporaries stay a few MB.
     """
     N = packed.shape[0]
-    # The planes take exactly the packed bytes (K / 8 + K / 16 = 6 K / 32 words
-    # per row). They go into one allocation of the packed size, and the caller
-    # drops the packed tensor: the same allocate-new / free-old pattern as the
-    # Humming repack this replaces. Two separately sized plane tensors left
-    # ~100-190 MiB of stranded allocator cache per GPU.
-    assert packed.is_contiguous() and packed.shape[1] * 32 == 6 * K
+    assert packed.is_contiguous()
+    words = packed.shape[1]
+    assert (words - 1) * 5 < K <= words * 5, (words, K)
+    # The planes take 6K/32 words per row, at most the packed 6K/30 (with
+    # padding); they go into one allocation of the packed size, and the
+    # caller drops the packed tensor: the same allocate-new / free-old
+    # pattern as the Humming repack this replaces. Two separately sized
+    # plane tensors left ~100-190 MiB of stranded allocator cache per GPU.
     storage = torch.empty_like(packed).view(-1)
     lo = storage[: N * (K // 8)].view(N, K // 8)
-    hi = storage[N * (K // 8) :].view(N, K // 16)
+    hi = storage[N * (K // 8) : N * (K // 8) + N * (K // 16)].view(N, K // 16)
     for r0 in range(0, N, rows_per_chunk):
         r1 = min(r0 + rows_per_chunk, N)
-        words = packed[r0:r1].reshape(r1 - r0, K // 32, 6)
+        chunk = packed[r0:r1]
         vals = torch.empty(
-            (r1 - r0, K // 32, 32), dtype=torch.int32, device=packed.device
+            (r1 - r0, words * 5), dtype=torch.int32, device=packed.device
         )
-        for i in range(32):
-            w, o = divmod(6 * i, 32)
-            v = torch.bitwise_right_shift(words[:, :, w], o) & ((1 << (32 - o)) - 1)
-            if o + 6 > 32:
-                v = v | torch.bitwise_left_shift(words[:, :, w + 1], 32 - o)
-            vals[:, :, i] = v & 63
-        vals = vals.reshape(r1 - r0, K)
+        for j in range(5):
+            vals[:, j::5] = torch.bitwise_right_shift(chunk, 6 * j) & 63
+        vals = vals[:, :K]
         lo_c = (vals & 15).reshape(r1 - r0, K // 8, 8)
         hi_c = torch.bitwise_right_shift(vals, 4).reshape(r1 - r0, K // 16, 16)
         acc = torch.zeros((r1 - r0, K // 8), dtype=torch.int32, device=packed.device)
@@ -740,7 +744,7 @@ def _int6_planes_group_size(linear: nn.Module) -> int | None:
     if (
         scheme.num_bits != 6
         or not scheme.symmetric
-        or gs != 64
+        or gs not in (32, 64, 128)
         or K % 128
         or linear.output_size_per_partition % 16
     ):
@@ -820,11 +824,14 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
                 reasons.append("expert map / EPLB")
             if routed.local_num_experts != routed.global_num_experts:
                 reasons.append("expert parallel")
-            # The decode path skips FusedMoE's dispatch / combine and its
-            # reductions, so it only covers the single-GPU MoE layout.
+            # The decode path skips FusedMoE's dispatch / combine, so it
+            # covers no-EP layouts only; MoE-TP is fine because the router,
+            # top-k and alignment are computed identically on every rank
+            # (the sharded expert GEMMs produce rank-local partials either
+            # way) - the output all-reduce is added in _forward_decode.
             pc = routed.moe_config.moe_parallel_config
-            if pc.tp_size != 1 or pc.dp_size != 1 or pc.pcp_size != 1 or pc.use_ep:
-                reasons.append("TP / DP / EP MoE")
+            if pc.dp_size != 1 or pc.pcp_size != 1 or pc.use_ep:
+                reasons.append("DP / PCP / EP MoE")
             if (
                 routed.scoring_func != "softmax"
                 or routed.use_grouped_topk
@@ -863,7 +870,19 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
                 or routed.global_num_experts < 2
             ):
                 reasons.append(f"top-k {routed.top_k} / expert count too small")
-        if shared is None or shared.expert_gate is None or self.replicate_shared_expert:
+        moe_tp = (
+            routed.moe_config.moe_parallel_config.tp_size if routed is not None else 1
+        )
+        if (
+            shared is None
+            or shared.expert_gate is None
+            or (
+                # A replicated shared expert's output is the full sum on every
+                # rank; folding it into the pre-reduce combine would count it
+                # tp_size times. (At tp == 1 replication is off anyway.)
+                self.replicate_shared_expert and moe_tp > 1
+            )
+        ):
             reasons.append("shared expert layout")
         if type(self.gate.quant_method).__name__ != "UnquantizedLinearMethod":
             reasons.append("quantized router")
@@ -888,6 +907,7 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
             self._shared_int6 and hidden % 512 == 0 and inter % 128 == 0
         )
         device = self.gate.weight.device
+        moe_tp = routed.moe_config.moe_parallel_config.tp_size
         self._decode_state = dict(
             routed=routed,
             quant_type=scalar_types.uint4b8,
@@ -897,10 +917,12 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
             gate_weight=self.gate.weight,
             shared_gate_weight=shared.expert_gate.weight.reshape(-1),
             ticket=torch.zeros(1, dtype=torch.int32, device=device),
+            moe_tp=moe_tp,
         )
         logger.info_once(
-            "Qwen4Exp fused MoE decode enabled (up to %d tokens)",
+            "Qwen4Exp fused MoE decode enabled (up to %d tokens%s)",
             _MOE_DECODE_MAX_TOKENS,
+            f", MoE-TP {moe_tp} with post-combine all-reduce" if moe_tp > 1 else "",
         )
 
     def forward(
@@ -1049,18 +1071,23 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
                 STAGES=3,
                 num_warps=1,
             )
-            return out
-        block = 512
-        _moe_combine_kernel[(M, triton.cdiv(K, block))](
-            routed_out,
-            shared_out,
-            sgate,
-            out,
-            K=K,
-            TOPK=topk,
-            BLOCK=block,
-            num_warps=4,
-        )
+        else:
+            block = 512
+            _moe_combine_kernel[(M, triton.cdiv(K, block))](
+                routed_out,
+                shared_out,
+                sgate,
+                out,
+                K=K,
+                TOPK=topk,
+                BLOCK=block,
+                num_warps=4,
+            )
+        if st["moe_tp"] > 1:
+            # MoE-TP: every rank computed its partial of the (linear) routed
+            # sum + sigmoid-gated shared output; reduce once, as the unfused
+            # combine does.
+            out = tensor_model_parallel_all_reduce(out)
         return out
 
 

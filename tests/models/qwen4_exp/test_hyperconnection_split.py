@@ -29,6 +29,7 @@ def _config() -> HyperConnectionConfig:
     )
 
 
+@pytest.mark.usefixtures("dist_init")
 @pytest.mark.parametrize("use_combine", [True, False])
 @pytest.mark.parametrize("quantized", [True, False], ids=["int8", "bf16"])
 def test_gated_residual_split_projections(use_combine: bool, quantized: bool):
@@ -116,6 +117,7 @@ def test_checkpoint_split_names_load_directly():
         assert name not in stacked
 
 
+@pytest.mark.usefixtures("dist_init")
 def test_split_weights_load_via_autoweights_loader():
     """Split checkpoint names must load into the split projections through
     the standard AutoWeightsLoader path (no stacked-name remapping)."""

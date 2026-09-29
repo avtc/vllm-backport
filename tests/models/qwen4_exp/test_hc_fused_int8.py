@@ -27,11 +27,13 @@ def _clean_envs_cache():
         envs.__getattr__.cache_clear()
 
 
-class _FakeWNA16:
-    def __init__(self, num_bits=8, symmetric=True, group_size=64):
-        self.num_bits = num_bits
-        self.symmetric = symmetric
-        self.group_size = group_size
+def _FakeWNA16(num_bits=8, symmetric=True, group_size=64):
+    # The eligibility check matches the scheme by class NAME.
+    return type(
+        "CompressedTensorsWNA16",
+        (),
+        {"num_bits": num_bits, "symmetric": symmetric, "group_size": group_size},
+    )()
 
 
 class _FakeLinear(nn.Module):
@@ -40,7 +42,7 @@ class _FakeLinear(nn.Module):
         self.scheme = scheme
         self.input_size_per_partition = input_size
         self.weight_packed = nn.Parameter(
-            torch.zeros(4, input_size // 8, dtype=torch.int32)
+            torch.zeros(4, input_size // 8, dtype=torch.int32), requires_grad=False
         )
         self.weight_scale = nn.Parameter(torch.zeros(4, input_size // 64))
 
@@ -112,6 +114,7 @@ def _quantize_int8(w: torch.Tensor, gs: int):
     )
 
 
+@pytest.mark.usefixtures("dist_init")
 def test_fused_projection_matches_quantized_reference():
     """_project_fused (Triton INT8 GEMVs) must match the unfused path on the
     same dequantized weights for M = 1..4 tokens."""

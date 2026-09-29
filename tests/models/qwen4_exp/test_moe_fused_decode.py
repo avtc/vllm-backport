@@ -16,27 +16,30 @@ from torch import nn
 
 
 def _pack_int6(vals: torch.Tensor) -> torch.Tensor:
-    """Pack via the real compressed-tensors packer when importable (pins the
-    actual checkpoint format), else the hand-rolled equivalent."""
+    """Padded int6 packing matching this fork's checkpoint format: five
+    values per int32 word at bits [6j, 6j+6), value + 32 (the inverse of
+    vLLM's unpack_quantized_values_into_int32). Cross-checked against the
+    installed compressed-tensors packer when importable."""
+    N, K = vals.shape
+    words = (K + 4) // 5
+    padded = torch.zeros((N, words * 5), dtype=torch.int32)
+    padded[:, :K] = vals.to(torch.int32) + 32
+    packed = torch.zeros((N, words), dtype=torch.int32)
+    for j in range(5):
+        packed |= torch.bitwise_left_shift(padded[:, j::5], 6 * j)
     try:
         from compressed_tensors.compressors.pack_quantized.helpers import (
             pack_to_int32,
         )
 
-        return pack_to_int32(vals.to(torch.int8), num_bits=6, packed_dim=1)
+        real = pack_to_int32(vals.to(torch.int8), num_bits=6, packed_dim=1)
+        assert torch.equal(real, packed), (
+            "compressed-tensors int6 packing changed; vLLM's unpacker and "
+            "_int6_to_planes must be re-verified"
+        )
     except ImportError:
         pass
-    N, K = vals.shape
-    bits = vals.reshape(N, K // 32, 32).to(torch.int64) + 32
-    stream = torch.zeros(N, K // 32, 192, dtype=torch.int64)
-    for i in range(32):
-        for b in range(6):
-            stream[:, :, 6 * i + b] = (bits[:, :, i] >> b) & 1
-    words = torch.zeros(N, K // 32, 6, dtype=torch.int32)
-    for w in range(6):
-        for b in range(32):
-            words[:, :, w] |= stream[:, :, 32 * w + b].to(torch.int32) << b
-    return words.reshape(N, K * 6 // 32)
+    return packed
 
 
 def _decode_planes(lo: torch.Tensor, hi: torch.Tensor, K: int) -> torch.Tensor:
@@ -92,8 +95,8 @@ def test_int6_planes_both_or_neither():
 
     # int8 not int6
     assert _int6_planes_group_size(_Lin(2560, 1280, _WNA16(num_bits=8))) is None
-    # group size != 64
-    assert _int6_planes_group_size(_Lin(2560, 1280, _WNA16(group_size=128))) is None
+    # unsupported group size
+    assert _int6_planes_group_size(_Lin(2560, 1280, _WNA16(group_size=48))) is None
     # K % 128, N % 16
     assert _int6_planes_group_size(_Lin(2000, 1280, _WNA16())) is None
     assert _int6_planes_group_size(_Lin(2560, 1284, _WNA16())) is None
@@ -128,7 +131,12 @@ def _fake_block(**over):
         activation=SimpleNamespace(name="SILU"),
         top_k=8,
         renormalize=True,
+        swiglu_limit=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
     )
+    routed.moe_config.activation_situ_beta = None
+    routed.moe_config.activation_situ_linear_beta = None
     block.experts = SimpleNamespace(routed_experts=routed)
     block.shared_expert = SimpleNamespace(
         expert_gate=SimpleNamespace(weight=torch.zeros(1, 512)),
@@ -139,10 +147,11 @@ def _fake_block(**over):
     block.enable_eplb = False
     block.gate = SimpleNamespace(
         quant_method=type("UnquantizedLinearMethod", (), {})(),
-        weight=torch.zeros(512, 512),
+        weight=torch.zeros(512, 512, dtype=torch.bfloat16),
     )
     block._has_lora = False
     block._shared_int6 = False
+    block._decode_state = None
     for k, v in over.items():
         setattr(block, k, v)
     return block
@@ -156,8 +165,7 @@ def test_setup_fused_decode_accepts_single_gpu_layout():
     assert block._decode_state["top_k"] == 8
 
 
-def test_setup_fused_decode_rejects_ep_and_moe_tp():
-    # EP: local experts != global
+def test_setup_fused_decode_rejects_ep():
     routed = _fake_block().experts.routed_experts
     routed.local_num_experts = 64
     block = _fake_block()
@@ -165,14 +173,38 @@ def test_setup_fused_decode_rejects_ep_and_moe_tp():
     block._setup_fused_decode()
     assert block._decode_state is None
 
-    # MoE TP: tp_size > 1
-    routed2 = _fake_block().experts.routed_experts
-    routed2.local_num_experts = routed2.global_num_experts
-    routed2.moe_config.moe_parallel_config.tp_size = 8
-    block2 = _fake_block()
-    block2.experts = type(block2.experts)(routed_experts=routed2)
-    block2._setup_fused_decode()
-    assert block2._decode_state is None
+    # EP flag even with full local experts
+    routed_ep = _fake_block().experts.routed_experts
+    routed_ep.moe_config.moe_parallel_config.use_ep = True
+    block_ep = _fake_block()
+    block_ep.experts = type(block_ep.experts)(routed_experts=routed_ep)
+    block_ep._setup_fused_decode()
+    assert block_ep._decode_state is None
+
+
+def test_setup_fused_decode_accepts_moe_tp_without_ep():
+    """MoE-TP without EP is supported: router/top-k/alignment run
+    identically on every rank and _forward_decode adds the output
+    all-reduce after the combine."""
+    routed = _fake_block().experts.routed_experts
+    routed.moe_config.moe_parallel_config.tp_size = 4
+    block = _fake_block()
+    block.experts = type(block.experts)(routed_experts=routed)
+    block._setup_fused_decode()
+    assert block._decode_state is not None
+    assert block._decode_state["moe_tp"] == 4
+
+
+def test_setup_fused_decode_rejects_replicated_shared_at_moe_tp():
+    """A replicated shared expert's full-sum output would be counted
+    tp_size times by the pre-reduce combine."""
+    routed = _fake_block().experts.routed_experts
+    routed.moe_config.moe_parallel_config.tp_size = 4
+    block = _fake_block()
+    block.experts = type(block.experts)(routed_experts=routed)
+    block.replicate_shared_expert = True
+    block._setup_fused_decode()
+    assert block._decode_state is None
 
 
 def test_moe_router_topk_matches_reference():
@@ -233,21 +265,20 @@ def test_moe_router_topk_matches_reference():
         # reference: bf16 logits, top-k, softmax over the selection
         ref_logits = (x.float() @ w.float().T).to(torch.bfloat16).float()
         ref_sg = (x.float() @ wsg.float()).to(torch.bfloat16).float()
-        sel_w, sel_i = torch.topk(ref_logits, topk, dim=-1)
-        ref_w = torch.softmax(sel_w, dim=-1)
         torch.testing.assert_close(logits, ref_logits, atol=1e-6, rtol=1e-5)
         torch.testing.assert_close(sgate, ref_sg, atol=1e-6, rtol=1e-5)
-        # Exact ties (possible in bf16) may order differently; compare the
-        # selections as id-sorted (weights, ids) pairs.
-        got = sorted(zip(topk_ids.tolist(), topk_w.tolist()))
-        ref = sorted(zip(sel_i.tolist(), ref_w.tolist()))
-        assert [i for i, _ in got] == [i for i, _ in ref], (m, e, got, ref)
-        torch.testing.assert_close(
-            torch.tensor([w for _, w in got]),
-            torch.tensor([w for _, w in ref]),
-            atol=1e-5,
-            rtol=1e-4,
-        )
+        # Reference top-k with the kernel's exact ordering: the
+        # order-preserving int form of the bf16 value, ties to the lower
+        # expert id (torch.topk tie order is unspecified).
+        bits = ref_logits.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+        ordered = torch.where(bits < 0, bits ^ 0x7FFF, bits).to(torch.int64)
+        ids = torch.arange(e, device=ref_logits.device)
+        key = ordered * 65536 + (65535 - ids)[None, :]
+        sel = torch.argsort(key, dim=-1, descending=True)[:, :topk]
+        sel_i = sel
+        sel_w = torch.softmax(torch.gather(ref_logits, 1, sel.long()), dim=-1)
+        torch.testing.assert_close(topk_ids.float(), sel_i.float(), atol=0, rtol=0)
+        torch.testing.assert_close(topk_w, sel_w, atol=1e-5, rtol=1e-4)
 
         # alignment contract: every valid flat entry appears once under its
         # expert's blocks, padded entries hold >= numel sentinel-ish values
