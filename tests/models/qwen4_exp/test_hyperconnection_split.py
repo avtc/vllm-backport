@@ -64,7 +64,7 @@ def _fake_quant_config():
     """Stand-in quant config resolving to the unquantized method, so
     construction runs on CPU while attribute plumbing stays observable
     (resolve_quant_method reads online_quantization_config unconditionally)."""
-    from unittest.mock import SimpleNamespace
+    from types import SimpleNamespace
 
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
