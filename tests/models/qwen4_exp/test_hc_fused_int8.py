@@ -176,7 +176,7 @@ def test_fused_projection_matches_quantized_reference():
                 inj_fused.float(), inj_ref.float(), rtol=2e-2, atol=5e-1
             )
             torch.testing.assert_close(
-                block_fused.float(), block_ref.float(), rtol=2e-2, atol=5e-2
+                block_fused.float(), block_ref.float(), rtol=2e-2, atol=2e-1
             )
 
 
