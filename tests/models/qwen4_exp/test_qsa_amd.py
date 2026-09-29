@@ -9,17 +9,26 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-from vllm.models.qwen4_exp.amd import (
+from vllm.platforms import current_platform
+
+# Skip at COLLECTION time, not test time: importing the AMD backend
+# registers the qwen4_exp custom ops, which the NVIDIA backend (imported by
+# the alphabetically earlier nvidia tests) has already registered under the
+# same names - the duplicate torch Library.define raises during collection,
+# before pytestmark is consulted.
+if not current_platform.is_rocm():
+    pytest.skip("AMD QSA requires ROCm", allow_module_level=True)
+
+from vllm.models.qwen4_exp.amd import (  # noqa: E402
     model as _qwen4_exp_model,  # noqa: F401
 )
-from vllm.models.qwen4_exp.amd import ple_layer as ple_layer_module
-from vllm.models.qwen4_exp.amd.indexer_qsa import (
+from vllm.models.qwen4_exp.amd import ple_layer as ple_layer_module  # noqa: E402
+from vllm.models.qwen4_exp.amd.indexer_qsa import (  # noqa: E402
     apply_qsa_rmsnorm,
     apply_qsa_rope,
 )
-from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops
-from vllm.platforms import current_platform
-from vllm.triton_utils import HAS_TRITON
+from vllm.models.qwen4_exp.amd.ops import qsa as qsa_ops  # noqa: E402
+from vllm.triton_utils import HAS_TRITON  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_rocm(),
