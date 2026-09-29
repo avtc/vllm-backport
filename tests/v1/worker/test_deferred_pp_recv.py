@@ -37,7 +37,10 @@ def test_deferred_recv_wait_for_comm_is_idempotent():
 
     def fake_recv():
         calls.append(1)
-        return ({"hidden_states": torch.zeros(1)}, ["h"], [lambda: None])
+        # Handles are objects with a wait() method.
+        handle = lambda: None  # noqa: E731
+        handle.wait = lambda: None
+        return ({"hidden_states": torch.zeros(1)}, [handle], [lambda: None])
 
     t = DeferredRecvIntermediateTensors(fake_recv)
     t.wait_for_comm()

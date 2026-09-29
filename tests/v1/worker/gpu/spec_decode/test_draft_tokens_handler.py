@@ -30,7 +30,10 @@ def _batch(req_ids: list[str], structured: bool) -> MagicMock:
 
 
 def _drafts(rows: int, cols: int) -> torch.Tensor:
-    return torch.arange(rows * cols, dtype=torch.int64).reshape(rows, cols)
+    # record_stream in the copy path is CUDA-only.
+    return torch.arange(rows * cols, dtype=torch.int64, device="cuda").reshape(
+        rows, cols
+    )
 
 
 @pytest.fixture
