@@ -21,6 +21,9 @@ class DraftTokensHandler:
         # Latest drafts of every running request whose batch had structured
         # output requests, by request id. See get_draft_tokens().
         self.latest_drafts: dict[str, list[int]] = {}
+        # Requests removed since the last set_draft_tokens: the sync-mode -1
+        # carrier fill must not resurrect them from a stale self.req_ids.
+        self._removed_since_set: set[str] = set()
         self.copy_pending = False
 
     def set_draft_tokens(
@@ -32,6 +35,7 @@ class DraftTokensHandler:
         # them); move its drafts into latest_drafts while self.req_ids still
         # names the batch that enqueued it.
         self._collect()
+        self._removed_since_set.clear()
         # Track every batch: sync scheduling re-populates each request's
         # spec_token_ids from the carriers get_draft_tokens builds for the
         # current batch.
@@ -75,6 +79,7 @@ class DraftTokensHandler:
     def remove_request(self, req_id: str) -> None:
         self._collect()
         self.latest_drafts.pop(req_id, None)
+        self._removed_since_set.add(req_id)
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
         self._collect()
@@ -96,7 +101,10 @@ class DraftTokensHandler:
             # collected drafts get -1 rows (the historical plain-batch
             # carrier) instead of dropping out of speculative decoding.
             for req_id in self.req_ids:
-                if req_id not in self.latest_drafts:
+                if (
+                    req_id not in self.latest_drafts
+                    and req_id not in self._removed_since_set
+                ):
                     req_ids.append(req_id)
                     draft_token_ids.append([-1] * self.num_draft_tokens)
             return DraftTokenIds(req_ids, draft_token_ids)
