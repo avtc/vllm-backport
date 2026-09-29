@@ -46,6 +46,7 @@ def handler() -> DraftTokensHandler:
     h.draft_tokens_np: np.ndarray | None = None
     h.num_draft_tokens = 0
     h.latest_drafts: dict[str, list[int]] = {}
+    h._removed_since_set: set[str] = set()
     h.copy_pending = False
     return h
 
