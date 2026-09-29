@@ -154,15 +154,18 @@ def test_fused_projection_matches_quantized_reference():
         for m in (1, 2, 3, 4):
             xn = torch.randn(m, hc_count * hidden, device=dev, dtype=torch.bfloat16)
             with torch.no_grad():
-                _, block_ref, inj_ref = mod._project(xn)
+                block_ref, inj_ref = mod._project(xn)
                 mod._hc_fused = True
-                _, block_fused, inj_fused = mod._project_fused(xn)
+                block_fused, inj_fused = mod._project_fused(xn)
                 mod._hc_fused = False
+            # The injection is a dot over K=2048 (magnitude ~45, one bf16
+            # ulp 0.25) and the block input passes through a sigmoid of a
+            # K=128 dot: allow a couple of ulps at each magnitude.
             torch.testing.assert_close(
-                inj_fused.float(), inj_ref.float(), rtol=2e-2, atol=2e-2
+                inj_fused.float(), inj_ref.float(), rtol=2e-2, atol=5e-1
             )
             torch.testing.assert_close(
-                block_fused.float(), block_ref.float(), rtol=2e-2, atol=2e-2
+                block_fused.float(), block_ref.float(), rtol=2e-2, atol=5e-2
             )
 
 
