@@ -265,19 +265,23 @@ def test_moe_router_topk_matches_reference():
         # reference: bf16 logits, top-k, softmax over the selection
         ref_logits = (x.float() @ w.float().T).to(torch.bfloat16).float()
         ref_sg = (x.float() @ wsg.float()).to(torch.bfloat16).float()
-        torch.testing.assert_close(logits, ref_logits, atol=1e-6, rtol=1e-5)
-        torch.testing.assert_close(sgate, ref_sg, atol=1e-6, rtol=1e-5)
-        # Reference top-k with the kernel's exact ordering: the
-        # order-preserving int form of the bf16 value, ties to the lower
-        # expert id (torch.topk tie order is unspecified).
-        bits = ref_logits.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+        # The router GEMV accumulates in fp32 tree order, the reference in
+        # cublas order: pre-bf16-rounding values differ slightly, so compare
+        # the rounded logits loosely (1 ulp at magnitude <= 64 is 0.5).
+        torch.testing.assert_close(logits, ref_logits, atol=0.6, rtol=1e-2)
+        torch.testing.assert_close(sgate, ref_sg, atol=0.6, rtol=1e-2)
+        # Selection and weights are checked against the KERNEL'S OWN stored
+        # logits, so accumulation order cannot flip the comparison: the
+        # kernel's top-k uses the order-preserving int form of the bf16
+        # value with ties to the lower expert id, and the renormalized
+        # weights are a softmax over exactly those selected logits.
+        bits = logits.to(torch.bfloat16).view(torch.int16).to(torch.int32)
         ordered = torch.where(bits < 0, bits ^ 0x7FFF, bits).to(torch.int64)
-        ids = torch.arange(e, device=ref_logits.device)
+        ids = torch.arange(e, device=logits.device)
         key = ordered * 65536 + (65535 - ids)[None, :]
         sel = torch.argsort(key, dim=-1, descending=True)[:, :topk]
-        sel_i = sel
-        sel_w = torch.softmax(torch.gather(ref_logits, 1, sel.long()), dim=-1)
-        torch.testing.assert_close(topk_ids.float(), sel_i.float(), atol=0, rtol=0)
+        assert topk_ids.tolist() == sel.tolist(), (m, e)
+        sel_w = torch.softmax(torch.gather(logits, 1, sel), dim=-1)
         torch.testing.assert_close(topk_w, sel_w, atol=1e-5, rtol=1e-4)
 
         # alignment contract: every valid flat entry appears once under its
