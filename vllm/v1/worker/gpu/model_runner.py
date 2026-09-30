@@ -1993,6 +1993,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         if self.pp_handler is not None:
+            # Fence the sampler's producer stream: code between sample() and
+            # broadcast() can switch the current stream, so the broadcast's
+            # wire-copies must be ordered against an event recorded while the
+            # sampler's stream is still current, or they read pre-write bytes
+            # (the first FULL-graph decode replay shipped float garbage).
+            self.pp_handler.record_sample_done()
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
             self.pp_handler.broadcast(
                 sampler_output.sampled_token_ids,

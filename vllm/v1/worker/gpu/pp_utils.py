@@ -90,6 +90,10 @@ class PPHandler:
             group_desc="pp_broadcast"
         )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+        # Event recorded on the sampler's current stream right after sample()
+        # returns; the broadcast wire-copies wait it so they never read the
+        # sampler outputs pre-write regardless of later stream switches.
+        self.sample_done_event: torch.cuda.Event | None = None
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -197,6 +201,11 @@ class PPHandler:
             idx_mapping=idx_mapping,
         )
 
+    def record_sample_done(self) -> None:
+        """Record a fence event on the sampler's producing stream."""
+        self.sample_done_event = torch.cuda.Event()
+        self.sample_done_event.record(torch.cuda.current_stream(self.device))
+
     def broadcast_drafts(
         self, draft_tokens: torch.Tensor, input_batch: InputBatch
     ) -> None:
@@ -302,14 +311,16 @@ class PPHandler:
             self.main_stream.synchronize()
 
         if envs.VLLM_PP_SYNC_BROADCAST:
-            # Escape hatch / diagnostic: the pad+stack copies below have read
-            # unwritten sampler outputs on the first graph-replayed decode
-            # step (pre-wire probe combined0=garbage while the receiver got
-            # the same bytes). A full device sync orders the copies after
-            # every producer stream regardless of which stream the runner
-            # executes on.
+            # Escape hatch / diagnostic: full device sync orders the copies
+            # after every producer stream regardless of topology.
             torch.cuda.synchronize()
         with torch.cuda.stream(self.broadcast_stream):
+            if self.sample_done_event is not None:
+                # Order the wire-copies against the sampler's actual producer
+                # stream (the event was recorded while that stream was still
+                # current); waiting only the current stream here raced the
+                # sampler when intermediate code switched streams.
+                self.broadcast_stream.wait_event(self.sample_done_event)
             self.broadcast_stream.wait_stream(torch.cuda.current_stream(self.device))
             send_tokens = torch.nn.functional.pad(
                 sampled_token_ids,

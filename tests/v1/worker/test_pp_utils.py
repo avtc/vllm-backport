@@ -361,3 +361,18 @@ def test_receive_and_consume_under_side_streams(monkeypatch):
     assert outputs is not None
     assert (outputs["sampled_tokens"] == 42).all().item()
     assert (outputs["num_sampled"] == 42).all().item()
+
+
+@requires_cuda
+def test_broadcast_waits_sample_done_event(monkeypatch):
+    """The wire-copies must be ordered against the event recorded right after
+    the sampler returns, not merely the current stream at broadcast time
+    (intermediate code can switch streams; the copies then race the sampler
+    and ship unwritten bytes)."""
+    sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=0)
+    calls = record_broadcasts(monkeypatch, fill_value=3)
+    with torch.cuda.stream(torch.cuda.Stream()):
+        sender.record_sample_done()
+    send_step(sender, make_input_batch(), width=1, with_draft=False)
+    assert sender.sample_done_event is not None
+    assert len(calls) == 2
