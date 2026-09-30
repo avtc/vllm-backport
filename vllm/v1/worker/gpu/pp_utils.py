@@ -89,68 +89,6 @@ class PPHandler:
         self.broadcast_group = get_pp_group().make_sibling_device_group(
             group_desc="pp_broadcast"
         )
-
-        # Persistent per-step receive buffers, one ring slot per in-flight
-        # step (max_concurrent_batches == pp world_size + 1). The deferred
-        # consume reads them pp_size steps after the broadcast; per-step
-        # allocations freed at consume time race the still-pending
-        # post_update kernels, because record_stream only covers work queued
-        # at record time (step T), not the deferred consumer at step T+pp_size.
-        # The freed blocks get reused, num_sampled turns to garbage, and
-        # _post_update_kernel's dynamic ``for i in range(num_sampled)`` loop
-        # writes far out of bounds. Persistent buffers are safe by
-        # construction: they are never freed.
-        self.recv_ring = (
-            None
-            if self.is_last_rank
-            else [
-                {
-                    "sampled": torch.zeros(
-                        max_num_reqs,
-                        self.max_sample_len,
-                        dtype=torch.int64,
-                        device=device,
-                    ),
-                    "num_sampled": torch.zeros(
-                        max_num_reqs, dtype=torch.int32, device=device
-                    ),
-                    "num_rejected": torch.zeros(
-                        max_num_reqs, dtype=torch.int32, device=device
-                    ),
-                    "idx_mapping": torch.zeros(
-                        max_num_reqs, dtype=torch.int64, device=device
-                    ),
-                    "draft": (
-                        torch.zeros(
-                            max_num_reqs,
-                            num_speculative_steps,
-                            dtype=torch.int64,
-                            device=device,
-                        )
-                        if num_speculative_steps > 0
-                        else None
-                    ),
-                }
-                for _ in range(get_pp_group().world_size + 1)
-            ]
-        )
-        self.recv_ring_cursor = 0
-        # Neutral zero payloads for steps where no request samples a token.
-        # Every rank must join the broadcast sequence every step: the
-        # mask's num_computed_tokens input lags on non-last ranks (deferred
-        # postprocess), so a conditional skip can diverge and desync the
-        # communicator.
-        self.idle_sampled = torch.zeros(
-            max_num_reqs, self.max_sample_len, dtype=torch.int64, device=device
-        )
-        self.idle_counts = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
-        self.idle_draft = (
-            torch.zeros(
-                max_num_reqs, num_speculative_steps, dtype=torch.int64, device=device
-            )
-            if num_speculative_steps > 0
-            else None
-        )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
 
     def on_req_idx_freed(self, req_idx: int) -> None:
@@ -242,16 +180,7 @@ class PPHandler:
     ) -> None:
         """Broadcast draft proposals so non-last ranks can embed real token ids."""
         assert self.is_last_rank
-        num_reqs = input_batch.num_reqs
         if compute_need_sampled_mask(input_batch) is None:
-            # Match receive()'s unconditional draft broadcast (see __init__).
-            with torch.cuda.stream(self.broadcast_stream):
-                self.broadcast_stream.wait_stream(self.main_stream)
-                torch.distributed.broadcast(
-                    self.idle_draft[:num_reqs],
-                    src=self.last_rank,
-                    group=self.broadcast_group,
-                )
             return
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
@@ -269,50 +198,52 @@ class PPHandler:
         assert not self.is_last_rank
         need_sampled_mask = compute_need_sampled_mask(input_batch)
         if need_sampled_mask is None:
-            # Every rank joins the broadcast sequence every step (see
-            # __init__); a non-sampling step is an all-False mask so the
-            # deferred consume filters all of its rows out.
-            need_sampled_mask = np.zeros(input_batch.num_reqs, dtype=bool)
+            # Leave this step's reserved slot as None.
+            return False
 
         # Snapshot the per-slot generation counter so a later free of any of
         # these RequestStates request indices is detectable at consume time.
         gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
 
         num_reqs = input_batch.num_reqs
-        buf = self.recv_ring[self.recv_ring_cursor]
-        self.recv_ring_cursor = (self.recv_ring_cursor + 1) % len(self.recv_ring)
-        # Snapshot this step's batch->slot mapping into the slot's persistent
-        # buffer: the live input_batch.idx_mapping is rewritten by later steps
-        # long before the deferred consume reads it.
-        buf["idx_mapping"][:num_reqs].copy_(input_batch.idx_mapping[:num_reqs])
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
-            sampled_tokens = buf["sampled"][:num_reqs]
-            num_sampled = buf["num_sampled"][:num_reqs]
-            num_rejected = buf["num_rejected"][:num_reqs]
+            sampled_tokens = torch.empty(
+                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
+            )
+            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
             torch.distributed.broadcast(
                 sampled_tokens, src=self.last_rank, group=self.broadcast_group
             )
             torch.distributed.broadcast(
-                num_sampled, src=self.last_rank, group=self.broadcast_group
-            )
-            torch.distributed.broadcast(
-                num_rejected, src=self.last_rank, group=self.broadcast_group
+                combined, src=self.last_rank, group=self.broadcast_group
             )
             draft_tokens = None
             if self.num_speculative_steps > 0:
-                draft_tokens = buf["draft"][:num_reqs]
+                draft_tokens = torch.empty(
+                    num_reqs,
+                    self.num_speculative_steps,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
                 torch.distributed.broadcast(
                     draft_tokens, src=self.last_rank, group=self.broadcast_group
                 )
             event = self.broadcast_stream.record_event()
+            num_sampled, num_rejected = combined.unbind(dim=0)
+            # Must record_stream since these were allocated on broadcast stream but
+            # later used on the main stream.
+            sampled_tokens.record_stream(self.main_stream)
+            combined.record_stream(self.main_stream)
+            if draft_tokens is not None:
+                draft_tokens.record_stream(self.main_stream)
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,
             num_sampled,
             num_rejected,
-            buf["idx_mapping"],
-            input_batch.idx_mapping_np.copy(),
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np,
             need_sampled_mask,
             gen_at_receive_np,
             draft_tokens,
@@ -327,29 +258,8 @@ class PPHandler:
         input_batch: InputBatch,
     ) -> None:
         assert self.is_last_rank
-        num_reqs = input_batch.num_reqs
         if compute_need_sampled_mask(input_batch) is None:
-            # No request samples this step, but the broadcast sequence must
-            # stay identical on every rank (see __init__): send neutral zeros
-            # with the step's shapes. Receivers filter the step at consume
-            # time via an all-False mask.
-            with torch.cuda.stream(self.broadcast_stream):
-                self.broadcast_stream.wait_stream(self.main_stream)
-                torch.distributed.broadcast(
-                    self.idle_sampled[:num_reqs],
-                    src=self.last_rank,
-                    group=self.broadcast_group,
-                )
-                torch.distributed.broadcast(
-                    self.idle_counts[:num_reqs],
-                    src=self.last_rank,
-                    group=self.broadcast_group,
-                )
-                torch.distributed.broadcast(
-                    self.idle_counts[:num_reqs],
-                    src=self.last_rank,
-                    group=self.broadcast_group,
-                )
+            # No request needs sampled outputs for a subsequent decode step.
             return
 
         assert sampled_token_ids.dtype == torch.int64
@@ -368,21 +278,15 @@ class PPHandler:
                 src=self.last_rank,
                 group=self.broadcast_group,
             )
-            # num_sampled / num_rejected are separate broadcasts: receivers
-            # read them into persistent per-step ring buffers, and a stacked
-            # [2, num_reqs] slice of such a buffer would not be contiguous.
+            combined = torch.stack((num_sampled, num_rejected), dim=0)
             torch.distributed.broadcast(
-                num_sampled, src=self.last_rank, group=self.broadcast_group
-            )
-            torch.distributed.broadcast(
-                num_rejected, src=self.last_rank, group=self.broadcast_group
+                combined, src=self.last_rank, group=self.broadcast_group
             )
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)
         if envs.VLLM_MAMBA_ALIGN_DEBUG:
             logger.info(
-                "pp broadcast: num_reqs=%d num_sampled=[%d..%d] num_rejected=[%d..%d]",
-                num_reqs,
+                "pp broadcast: num_sampled=[%d..%d] num_rejected=[%d..%d]",
                 int(num_sampled.min()),
                 int(num_sampled.max()),
                 int(num_rejected.min()),

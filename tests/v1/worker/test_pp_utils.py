@@ -185,64 +185,56 @@ def test_broadcast_pads_sampled_tokens_to_max_sample_len(monkeypatch, width, num
 
 @requires_cuda
 def test_send_and_recv_op_counts_match_with_speculator(monkeypatch):
-    """With a speculator the step is four broadcasts: sampled, num_sampled,
-    num_rejected, draft, matched strictly by order on the communicator."""
+    """With a speculator the step is three broadcasts: sampled tokens, the
+    combined [2, num_reqs] sampled/rejected counts, draft - matched strictly
+    by order on the communicator (the reverted upstream implementation)."""
     sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=3)
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(), width=1, with_draft=True)
-    assert len(calls) == 4
+    assert len(calls) == 3
     assert calls[0].shape == (3, sender.max_sample_len)
-    assert calls[1].shape == (3,)
-    assert calls[2].shape == (3,)
-    assert calls[3].shape == (3, sender.num_speculative_steps)
+    assert calls[1].shape == (2, 3)
+    assert calls[2].shape == (3, sender.num_speculative_steps)
 
     receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=3)
     calls.clear()
     assert receiver.receive(make_input_batch())
-    assert len(calls) == 4
+    assert len(calls) == 3
     assert calls[0].shape == (3, sender.max_sample_len)
-    assert calls[3].shape == (3, sender.num_speculative_steps)
+    assert calls[1].shape == (2, 3)
+    assert calls[2].shape == (3, sender.num_speculative_steps)
 
 
 @requires_cuda
 def test_send_and_recv_op_counts_match_without_speculator(monkeypatch):
-    """Without spec decode the step is three broadcasts on both sides."""
+    """Without spec decode the step is two broadcasts on both sides."""
     sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=0)
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(), width=1, with_draft=False)
-    assert len(calls) == 3
+    assert len(calls) == 2
 
     receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=0)
     calls.clear()
     assert receiver.receive(make_input_batch())
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert receiver.queue[-1].draft_tokens is None
 
 
 @requires_cuda
-def test_both_ranks_participate_when_no_request_needs_sampling(monkeypatch):
-    """A no-sample step still runs the full broadcast sequence on every rank.
-
-    The old conditional skip was unsound: the mask depends on
-    num_computed_tokens_np, which lags on non-last ranks (deferred
-    postprocess), so the ranks could disagree at a prefill->decode boundary
-    and desynchronize the communicator - step contents then shift by one and
-    per-request sampled counts arrive garbage (the pp4 deferred-wave IMA).
-    """
+def test_both_ranks_skip_when_no_request_needs_sampling(monkeypatch):
+    """Upstream semantics: a step where no request samples skips the
+    broadcasts on every rank. (An always-participate variant was tried for
+    the pp4 deferred-wave IMA and did not cure it; reverted to the upstream
+    implementation, which is what Minachist's working stack runs.)"""
     sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=3)
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(needs_sample=False), width=1, with_draft=True)
-    assert len(calls) == 4  # sampled, num_sampled, num_rejected, draft
-    assert calls[0].shape == (3, sender.max_sample_len)
-    assert calls[3].shape == (3, sender.num_speculative_steps)
-    assert all((c == 0).all().item() for c in calls)
+    assert calls == []
 
     receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=3)
     calls.clear()
     assert not receiver.receive(make_input_batch(needs_sample=False))
-    assert len(calls) == 4
-    # The deferred consume must filter such a step out entirely.
-    assert not receiver.queue[-1].need_sampled_mask.any()
+    assert calls == []
 
 
 @requires_cuda
@@ -302,30 +294,6 @@ def test_consume_reads_idx_mapping_snapshot_not_live_tensor(monkeypatch):
     outputs = receiver.get_prev_sampled_outputs(None)
     assert outputs is not None
     assert outputs["idx_mapping"].tolist() == [0, 1, 2]
-
-
-@requires_cuda
-def test_recv_ring_slots_are_distinct_and_deep_enough(monkeypatch):
-    """Receive buffers are persistent ring slots: consecutive in-flight steps
-    must use distinct storage (a deferred slot must not be overwritten by a
-    later receive before it is consumed), and the ring must cover
-    max_concurrent_batches == pp world_size + 1 in-flight steps."""
-    world_size = 3
-    receiver = make_handler(
-        monkeypatch,
-        is_last_rank=False,
-        num_speculative_steps=0,
-        world_size=world_size,
-    )
-    record_broadcasts(monkeypatch)
-    assert len(receiver.recv_ring) == world_size + 1
-
-    ptrs = []
-    batch = make_input_batch(num_reqs=2)
-    for _ in range(world_size + 1):
-        receiver.receive(batch)
-        ptrs.append(receiver.queue[-1].sampled_tokens.data_ptr())
-    assert len(set(ptrs)) == world_size + 1
 
 
 @requires_cuda
