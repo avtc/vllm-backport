@@ -144,6 +144,14 @@ class PPHandler:
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
+        if envs.VLLM_MAMBA_ALIGN_DEBUG:
+            cur = torch.cuda.current_stream(self.device)
+            logger.info(
+                "pp consume pre-wait: stream_match=%s event_pending=%s buf=0x%x",
+                cur == self.main_stream,
+                not slot.event.query(),
+                slot.sampled_tokens.data_ptr(),
+            )
         self.main_stream.wait_event(slot.event)
         if slot.draft_tokens is not None and draft_tokens_to_update is not None:
             draft_tokens = slot.draft_tokens
@@ -248,6 +256,17 @@ class PPHandler:
             gen_at_receive_np,
             draft_tokens,
         )
+        if envs.VLLM_MAMBA_ALIGN_DEBUG:
+            cur = torch.cuda.current_stream(self.device)
+            logger.info(
+                "pp receive: num_reqs=%d stream_match=%s event_pending=%s"
+                " num_sampled0=%d buf=0x%x",
+                num_reqs,
+                cur == self.main_stream,
+                not event.query(),
+                int(num_sampled[:1].item()),
+                sampled_tokens.data_ptr(),
+            )
         return bool(need_sampled_mask.all())
 
     def broadcast(
