@@ -65,3 +65,43 @@ def test_dequant_gather(num_bits, group_size, dtype, num_ids):
     assert out.shape == (num_ids, hidden)
     assert out.dtype == dtype
     torch.testing.assert_close(out, ref)
+
+
+@pytest.mark.parametrize("group_size", [0, 64])
+@pytest.mark.parametrize("bad_id", [-1, 10**6, -(2**40)])
+@pytest.mark.parametrize("num_bits", [4, 8])
+def test_dequant_gather_clamps_out_of_range_ids(num_bits, bad_id, group_size):
+    """Out-of-range token ids clamp to row 0 instead of faulting the gather.
+
+    Pipeline ranks reconstruct decode input ids from worker-local state that
+    a deferred writer fills steps later; an id that escapes the vocab before
+    that must degrade to a wrong-but-visible token, not an illegal memory
+    access."""
+    device = "cuda"
+    vocab, hidden, group_size = 64, 128, 64
+    pack_factor = 32 // num_bits
+    weight_packed = torch.randint(
+        -(2**31),
+        2**31,
+        (vocab, hidden // pack_factor),
+        dtype=torch.int32,
+        device=device,
+    )
+    weight_scale = (
+        torch.rand(vocab, 1, dtype=torch.bfloat16, device=device) + 0.01
+        if group_size == 0
+        else torch.rand(
+            vocab, hidden // group_size, dtype=torch.bfloat16, device=device
+        )
+        + 0.01
+    )
+    ids = torch.tensor([3, bad_id, 7], dtype=torch.int64, device=device)
+    out = _dequant_gather_triton(ids, weight_packed, weight_scale, hidden, num_bits)
+    ref = _dequant_gather_torch(
+        torch.tensor([3, 0, 7], device=device),
+        weight_packed,
+        weight_scale,
+        hidden,
+        num_bits,
+    )
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
