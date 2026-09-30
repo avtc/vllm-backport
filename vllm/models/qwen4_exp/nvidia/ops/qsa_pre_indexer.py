@@ -135,10 +135,14 @@ def _qsa_pre_indexer_kernel(
     CACHE_HAS_ROPE_POS: tl.constexpr,
     MROPE_H: tl.constexpr,
     MROPE_W: tl.constexpr,
-    # SM86 Triton cannot compile fp8e4nv pointer types: the state cache,
-    # compressed cache and q output arrive as uint8 views and rows are
-    # decoded/encoded in-register (bit-exact with native converts).
-    CACHE_FP8: tl.constexpr = False,
+    # SM86 Triton cannot compile fp8e4nv pointer types: any fp8 storage
+    # arrives as a uint8 view and rows are decoded/encoded in-register
+    # (bit-exact with native converts). The three caches are independent -
+    # e.g. the raw state ring can stay bf16 while the compressed cache and
+    # query output are e4m3.
+    STATE_FP8: tl.constexpr = False,
+    COMPRESSED_FP8: tl.constexpr = False,
+    QOUT_FP8: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     # K work occupies the first programs; the remaining programs tile Q. This
@@ -191,7 +195,7 @@ def _qsa_pre_indexer_kernel(
             MROPE_H,
             MROPE_W,
         )
-        if CACHE_FP8:
+        if QOUT_FP8:
             tl.store(
                 q_out_ptr
                 + tokens[:, None, None] * q_out_stride_token
@@ -270,7 +274,7 @@ def _qsa_pre_indexer_kernel(
             source_valid = tl.where(
                 source_in_chunk, source_tokens_valid, state_block_valid
             )
-            if CACHE_FP8:
+            if STATE_FP8:
                 # The state ring is a uint8 view; select values, not the
                 # differently-typed pointers.
                 cur = tl.load(
@@ -373,7 +377,7 @@ def _qsa_pre_indexer_kernel(
             compressed_block = (compressed_slot // COMP_PAGE_SIZE).to(tl.int64)
             compressed_row = compressed_slot % COMP_PAGE_SIZE
             y_flat = tl.reshape(y, (D,))
-            if CACHE_FP8:
+            if COMPRESSED_FP8:
                 tl.store(
                     compressed_cache_ptr
                     + compressed_block * compressed_cache_stride_block
@@ -418,7 +422,7 @@ def _qsa_pre_indexer_kernel(
                     mask=valid_slot,
                     other=0.0,
                 )
-                if CACHE_FP8:
+                if STATE_FP8:
                     tl.store(
                         state_row + dims,
                         _encode_fp8_u8(k.to(tl.float32), False),
@@ -516,11 +520,14 @@ def qsa_pre_indexer(
     # SM86-safe fp8: Triton below SM89 cannot compile fp8e4nv pointers, so the
     # indexer-side caches and output arrive as uint8 views and rows are
     # decoded/encoded in-register (bit-exact with the native converts).
-    cache_fp8 = state_cache.dtype == torch.float8_e4m3fn
-    if cache_fp8:
-        assert q_out.dtype == compressed_cache.dtype == torch.float8_e4m3fn
+    state_fp8 = state_cache.dtype == torch.float8_e4m3fn
+    compressed_fp8 = compressed_cache.dtype == torch.float8_e4m3fn
+    qout_fp8 = q_out.dtype == torch.float8_e4m3fn
+    if state_fp8:
         state_cache = state_cache.view(torch.uint8)
+    if compressed_fp8:
         compressed_cache = compressed_cache.view(torch.uint8)
+    if qout_fp8:
         q_out = q_out.view(torch.uint8)
     _qsa_pre_indexer_kernel[(num_k_work + num_q_work,)](
         q,
@@ -566,7 +573,9 @@ def qsa_pre_indexer(
         CACHE_HAS_ROPE_POS=cache_has_rope_pos,
         MROPE_H=section[1],
         MROPE_W=section[2],
-        CACHE_FP8=cache_fp8,
+        STATE_FP8=state_fp8,
+        COMPRESSED_FP8=compressed_fp8,
+        QOUT_FP8=qout_fp8,
         num_warps=1,
     )
 
