@@ -652,11 +652,12 @@ def test_aligned_state_indices_resolve_rows_through_idx_mapping():
     torch.manual_seed(0)
     num_reqs = len(_PERM)
     bt, _ = _build_disjoint_block_table(num_reqs, device)
-    seq_lens = torch.tensor([5, 17, 33, 2], dtype=torch.int32, device=device)
+    padded = num_reqs + 3  # FULL-graph padded rows past idx_mapping
+    # Sized to cover padded rows: the kernel loads seq_lens[rows] for them.
+    seq_lens = torch.tensor([5, 17, 33, 2, 9, 40, 1], dtype=torch.int32, device=device)
     cache_block_size = 8
     num_state_slots = 2
     num_groups = 1
-    padded = num_reqs + 3  # FULL-graph padded rows past idx_mapping
 
     idx_mapping = torch.tensor(_PERM, dtype=torch.int32, device=device)
     out = torch.full(
@@ -686,11 +687,13 @@ def test_aligned_state_indices_resolve_rows_through_idx_mapping():
     )
     torch.accelerator.synchronize()
 
-    # Reference: batch row r reads source row idx_mapping[r]; the state slots
-    # are the block ids at ceil((len-1)/block_size) .. +num_state_slots-1.
+    # Reference: batch row r reads source row idx_mapping[r] (padded rows
+    # resolve to slot 0, active -- they store real slot-0 block ids chosen
+    # by the padded row's own seq_len); the state slots are the block ids at
+    # ceil((len-1)/block_size) .. +num_state_slots-1.
     ref = torch.full_like(out.cpu(), -1)
-    for r in range(num_reqs):
-        slot = _PERM[r]
+    for r in range(padded):
+        slot = _PERM[r] if r < num_reqs else 0
         first = max((int(seq_lens[r]) - 1) // cache_block_size, 0)
         ref[0, r] = bt.cpu()[slot, first : first + num_state_slots]
     torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
