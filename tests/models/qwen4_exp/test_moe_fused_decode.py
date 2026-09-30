@@ -53,16 +53,43 @@ def _decode_planes(lo: torch.Tensor, hi: torch.Tensor, K: int) -> torch.Tensor:
     return vals - 32
 
 
+def _pack_int6_dense(vals: torch.Tensor) -> torch.Tensor:
+    """Dense int6 packing (the AutoRound export format): value i at bit 6i of
+    the row's little-endian bit stream, split across int32 boundaries."""
+    N, K = vals.shape
+    assert K % 32 == 0
+    bits = vals.reshape(N, K // 32, 32).to(torch.int64) + 32
+    stream = torch.zeros(N, K // 32, 192, dtype=torch.int64)
+    for i in range(32):
+        for b in range(6):
+            stream[:, :, 6 * i + b] = (bits[:, :, i] >> b) & 1
+    words = torch.zeros(N, K // 32, 6, dtype=torch.int32)
+    for w in range(6):
+        for b in range(32):
+            words[:, :, w] |= stream[:, :, 32 * w + b].to(torch.int32) << b
+    return words.reshape(N, 6 * K // 32)
+
+
 def test_int6_to_planes_round_trip():
+    """Both layouts round-trip: dense (the export this fork runs - the pp4
+    boot crashed on its 480-word rows at K=2560) and padded (the 0.17.0
+    packer, cross-checked when importable)."""
     from vllm.models.qwen4_exp.nvidia.model import _int6_to_planes
 
     torch.manual_seed(0)
-    for n, k in ((5, 256), (300, 128)):  # includes the multi-chunk path
+    for n, k in ((5, 2560), (300, 640), (2, 128)):  # includes multi-chunk
         vals = torch.randint(-32, 32, (n, k), dtype=torch.int32)
-        packed = _pack_int6(vals)
-        lo, hi = _int6_to_planes(packed, k)
-        assert lo.shape == (n, k // 8) and hi.shape == (n, k // 16)
-        assert torch.equal(_decode_planes(lo, hi, k), vals)
+        for packed in (_pack_int6_dense(vals), _pack_int6(vals)):
+            lo, hi = _int6_to_planes(packed, k)
+            assert lo.shape == (n, k // 8) and hi.shape == (n, k // 16)
+            assert torch.equal(_decode_planes(lo, hi, k), vals)
+
+
+def test_int6_to_planes_rejects_unknown_width():
+    from vllm.models.qwen4_exp.nvidia.model import _int6_to_planes
+
+    with pytest.raises(ValueError, match="neither the dense"):
+        _int6_to_planes(torch.zeros(2, 100, dtype=torch.int32), 2560)
 
 
 def test_int6_planes_both_or_neither():
