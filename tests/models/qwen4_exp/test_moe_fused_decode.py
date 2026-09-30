@@ -58,12 +58,13 @@ def _pack_int6_dense(vals: torch.Tensor) -> torch.Tensor:
     the row's little-endian bit stream, split across int32 boundaries."""
     N, K = vals.shape
     assert K % 32 == 0
+    device = vals.device
     bits = vals.reshape(N, K // 32, 32).to(torch.int64) + 32
-    stream = torch.zeros(N, K // 32, 192, dtype=torch.int64)
+    stream = torch.zeros(N, K // 32, 192, dtype=torch.int64, device=device)
     for i in range(32):
         for b in range(6):
             stream[:, :, 6 * i + b] = (bits[:, :, i] >> b) & 1
-    words = torch.zeros(N, K // 32, 6, dtype=torch.int32)
+    words = torch.zeros(N, K // 32, 6, dtype=torch.int32, device=device)
     for w in range(6):
         for b in range(32):
             words[:, :, w] |= stream[:, :, 32 * w + b].to(torch.int32) << b
