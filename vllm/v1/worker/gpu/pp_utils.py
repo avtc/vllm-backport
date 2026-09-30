@@ -147,10 +147,13 @@ class PPHandler:
         if envs.VLLM_MAMBA_ALIGN_DEBUG:
             cur = torch.cuda.current_stream(self.device)
             logger.info(
-                "pp consume pre-wait: stream_match=%s event_pending=%s buf=0x%x",
+                "pp consume pre-wait: stream_match=%s event_pending=%s buf=0x%x"
+                " cur=0x%x main=0x%x",
                 cur == self.main_stream,
                 not slot.event.query(),
                 slot.sampled_tokens.data_ptr(),
+                cur.cuda_stream,
+                self.main_stream.cuda_stream,
             )
         # The deferred consume may run on a different stream than any stream
         # captured at PPHandler construction (observed stream_match=False on
@@ -310,6 +313,18 @@ class PPHandler:
                 group=self.broadcast_group,
             )
             combined = torch.stack((num_sampled, num_rejected), dim=0)
+            if envs.VLLM_MAMBA_ALIGN_DEBUG:
+                # Post-copy, pre-wire content: these .item() reads sync the
+                # broadcast stream past the stack kernel, so they show the
+                # exact bytes NCCL is about to ship.
+                logger.info(
+                    "pp send: combined0=(%d,%d) send0=%d cur=0x%x main=0x%x",
+                    int(combined[0, 0].item()),
+                    int(combined[1, 0].item()),
+                    int(send_tokens[0, 0].item()),
+                    torch.cuda.current_stream(self.device).cuda_stream,
+                    self.main_stream.cuda_stream,
+                )
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
