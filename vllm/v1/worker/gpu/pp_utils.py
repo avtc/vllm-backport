@@ -8,11 +8,15 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -215,6 +219,17 @@ class PPHandler:
                 )
             draft_tokens_to_update[draft_idx_mapping] = draft_tokens
 
+        if envs.VLLM_MAMBA_ALIGN_DEBUG:
+            logger.info(
+                "pp consume: num_sampled=[%d..%d] num_rejected=[%d..%d]"
+                " sampled0=[%d..%d]",
+                int(slot.num_sampled.min()),
+                int(slot.num_sampled.max()),
+                int(slot.num_rejected.min()),
+                int(slot.num_rejected.max()),
+                int(slot.sampled_tokens[:, 0].min()),
+                int(slot.sampled_tokens[:, 0].max()),
+            )
         return dict(
             sampled_tokens=slot.sampled_tokens,
             num_sampled=slot.num_sampled,
@@ -364,3 +379,12 @@ class PPHandler:
             )
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)
+        if envs.VLLM_MAMBA_ALIGN_DEBUG:
+            logger.info(
+                "pp broadcast: num_reqs=%d num_sampled=[%d..%d] num_rejected=[%d..%d]",
+                num_reqs,
+                int(num_sampled.min()),
+                int(num_sampled.max()),
+                int(num_rejected.min()),
+                int(num_rejected.max()),
+            )
