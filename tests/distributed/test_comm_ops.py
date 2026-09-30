@@ -5,6 +5,7 @@
 Run `pytest tests/distributed/test_comm_ops.py`.
 """
 
+import pickle
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -641,3 +642,61 @@ def test_multi_process_tensor_parallel_pipeline_parallel(
     monkeypatch: pytest.MonkeyPatch,
 ):
     multi_process_parallel(monkeypatch, tp_size, pp_size, test_target)
+
+
+def test_fast_meta_marker_skips_payload_on_repeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VLLM_PP_FAST_META: the second send of an identical object posts only
+    the zero-size marker; the receiver's marker path must return the cached
+    object. One 8-byte gloo message replaces pickle + payload + unpickle on
+    every steady-state PP decode step."""
+    import vllm.envs as envs
+
+    posted: list[torch.Tensor] = []
+
+    def fake_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        posted.append(t)
+        return _DummyWork()
+
+    monkeypatch.setattr(torch.distributed, "isend", fake_isend)
+    monkeypatch.setattr(envs, "VLLM_PP_FAST_META", True, raising=False)
+
+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)
+    g.isend_object({"k": [1, 2, 3]}, dst=1)
+    assert len(posted) == 2  # first send: size + payload
+    g.isend_object({"k": [1, 2, 3]}, dst=1)
+    assert len(posted) == 3  # second send: marker only
+    assert posted[2].item() == 0
+
+    def marker_recv(t: torch.Tensor, *args: Any, **kwargs: Any) -> int:
+        t.fill_(0)  # sender's marker
+        return 5
+
+    monkeypatch.setattr(torch.distributed, "recv", marker_recv)
+    # Prime the cache with a full exchange.
+    g2 = _make_group_for_unit_test(rank_in_group=1, world_size=2)
+
+    def full_recv(t: torch.Tensor, *args: Any, **kwargs: Any) -> int:
+        if t.dtype == torch.long:
+            t.fill_(0)
+        else:
+            t[:] = torch.frombuffer(pickle.dumps({"k": [1, 2, 3]}), dtype=torch.uint8)[
+                : t.numel()
+            ]
+        return 5
+
+    monkeypatch.setattr(torch.distributed, "recv", full_recv)
+    obj = g2.recv_object(src=0)
+    assert obj == {"k": [1, 2, 3]}
+
+    monkeypatch.setattr(torch.distributed, "recv", marker_recv)
+    assert g2.recv_object(src=0) == {"k": [1, 2, 3]}
+
+    g3 = _make_group_for_unit_test(rank_in_group=1, world_size=2)
+    monkeypatch.setattr(torch.distributed, "recv", marker_recv)
+    try:
+        g3.recv_object(src=0)
+        raise AssertionError("marker before cache must raise")
+    except RuntimeError:
+        pass

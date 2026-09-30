@@ -923,6 +923,18 @@ class GroupCoordinator:
             size_tensor, src=self.ranks[src], group=self.cpu_group
         )
 
+        if int(size_tensor.item()) == 0:
+            # VLLM_PP_FAST_META marker: the sender's object fingerprint
+            # matched its previous send to us, so the cached unpickled
+            # object is identical.
+            cache = getattr(self, "_fast_meta_cache", None)
+            if cache is None or src not in cache:
+                raise RuntimeError(
+                    "Fast-meta marker received before any full object exchange"
+                    f" from rank {src}; disable VLLM_PP_FAST_META."
+                )
+            return cache[src]
+
         # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
             size_tensor.item(),  # type: ignore[arg-type]
@@ -940,12 +952,27 @@ class GroupCoordinator:
 
         obj = pickle.loads(object_tensor.numpy().tobytes())
 
+        if envs.VLLM_PP_FAST_META:
+            cache = getattr(self, "_fast_meta_cache", None)
+            if cache is None:
+                self._fast_meta_cache = cache = {}
+            cache[src] = obj
         return obj
+
+    def _object_fingerprint(self, obj: Any) -> str:
+        return repr(obj)
 
     def isend_object(self, obj: Any, dst: int) -> Handle:
         """Non-blocking ``send_object``: isend size + pickled object on the
         CPU group. Returns a handle that retains the serialized source
         tensors until ``wait`` drains both sends.
+
+        VLLM_PP_FAST_META=1: PP stage boundaries exchange the same tensor
+        metadata every decode step; when the fingerprint matches the last
+        object sent to this peer, only a zero size marker is sent and the
+        receiver reuses its cached unpickled object, skipping the pickle,
+        the payload transfer and the unpickle (one 8-byte gloo message
+        remains as the step's synchronization point).
         """
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
         assert dst != self.rank_in_group, (
@@ -953,12 +980,20 @@ class GroupCoordinator:
             "as the current rank."
         )
 
-        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
-        size_tensor = torch.tensor(
-            [object_tensor.numel()], dtype=torch.long, device="cpu"
-        )
-
-        retained = (size_tensor, object_tensor)
+        last = getattr(self, "_fast_meta_last", None)
+        if last is None:
+            self._fast_meta_last = last = {}
+        fingerprint = self._object_fingerprint(obj)
+        if envs.VLLM_PP_FAST_META and last.get(dst) == fingerprint:
+            size_tensor = torch.tensor([0], dtype=torch.long, device="cpu")
+            retained = (size_tensor,)
+        else:
+            last[dst] = fingerprint
+            object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+            size_tensor = torch.tensor(
+                [object_tensor.numel()], dtype=torch.long, device="cpu"
+            )
+            retained = (size_tensor, object_tensor)
         works: list[Any] = []
         for tensor in retained:
             work = torch.distributed.isend(
