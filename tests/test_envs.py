@@ -681,4 +681,4 @@ def test_pp_ple_validated_defaults():
     assert envs.VLLM_PLE_MMAP_PREPARE_OUTSIDE is True
     # Numerics-affecting switches stay opt-in until GSM8K/KLD sign-off.
     assert envs.VLLM_PLE_MMAP_STORE_FP8 is False
-    assert envs.VLLM_QSA_FP8_KV == "off"
+    assert envs.VLLM_QSA_FP8_KV == ""
