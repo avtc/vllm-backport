@@ -631,3 +631,66 @@ if __name__ == "__main__":
         test_precopy_indexes_block_tables_by_req_slot(dim_first)
         test_postprocess_indexes_block_tables_by_req_slot(dim_first)
         print(f"OK row attribution conv_dim_first={dim_first}")
+
+
+@_cuda_required
+def test_aligned_state_indices_resolve_rows_through_idx_mapping():
+    """Row attribution of ``get_aligned_state_indices_multi_group_kernel``.
+
+    The context binds the SOURCE per-request-slot block tables, while the
+    grid runs in batch order: the table row must be resolved through
+    ``idx_mapping`` (batch row -> request slot). With an identity mapping a
+    batch-row-indexed regression is invisible, so launch under a permutation
+    where every slot's state slots differ, and compare against a CPU
+    reference that indexes the source table by slot. Padded rows (FULL-graph
+    capture passes num_reqs beyond the mapping) must resolve to slot 0
+    without reading past the mapping.
+    """
+    from vllm.v1.worker.mamba_utils import get_aligned_state_indices_multi_group_kernel
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    num_reqs = len(_PERM)
+    bt, _ = _build_disjoint_block_table(num_reqs, device)
+    seq_lens = torch.tensor([5, 17, 33, 2], dtype=torch.int32, device=device)
+    cache_block_size = 8
+    num_state_slots = 2
+    num_groups = 1
+    padded = num_reqs + 3  # FULL-graph padded rows past idx_mapping
+
+    idx_mapping = torch.tensor(_PERM, dtype=torch.int32, device=device)
+    out = torch.full(
+        (num_groups, padded, num_state_slots), -1, dtype=torch.int32, device=device
+    )
+    bt_ptrs = torch.tensor([bt.data_ptr()], dtype=torch.int64, device=device)
+    get_aligned_state_indices_multi_group_kernel[(1,)](
+        bt_ptrs,
+        seq_lens,
+        out,
+        idx_mapping,
+        idx_mapping.numel(),
+        bt.stride(0),
+        seq_lens.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        padded,
+        CACHE_BLOCK_SIZE=cache_block_size,
+        NUM_GROUPS=num_groups,
+        BLOCK_GROUPS=1,
+        NUM_STATE_SLOTS=num_state_slots,
+        BLOCK_STATE_SLOTS=num_state_slots,
+        BLOCK_ROWS=32,
+        HAS_IDX_MAPPING=True,
+        num_warps=1,
+    )
+    torch.accelerator.synchronize()
+
+    # Reference: batch row r reads source row idx_mapping[r]; the state slots
+    # are the block ids at ceil((len-1)/block_size) .. +num_state_slots-1.
+    ref = torch.full_like(out.cpu(), -1)
+    for r in range(num_reqs):
+        slot = _PERM[r]
+        first = max((int(seq_lens[r]) - 1) // cache_block_size, 0)
+        ref[0, r] = bt.cpu()[slot, first : first + num_state_slots]
+    torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)

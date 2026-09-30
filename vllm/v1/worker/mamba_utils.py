@@ -36,11 +36,19 @@ logger = init_logger(__name__)
 _TEMPORAL_TILES = 16
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+@triton.jit(do_not_specialize=["num_requests", "num_mapping_rows"])
 def get_aligned_state_indices_multi_group_kernel(
     block_table_ptrs_ptr,
     seq_lens_ptr,
     state_indices_ptr,
+    # Optional: batch_idx -> req_state_idx (V2 model runner / PP). The bound
+    # block tables are the source request-state-slot tables, so the table row
+    # must be resolved through this mapping; seq_lens and the output stay in
+    # batch order.
+    idx_mapping_ptr,
+    # Entries in idx_mapping (real requests). FULL-graph capture passes a
+    # padded row count, so rows past this must not index into the mapping.
+    num_mapping_rows,
     block_table_stride_req: tl.int64,
     seq_lens_stride: tl.constexpr,
     state_indices_stride_0: tl.constexpr,
@@ -53,9 +61,24 @@ def get_aligned_state_indices_multi_group_kernel(
     NUM_STATE_SLOTS: tl.constexpr,
     BLOCK_STATE_SLOTS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr = False,
 ):
     rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     valid_row = rows < num_requests
+
+    if HAS_IDX_MAPPING:
+        # idx_mapping only covers real requests; padded rows resolve to slot 0
+        # (the gathered-table path read a zeroed padding row there). The load
+        # index is clamped so the padded rows never read past the mapping.
+        safe_rows = tl.minimum(rows, tl.maximum(num_mapping_rows - 1, 0))
+        table_row = tl.load(idx_mapping_ptr + safe_rows, mask=valid_row, other=0).to(
+            tl.int64
+        )
+        table_row = tl.where(rows < num_mapping_rows, table_row, 0)
+        active_row = valid_row & (table_row >= 0)
+    else:
+        table_row = rows
+        active_row = valid_row
 
     seq_lens = tl.load(
         seq_lens_ptr + rows * seq_lens_stride,
@@ -77,12 +100,12 @@ def get_aligned_state_indices_multi_group_kernel(
     valid_state_slot = state_slots < NUM_STATE_SLOTS
     state_indices = tl.load(
         block_tables[:, None, None]
-        + rows[None, :, None] * block_table_stride_req
+        + table_row[None, :, None] * block_table_stride_req
         + first_state_slot[None, :, None]
         + state_slots[None, None, :],
         mask=(
             valid_group[:, None, None]
-            & valid_row[None, :, None]
+            & active_row[None, :, None]
             & valid_state_slot[None, None, :]
         ),
     )
@@ -94,7 +117,7 @@ def get_aligned_state_indices_multi_group_kernel(
         state_indices,
         mask=(
             valid_group[:, None, None]
-            & valid_row[None, :, None]
+            & active_row[None, :, None]
             & valid_state_slot[None, None, :]
         ),
     )
@@ -1108,13 +1131,29 @@ class MambaSpecDecodeGPUContext:
         self,
         seq_lens: torch.Tensor,
         num_reqs: int,
+        idx_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """compute every Mamba group's aligned physical state IDs in one launch."""
+        """Compute every Mamba group's aligned physical state IDs in one launch.
+
+        Args:
+            seq_lens: [num_reqs] batch-ordered sequence lengths.
+            num_reqs: rows to fill. FULL-graph batches pass the padded request
+                count, which may exceed the number of real requests.
+            idx_mapping: optional [num_reqs_real] batch_idx -> req_state_idx,
+                covering real requests only. The block tables bound to this
+                context are the source request-state-slot tables, so the table
+                row is resolved through this mapping; None means the batch
+                order already equals the request-state order (V1).
+        """
         assert self.is_initialized
         assert seq_lens.is_cuda
         assert 0 <= num_reqs <= seq_lens.shape[0]
         assert self.aligned_state_indices is not None
         assert num_reqs <= self.aligned_state_indices.shape[1]
+        if idx_mapping is not None:
+            assert idx_mapping.numel() <= num_reqs, (
+                "idx_mapping covers real requests; num_reqs counts padded rows"
+            )
         if num_reqs == 0:
             return self.aligned_state_indices[:, :0]
 
@@ -1125,6 +1164,8 @@ class MambaSpecDecodeGPUContext:
             self.block_table_ptrs,
             seq_lens,
             self.aligned_state_indices,
+            idx_mapping,
+            0 if idx_mapping is None else idx_mapping.numel(),
             self.block_table_stride_req,
             seq_lens.stride(0),
             self.aligned_state_indices.stride(0),
@@ -1137,6 +1178,7 @@ class MambaSpecDecodeGPUContext:
             NUM_STATE_SLOTS=num_state_slots,
             BLOCK_STATE_SLOTS=triton.next_power_of_2(num_state_slots),
             BLOCK_ROWS=block_rows,
+            HAS_IDX_MAPPING=idx_mapping is not None,
             num_warps=1,
         )
         return self.aligned_state_indices[:, :num_reqs]
