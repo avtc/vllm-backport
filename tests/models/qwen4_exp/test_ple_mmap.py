@@ -422,3 +422,29 @@ def test_mmap_table_path_single_owner_per_layer():
         _claim_mmap_table(path, second)
     finally:
         ne._MMAP_TABLE_OWNERS.clear()
+
+
+def test_mmap_table_path_creates_missing_directory(tmp_path):
+    import os
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import torch
+
+    from vllm.models.qwen4_exp.nvidia import ngram_embedding as ne
+
+    _FakeEtP = SimpleNamespace(device_group=SimpleNamespace(_rank=3))
+    fake_dist = type("M", (), {"get_rank": staticmethod(lambda g: g._rank)})
+    target = tmp_path / "new" / "sub" / "ple"
+    with (
+        patch.dict(os.environ, {"VLLM_PLE_MMAP_PATH": str(target)}),
+        patch.object(torch, "distributed", fake_dist),
+        patch.object(ne, "get_etp_group", lambda: _FakeEtP),
+    ):
+        from vllm import envs
+
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+        path = ne._mmap_table_path()
+    assert path == f"{target}.rank3"
+    assert os.path.isdir(os.path.dirname(path))  # created on demand

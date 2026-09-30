@@ -978,7 +978,11 @@ def _mmap_table_path() -> str:
     base = envs.VLLM_PLE_MMAP_PATH
     assert base, "VLLM_PLE_MMAP_PATH must be set for the mmap PLE table"
     rank = torch.distributed.get_rank(get_etp_group().device_group)
-    return f"{base}.rank{rank}"
+    path = f"{base}.rank{rank}"
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory, exist_ok=True)
+    return path
 
 
 # The table file is keyed per ETP rank only, so a second PLE layer (its own
