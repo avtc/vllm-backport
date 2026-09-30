@@ -536,3 +536,34 @@ def test_setup_fused_decode_rejects_non_bf16_params():
     )
     block._setup_fused_decode()
     assert block._decode_state is None
+
+
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 8, 16, 64])
+@pytest.mark.parametrize("n,k,gs", [(1280, 2560, 64), (2560, 640, 64)])
+def test_w6a16_gemm_real_shapes(m, n, k, gs):
+    """The standalone int6-planes GEMM at the checkpoint's real shapes.
+
+    PP tp1 boots the shared expert through _Int6PlanesScheme on the real
+    weights for the first time (tp8+EP replicates it, so the path never ran
+    before). Exercises every M-driven block config including the M=1 decode
+    shape that JIT-compiles separately, against a dequant-then-matmul
+    reference."""
+    cuda = pytest.importorskip("torch").cuda
+    if not cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.models.qwen4_exp.nvidia.model import (
+        _int6_to_planes,
+        _w6a16_gemm,
+    )
+
+    torch.manual_seed(0)
+    vals = torch.randint(-32, 32, (n, k), dtype=torch.int32, device="cuda")
+    lo, hi = _int6_to_planes(_pack_int6_dense(vals), k)
+    scale = torch.rand(n, k // gs, dtype=torch.bfloat16, device="cuda") * 0.01
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+
+    y = _w6a16_gemm(x, lo, hi, scale, gs)
+
+    w = vals.to(torch.float32) * scale.repeat_interleave(gs, dim=1).to(torch.float32)
+    ref = (x.to(torch.float32) @ w.T).to(torch.bfloat16)
+    torch.testing.assert_close(y, ref, rtol=2e-2, atol=2e-1)
