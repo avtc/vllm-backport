@@ -13,6 +13,7 @@ import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.parameter import (
     BasevLLMParameter,
@@ -21,7 +22,6 @@ from vllm.model_executor.parameter import (
     PackedvLLMParameter,
 )
 from vllm.triton_utils import tl, triton
-from vllm.utils import init_logger
 
 __all__ = ["CompressedTensorsEmbeddingWNA16Int"]
 
