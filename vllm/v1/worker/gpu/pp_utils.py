@@ -131,6 +131,22 @@ class PPHandler:
             ]
         )
         self.recv_ring_cursor = 0
+        # Neutral zero payloads for steps where no request samples a token.
+        # Every rank must join the broadcast sequence every step: the
+        # mask's num_computed_tokens input lags on non-last ranks (deferred
+        # postprocess), so a conditional skip can diverge and desync the
+        # communicator.
+        self.idle_sampled = torch.zeros(
+            max_num_reqs, self.max_sample_len, dtype=torch.int64, device=device
+        )
+        self.idle_counts = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self.idle_draft = (
+            torch.zeros(
+                max_num_reqs, num_speculative_steps, dtype=torch.int64, device=device
+            )
+            if num_speculative_steps > 0
+            else None
+        )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
 
     def on_req_idx_freed(self, req_idx: int) -> None:
@@ -211,7 +227,16 @@ class PPHandler:
     ) -> None:
         """Broadcast draft proposals so non-last ranks can embed real token ids."""
         assert self.is_last_rank
+        num_reqs = input_batch.num_reqs
         if compute_need_sampled_mask(input_batch) is None:
+            # Match receive()'s unconditional draft broadcast (see __init__).
+            with torch.cuda.stream(self.broadcast_stream):
+                self.broadcast_stream.wait_stream(self.main_stream)
+                torch.distributed.broadcast(
+                    self.idle_draft[:num_reqs],
+                    src=self.last_rank,
+                    group=self.broadcast_group,
+                )
             return
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
@@ -229,8 +254,10 @@ class PPHandler:
         assert not self.is_last_rank
         need_sampled_mask = compute_need_sampled_mask(input_batch)
         if need_sampled_mask is None:
-            # Leave this step's reserved slot as None.
-            return False
+            # Every rank joins the broadcast sequence every step (see
+            # __init__); a non-sampling step is an all-False mask so the
+            # deferred consume filters all of its rows out.
+            need_sampled_mask = np.zeros(input_batch.num_reqs, dtype=bool)
 
         # Snapshot the per-slot generation counter so a later free of any of
         # these RequestStates request indices is detectable at consume time.
@@ -285,8 +312,29 @@ class PPHandler:
         input_batch: InputBatch,
     ) -> None:
         assert self.is_last_rank
+        num_reqs = input_batch.num_reqs
         if compute_need_sampled_mask(input_batch) is None:
-            # No request needs sampled outputs for a subsequent decode step.
+            # No request samples this step, but the broadcast sequence must
+            # stay identical on every rank (see __init__): send neutral zeros
+            # with the step's shapes. Receivers filter the step at consume
+            # time via an all-False mask.
+            with torch.cuda.stream(self.broadcast_stream):
+                self.broadcast_stream.wait_stream(self.main_stream)
+                torch.distributed.broadcast(
+                    self.idle_sampled[:num_reqs],
+                    src=self.last_rank,
+                    group=self.broadcast_group,
+                )
+                torch.distributed.broadcast(
+                    self.idle_counts[:num_reqs],
+                    src=self.last_rank,
+                    group=self.broadcast_group,
+                )
+                torch.distributed.broadcast(
+                    self.idle_counts[:num_reqs],
+                    src=self.last_rank,
+                    group=self.broadcast_group,
+                )
             return
 
         assert sampled_token_ids.dtype == torch.int64

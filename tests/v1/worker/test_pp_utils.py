@@ -220,17 +220,39 @@ def test_send_and_recv_op_counts_match_without_speculator(monkeypatch):
 
 
 @requires_cuda
-def test_both_ranks_skip_when_no_request_needs_sampling(monkeypatch):
-    """The skip gate must be symmetric, or the ranks desynchronize."""
+def test_both_ranks_participate_when_no_request_needs_sampling(monkeypatch):
+    """A no-sample step still runs the full broadcast sequence on every rank.
+
+    The old conditional skip was unsound: the mask depends on
+    num_computed_tokens_np, which lags on non-last ranks (deferred
+    postprocess), so the ranks could disagree at a prefill->decode boundary
+    and desynchronize the communicator - step contents then shift by one and
+    per-request sampled counts arrive garbage (the pp4 deferred-wave IMA).
+    """
     sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=3)
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(needs_sample=False), width=1, with_draft=True)
-    assert calls == []
+    assert len(calls) == 4  # sampled, num_sampled, num_rejected, draft
+    assert calls[0].shape == (3, sender.max_sample_len)
+    assert calls[3].shape == (3, sender.num_speculative_steps)
+    assert all((c == 0).all().item() for c in calls)
 
     receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=3)
     calls.clear()
     assert not receiver.receive(make_input_batch(needs_sample=False))
-    assert calls == []
+    assert len(calls) == 4
+    # The deferred consume must filter such a step out entirely.
+    assert not receiver.queue[-1].need_sampled_mask.any()
+
+
+@requires_cuda
+def test_no_sample_step_consume_is_neutral(monkeypatch):
+    """Consuming an all-False-mask step performs no state updates."""
+    receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=0)
+    record_broadcasts(monkeypatch, fill_value=7)
+    assert not receiver.receive(make_input_batch(needs_sample=False))
+    outputs = receiver.get_prev_sampled_outputs()
+    assert outputs is None
 
 
 @requires_cuda
