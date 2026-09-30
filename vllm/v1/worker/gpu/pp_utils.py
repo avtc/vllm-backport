@@ -152,7 +152,18 @@ class PPHandler:
                 not slot.event.query(),
                 slot.sampled_tokens.data_ptr(),
             )
-        self.main_stream.wait_event(slot.event)
+        # The deferred consume may run on a different stream than any stream
+        # captured at PPHandler construction (observed stream_match=False on
+        # every pp4 rank); fencing a non-executing stream let post_update race
+        # the NCCL write and deliver unwritten pool bytes as sampled counts.
+        cur.wait_event(slot.event)
+        # The real consumer stream must also gate the allocator's reuse of
+        # the per-step receive tensors.
+        slot.sampled_tokens.record_stream(cur)
+        slot.num_sampled.record_stream(cur)
+        slot.num_rejected.record_stream(cur)
+        if slot.draft_tokens is not None:
+            slot.draft_tokens.record_stream(cur)
         if slot.draft_tokens is not None and draft_tokens_to_update is not None:
             draft_tokens = slot.draft_tokens
             draft_idx_mapping = slot.idx_mapping
@@ -191,7 +202,7 @@ class PPHandler:
         if compute_need_sampled_mask(input_batch) is None:
             return
         with torch.cuda.stream(self.broadcast_stream):
-            self.broadcast_stream.wait_stream(self.main_stream)
+            self.broadcast_stream.wait_stream(torch.cuda.current_stream(self.device))
             send = draft_tokens[input_batch.idx_mapping].contiguous()
             # Must record the idx_mapping tensor since it was allocated
             # on the main stream.
@@ -214,8 +225,9 @@ class PPHandler:
         gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
 
         num_reqs = input_batch.num_reqs
+        cur_stream = torch.cuda.current_stream(self.device)
         with torch.cuda.stream(self.broadcast_stream):
-            self.broadcast_stream.wait_stream(self.main_stream)
+            self.broadcast_stream.wait_stream(cur_stream)
             sampled_tokens = torch.empty(
                 num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
             )
@@ -241,10 +253,10 @@ class PPHandler:
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
             # later used on the main stream.
-            sampled_tokens.record_stream(self.main_stream)
-            combined.record_stream(self.main_stream)
+            sampled_tokens.record_stream(cur_stream)
+            combined.record_stream(cur_stream)
             if draft_tokens is not None:
-                draft_tokens.record_stream(self.main_stream)
+                draft_tokens.record_stream(cur_stream)
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,
@@ -287,7 +299,7 @@ class PPHandler:
             self.main_stream.synchronize()
 
         with torch.cuda.stream(self.broadcast_stream):
-            self.broadcast_stream.wait_stream(self.main_stream)
+            self.broadcast_stream.wait_stream(torch.cuda.current_stream(self.device))
             send_tokens = torch.nn.functional.pad(
                 sampled_token_ids,
                 (0, self.max_sample_len - sampled_token_ids.shape[-1]),

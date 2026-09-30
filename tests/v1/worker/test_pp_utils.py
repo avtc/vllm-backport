@@ -338,3 +338,26 @@ def test_post_update_clamps_garbage_num_sampled(monkeypatch):
     # only one write landed, inside the row
     assert (all_token_ids[0, 10] == 42).item() and (all_token_ids[0, 11:] == 0).all()
     assert (all_token_ids[1:] == 0).all()
+
+
+@requires_cuda
+def test_receive_and_consume_under_side_streams(monkeypatch):
+    """The deferred consume may execute on a stream other than any stream
+    captured at PPHandler construction (observed stream_match=False on every
+    non-last pp4 rank in production): the event wait and record_stream calls
+    must target the runtime current stream, or post_update races the NCCL
+    write and delivers unwritten pool bytes as sampled counts."""
+    receiver = make_handler(
+        monkeypatch, is_last_rank=False, num_speculative_steps=0, world_size=2
+    )
+    record_broadcasts(monkeypatch, fill_value=42)
+    side_a = torch.cuda.Stream()
+    side_b = torch.cuda.Stream()
+    with torch.cuda.stream(side_a):
+        assert receiver.receive(make_input_batch())
+    assert receiver.get_prev_sampled_outputs() is None  # seeded placeholder
+    with torch.cuda.stream(side_b):
+        outputs = receiver.get_prev_sampled_outputs()
+    assert outputs is not None
+    assert (outputs["sampled_tokens"] == 42).all().item()
+    assert (outputs["num_sampled"] == 42).all().item()
