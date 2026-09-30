@@ -2109,6 +2109,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.draft_tokens[input_batch.idx_mapping],
             )
             if self.pp_handler is not None:
+                # Fence the draft production the same way as the sampler:
+                # the draft gather inside broadcast_drafts runs on the
+                # broadcast stream and raced its producers (acceptance
+                # collapsed to ~0 on pp4+mtp3 without this).
+                self.pp_handler.record_sample_done()
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch
                 )

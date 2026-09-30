@@ -214,6 +214,11 @@ class PPHandler:
         if compute_need_sampled_mask(input_batch) is None:
             return
         with torch.cuda.stream(self.broadcast_stream):
+            if self.sample_done_event is not None:
+                # Order the draft gather against the event recorded right
+                # after the drafts were staged (same fence the sampled-token
+                # broadcast uses; the gather previously raced its producers).
+                self.broadcast_stream.wait_event(self.sample_done_event)
             self.broadcast_stream.wait_stream(torch.cuda.current_stream(self.device))
             send = draft_tokens[input_batch.idx_mapping].contiguous()
             # Must record the idx_mapping tensor since it was allocated
