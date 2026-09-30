@@ -304,3 +304,47 @@ def test_recv_ring_slots_are_distinct_and_deep_enough(monkeypatch):
         receiver.receive(batch)
         ptrs.append(receiver.queue[-1].sampled_tokens.data_ptr())
     assert len(set(ptrs)) == world_size + 1
+
+
+@requires_cuda
+def test_post_update_clamps_garbage_num_sampled(monkeypatch):
+    """A garbage sampled-count must not drive post_update's dynamic
+    all_token_ids write past the request row: heap corruption from a
+    deferred-state/transport race on PP ranks surfaces as an IMA in an
+    arbitrary later kernel (observed: the quantized embedding gather)."""
+    import torch
+
+    from vllm.v1.worker.gpu.input_batch import post_update
+
+    max_num_reqs, max_model_len, width = 4, 64, 1
+    dev = "cuda"
+    idx_mapping = torch.tensor([0], dtype=torch.int64, device=dev)
+    num_computed = torch.zeros(max_num_reqs, dtype=torch.int32, device=dev)
+    last_sampled = torch.zeros(max_num_reqs, dtype=torch.int64, device=dev)
+    sampled = torch.zeros(1, width, dtype=torch.int64, device=dev)
+    sampled[0, 0] = 42
+    num_sampled = torch.tensor([2**31 - 1], dtype=torch.int32, device=dev)
+    num_rejected = torch.zeros(1, dtype=torch.int32, device=dev)
+    all_token_ids = torch.zeros(
+        max_num_reqs, max_model_len, dtype=torch.int64, device=dev
+    )
+    total_len = torch.tensor([10], dtype=torch.int64, device=dev)
+
+    post_update(
+        idx_mapping,
+        num_computed,
+        last_sampled,
+        None,
+        sampled,
+        num_sampled,
+        num_rejected,
+        None,
+        all_token_ids,
+        total_len,
+    )
+    torch.cuda.synchronize()
+    assert last_sampled[0].item() == 42
+    assert total_len[0].item() == 10 + width  # clamped to max_sample_len
+    # only one write landed, inside the row
+    assert (all_token_ids[0, 10] == 42).item() and (all_token_ids[0, 11:] == 0).all()
+    assert (all_token_ids[1:] == 0).all()

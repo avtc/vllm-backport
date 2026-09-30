@@ -551,6 +551,7 @@ def _post_update_kernel(
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
+    max_sample_len,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
@@ -560,6 +561,11 @@ def _post_update_kernel(
 
     total_len = tl.load(total_len_ptr + req_state_idx)
     num_sampled = tl.load(num_sampled_ptr + req_id)
+    # The dynamic loop below writes all_token_ids[req, total_len + i]; a
+    # garbage count (deferred-state / transport corruption on PP ranks)
+    # would write unboundedly and corrupt arbitrary allocations. By
+    # construction a step samples at most max_sample_len tokens per request.
+    num_sampled = tl.minimum(tl.maximum(num_sampled, 0), max_sample_len)
     if num_sampled > 0:
         token_id = tl.load(
             sampled_tokens_ptr + req_id * sampled_tokens_stride + num_sampled - 1
@@ -634,6 +640,7 @@ def post_update(
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
+        sampled_tokens.shape[1],  # max_sample_len clamp for the dynamic loop
         num_warps=1,
     )
 
