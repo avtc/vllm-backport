@@ -185,35 +185,37 @@ def test_broadcast_pads_sampled_tokens_to_max_sample_len(monkeypatch, width, num
 
 @requires_cuda
 def test_send_and_recv_op_counts_match_with_speculator(monkeypatch):
-    """With a speculator the step is three broadcasts: sampled, combined, draft,
-    matched strictly by order on the communicator."""
+    """With a speculator the step is four broadcasts: sampled, num_sampled,
+    num_rejected, draft, matched strictly by order on the communicator."""
     sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=3)
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(), width=1, with_draft=True)
-    assert len(calls) == 3
+    assert len(calls) == 4
     assert calls[0].shape == (3, sender.max_sample_len)
-    assert calls[2].shape == (3, sender.num_speculative_steps)
+    assert calls[1].shape == (3,)
+    assert calls[2].shape == (3,)
+    assert calls[3].shape == (3, sender.num_speculative_steps)
 
     receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=3)
     calls.clear()
     assert receiver.receive(make_input_batch())
-    assert len(calls) == 3
+    assert len(calls) == 4
     assert calls[0].shape == (3, sender.max_sample_len)
-    assert calls[2].shape == (3, sender.num_speculative_steps)
+    assert calls[3].shape == (3, sender.num_speculative_steps)
 
 
 @requires_cuda
 def test_send_and_recv_op_counts_match_without_speculator(monkeypatch):
-    """Without spec decode the step is two broadcasts on both sides."""
+    """Without spec decode the step is three broadcasts on both sides."""
     sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=0)
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(), width=1, with_draft=False)
-    assert len(calls) == 2
+    assert len(calls) == 3
 
     receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=0)
     calls.clear()
     assert receiver.receive(make_input_batch())
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert receiver.queue[-1].draft_tokens is None
 
 
@@ -255,3 +257,50 @@ def test_relayed_draft_tokens_are_scattered_on_consume(monkeypatch):
     assert (draft_tokens[:2] == 7).all()
     assert (draft_tokens[2:] == 0).all()
     assert (outputs["sampled_tokens"] == 7).all()
+
+
+@requires_cuda
+def test_consume_reads_idx_mapping_snapshot_not_live_tensor(monkeypatch):
+    """The deferred consume runs pp_size steps after receive(); the live
+    input_batch.idx_mapping holds a later step's batch->slot mapping by then.
+    The consumed mapping must be the snapshot taken at receive time, or
+    post_update writes another step's request state (the vLLM#55506 class)."""
+    receiver = make_handler(
+        monkeypatch, is_last_rank=False, num_speculative_steps=0, world_size=2
+    )
+    record_broadcasts(monkeypatch, fill_value=5)
+    batch = make_input_batch(num_reqs=3)  # idx_mapping [0, 1, 2]
+    assert receiver.receive(batch)
+
+    # Later steps rewrite the LIVE mapping and its numpy mirror.
+    batch.idx_mapping.copy_(torch.tensor([7, 7, 7], device="cuda"))
+    batch.idx_mapping_np[...] = 7
+
+    assert receiver.get_prev_sampled_outputs(None) is None  # seeded placeholder
+    outputs = receiver.get_prev_sampled_outputs(None)
+    assert outputs is not None
+    assert outputs["idx_mapping"].tolist() == [0, 1, 2]
+
+
+@requires_cuda
+def test_recv_ring_slots_are_distinct_and_deep_enough(monkeypatch):
+    """Receive buffers are persistent ring slots: consecutive in-flight steps
+    must use distinct storage (a deferred slot must not be overwritten by a
+    later receive before it is consumed), and the ring must cover
+    max_concurrent_batches == pp world_size + 1 in-flight steps."""
+    world_size = 3
+    receiver = make_handler(
+        monkeypatch,
+        is_last_rank=False,
+        num_speculative_steps=0,
+        world_size=world_size,
+    )
+    record_broadcasts(monkeypatch)
+    assert len(receiver.recv_ring) == world_size + 1
+
+    ptrs = []
+    batch = make_input_batch(num_reqs=2)
+    for _ in range(world_size + 1):
+        receiver.receive(batch)
+        ptrs.append(receiver.queue[-1].sampled_tokens.data_ptr())
+    assert len(set(ptrs)) == world_size + 1
