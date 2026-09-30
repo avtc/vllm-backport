@@ -67,7 +67,7 @@ if TYPE_CHECKING:
     # workspace rows. 40 is the upstream default, sized to match the
     # flashmla workspace; values above it only grow memory, never enable
     # bigger requests, and values below 1 are rejected.
-    VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 40
+    VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR: int = 4
     # Byte budget for the Triton sparse-MLA fp8 gather-dequant workspace.
     # Prefill-shaped MQA batches sub-batch tokens to stay under this. At
     # default 64 MiB a GLM-shaped batch (topk 2176, head_dim 512) fits ~30
@@ -185,7 +185,7 @@ if TYPE_CHECKING:
     # Run the mmap PLE host gather in the model state's prepare_inputs
     # instead of forward: removes the per-step D2H sync from the critical
     # path and keeps forward capturable in FULL cudagraphs.
-    VLLM_PLE_MMAP_PREPARE_OUTSIDE: bool = False
+    VLLM_PLE_MMAP_PREPARE_OUTSIDE: bool = True
     # Store the PLE table as e4m3 with a per-tensor scale (written at first
     # finalize as a .fp8 sidecar): halves NVMe footprint and warm page cache;
     # gathers decode through a 256-entry LUT.
@@ -205,7 +205,7 @@ if TYPE_CHECKING:
     VLLM_PP_DEBUG_SYNC_DEFERRED: bool = False
     VLLM_MAMBA_ALIGN_DEBUG: bool = False
     VLLM_PP_SYNC_BROADCAST: bool = False
-    VLLM_PP_FAST_META: bool = False
+    VLLM_PP_FAST_META: bool = True
     VLLM_PP_TIMING_DEBUG: bool = False
     VLLM_EMBED_GATHER_DEBUG: bool = False
     # Fused decode-time MoE block (router + topk + alignment + shared expert
@@ -1199,7 +1199,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
     "VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR": lambda: int(
-        os.getenv("VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR", "40")
+        os.getenv("VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR", "4")
     ),
     "VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB": lambda: int(
         os.getenv("VLLM_TRITON_MLA_SPARSE_FP8_GATHER_MB", "64")
@@ -2480,7 +2480,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_PLE_MMAP_PIN_STAGING", "1"))
     ),
     "VLLM_PLE_MMAP_PREPARE_OUTSIDE": lambda: bool(
-        int(os.getenv("VLLM_PLE_MMAP_PREPARE_OUTSIDE", "0"))
+        int(os.getenv("VLLM_PLE_MMAP_PREPARE_OUTSIDE", "1"))
     ),
     "VLLM_PLE_MMAP_STORE_FP8": lambda: bool(
         int(os.getenv("VLLM_PLE_MMAP_STORE_FP8", "0"))
@@ -2491,7 +2491,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_HC_FUSED_INT8": lambda: bool(int(os.getenv("VLLM_HC_FUSED_INT8", "1"))),
     "VLLM_PP_DEFER_RECV": lambda: bool(int(os.getenv("VLLM_PP_DEFER_RECV", "1"))),
-    "VLLM_PP_FAST_META": lambda: bool(int(os.getenv("VLLM_PP_FAST_META", "0"))),
+    "VLLM_PP_FAST_META": lambda: bool(int(os.getenv("VLLM_PP_FAST_META", "1"))),
     "VLLM_PP_TIMING_DEBUG": lambda: bool(int(os.getenv("VLLM_PP_TIMING_DEBUG", "0"))),
     "VLLM_PP_SYNC_BROADCAST": lambda: bool(
         int(os.getenv("VLLM_PP_SYNC_BROADCAST", "0"))

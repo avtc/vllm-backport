@@ -671,3 +671,14 @@ def test_pp_debug_sync_deferred_env():
         if hasattr(envs.__getattr__, "cache_clear"):
             envs.__getattr__.cache_clear()
     importlib.reload(envs)
+
+
+def test_pp_ple_validated_defaults():
+    """Validated-good defaults for the 8x3090 PP decode recipe."""
+    envs.cache_clear()
+    assert envs.VLLM_SPARSE_INDEXER_PREFILL_BUFFER_FACTOR == 4
+    assert envs.VLLM_PP_FAST_META is True
+    assert envs.VLLM_PLE_MMAP_PREPARE_OUTSIDE is True
+    # Numerics-affecting switches stay opt-in until GSM8K/KLD sign-off.
+    assert envs.VLLM_PLE_MMAP_STORE_FP8 is False
+    assert envs.VLLM_QSA_FP8_KV == "off"
