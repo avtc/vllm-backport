@@ -382,10 +382,11 @@ def _moe_combine_kernel(
 # ---------------------------------------------------------------------------
 #
 # The shared expert's gate/up (1280 x 2560) and down (2560 x 640) projections
-# are INT6 group-64 (compressed-tensors pack-quantized: five values per int32
-# word at bits [6j, 6j+6), value + 32, two padding bits per word - this
-# fork's 0.17.0-style format as vLLM's unpack_quantized_values_into_int32
-# reads it). Humming runs these
+# are INT6 group-64 (compressed-tensors pack-quantized, value + 32; the
+# export this fork runs packs densely - value i at bit 6i, split across
+# int32 boundaries - while the 0.17.0 packer writes five padded values per
+# word; _int6_to_planes detects the layout from the packed width). Humming
+# runs these
 # small shapes at ~250 GB/s at one token. _Int6PlanesScheme splits the same
 # 6 bits per weight into a 4-bit and a 2-bit plane once at load time (same
 # memory), which the kernels below decode with shifts:
@@ -401,37 +402,60 @@ def _moe_combine_kernel(
 def _int6_to_planes(
     packed: torch.Tensor, K: int, rows_per_chunk: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Padded pack-quantized INT6 [N, ceil(K / 5)] int32 -> lo/hi planes.
+    """Pack-quantized INT6 [N, W] int32 -> lo/hi planes.
 
-    This fork's checkpoints (compressed-tensors 0.17.0 packer, and vLLM's
-    unpack_quantized_values_into_int32) store five 6-bit values per int32
-    word - value j of each group of five at bits [6j, 6j+6), the remaining
-    two bits padding - NOT the dense split-across-boundaries stream newer
-    compressed-tensors writes. lo [N, K / 8] int32 holds bits 0..3 of eight
-    values per word, hi [N, K / 16] int32 bits 4..5 of sixteen. Done in row
-    chunks so the load-time temporaries stay a few MB.
+    Two layouts exist in the wild and the packed width disambiguates them
+    (they differ for every K this path accepts, K % 128 == 0):
+    - dense (W == ceil(6K/32), the AutoRound export this fork runs): value
+      i at bit 6i of the row's little-endian bit stream, split across int32
+      boundaries - 32 values in six words;
+    - padded (W == ceil(K/5), compressed-tensors 0.17.0's packer): five
+      values per word at bits [6j, 6j+6), two padding bits.
+    Both carry the value + 32 bias. lo [N, K/8] int32 holds bits 0..3 of
+    eight values per word, hi [N, K/16] int32 bits 4..5 of sixteen. Done in
+    row chunks so the load-time temporaries stay a few MB.
     """
     N = packed.shape[0]
     assert packed.is_contiguous()
     words = packed.shape[1]
-    assert (words - 1) * 5 < K <= words * 5, (words, K)
-    # The planes take 6K/32 words per row, at most the packed 6K/30 (with
-    # padding); they go into one allocation of the packed size, and the
-    # caller drops the packed tensor: the same allocate-new / free-old
-    # pattern as the Humming repack this replaces. Two separately sized
-    # plane tensors left ~100-190 MiB of stranded allocator cache per GPU.
+    dense_words = (6 * K + 31) // 32
+    padded_words = (K + 4) // 5
+    dense = words == dense_words
+    if not dense and words != padded_words:
+        raise ValueError(
+            f"int6 packed width {words} matches neither the dense "
+            f"({dense_words}) nor the padded ({padded_words}) layout for K={K}"
+        )
+    # The planes take 6K/32 words per row, at most the packed width; they go
+    # into one allocation of the packed size, and the caller drops the packed
+    # tensor: the same allocate-new / free-old pattern as the Humming repack
+    # this replaces. Two separately sized plane tensors left ~100-190 MiB of
+    # stranded allocator cache per GPU.
     storage = torch.empty_like(packed).view(-1)
     lo = storage[: N * (K // 8)].view(N, K // 8)
     hi = storage[N * (K // 8) : N * (K // 8) + N * (K // 16)].view(N, K // 16)
     for r0 in range(0, N, rows_per_chunk):
         r1 = min(r0 + rows_per_chunk, N)
-        chunk = packed[r0:r1]
-        vals = torch.empty(
-            (r1 - r0, words * 5), dtype=torch.int32, device=packed.device
-        )
-        for j in range(5):
-            vals[:, j::5] = torch.bitwise_right_shift(chunk, 6 * j) & 63
-        vals = vals[:, :K]
+        if dense:
+            chunk = packed[r0:r1].reshape(r1 - r0, K // 32, 6)
+            vals = torch.empty(
+                (r1 - r0, K // 32, 32), dtype=torch.int32, device=packed.device
+            )
+            for i in range(32):
+                w, o = divmod(6 * i, 32)
+                v = torch.bitwise_right_shift(chunk[:, :, w], o) & ((1 << (32 - o)) - 1)
+                if o + 6 > 32:
+                    v = v | torch.bitwise_left_shift(chunk[:, :, w + 1], 32 - o)
+                vals[:, :, i] = v & 63
+            vals = vals.reshape(r1 - r0, K)
+        else:
+            chunk = packed[r0:r1]
+            vals = torch.empty(
+                (r1 - r0, words * 5), dtype=torch.int32, device=packed.device
+            )
+            for j in range(5):
+                vals[:, j::5] = torch.bitwise_right_shift(chunk, 6 * j) & 63
+            vals = vals[:, :K]
         lo_c = (vals & 15).reshape(r1 - r0, K // 8, 8)
         hi_c = torch.bitwise_right_shift(vals, 4).reshape(r1 - r0, K // 16, 16)
         acc = torch.zeros((r1 - r0, K // 8), dtype=torch.int32, device=packed.device)
