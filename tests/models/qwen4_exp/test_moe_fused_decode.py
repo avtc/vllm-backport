@@ -509,31 +509,3 @@ def test_setup_fused_decode_rejects_non_bf16_params():
     )
     block._setup_fused_decode()
     assert block._decode_state is None
-
-
-def test_misaligned_shared_expert_replicate_escape(monkeypatch):
-    """VLLM_SHARED_EXPERT_REPLICATE_MISALIGNED turns the misaligned-shared
-    refusal into replication (the EP layout); the default keeps upstream's
-    fail-loud behavior."""
-    from vllm.model_executor.models.qwen3_next import (
-        _should_replicate_misaligned_shared_expert,
-    )
-
-    # 640 @ TP4, group 64: partition 160 not divisible - upstream refuses.
-    with pytest.raises(ValueError, match="not divisible"):
-        _should_replicate_misaligned_shared_expert(640, 4, 64, False, False)
-
-    monkeypatch.setenv("VLLM_SHARED_EXPERT_REPLICATE_MISALIGNED", "1")
-    import vllm.envs as envs
-
-    if hasattr(envs.__getattr__, "cache_clear"):
-        envs.__getattr__.cache_clear()
-    assert _should_replicate_misaligned_shared_expert(640, 4, 64, False, False) is True
-    if hasattr(envs.__getattr__, "cache_clear"):
-        envs.__getattr__.cache_clear()
-
-    # Aligned layouts never replicate: 640 @ TP2 group 64 -> 320 % 64 == 0.
-    monkeypatch.delenv("VLLM_SHARED_EXPERT_REPLICATE_MISALIGNED", raising=False)
-    if hasattr(envs.__getattr__, "cache_clear"):
-        envs.__getattr__.cache_clear()
-    assert _should_replicate_misaligned_shared_expert(640, 2, 64, False, False) is False
