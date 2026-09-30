@@ -1225,14 +1225,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
         if num_tokens_after_padding > num_tokens:
-            # FULL-graph replays consume input_ids[:num_tokens_after_padding];
-            # the real-token writers (prepare_prefill_inputs, combine) only
+            # FULL-graph replays consume input_ids/positions
+            # [:num_tokens_after_padding]; the real-token writers
+            # (prepare_prefill_inputs, combine, prepare_pos_seq_lens) only
             # cover [:num_tokens], so the padded rows would keep stale bytes
-            # from earlier steps and every id consumer (the quantized vocab
-            # embedding gather, the sparse-indexer token embedding) would see
-            # out-of-range ids. Pad with token id 0: valid, and padded rows'
-            # outputs are discarded.
+            # from earlier steps. Id/position consumers that do not honor
+            # is_padding (the quantized vocab embedding gather, the
+            # sparse-indexer token embedding, position-derived KV block
+            # indexing) would then read out-of-range ids or positions. Pad
+            # with zeros: valid for every consumer, and padded rows' outputs
+            # are discarded.
             self.input_buffers.input_ids[num_tokens:num_tokens_after_padding].zero_()
+            self.input_buffers.positions[num_tokens:num_tokens_after_padding].zero_()
         if envs.VLLM_MOE_SKIP_PADDING:
             # Mark trailing cudagraph-padding rows so kernels can skip work for
             # them when supported.
