@@ -213,13 +213,16 @@ def _reinterpret_u64_as_i64(value: int) -> int:
 
 
 @triton.jit
-def _align_guard_trip(debug_ptr, kind):
+def _align_guard_trip(debug_ptr, kind, dst_col):
     # Count an align state copy skipped for impossible inputs
     # (negative/out-of-range block-table columns or negative block ids).
     # debug layout: [0]=total skips, [1]=dst_col, [2]=src_col,
-    # [3]=temporal src col, [4]=dest block id, [5]=src block id.
+    # [3]=temporal src col, [4]=dest block id, [5]=src block id,
+    # [6]=max dst_col seen, [7]=min dst_col seen.
     tl.atomic_add(debug_ptr, 1)
     tl.atomic_add(debug_ptr + kind, 1)
+    tl.atomic_max(debug_ptr + 6, dst_col)
+    tl.atomic_min(debug_ptr + 7, dst_col)
 
 
 @triton.jit
@@ -289,10 +292,10 @@ def _copy_mamba_state_block(
     # becomes a wild address (IMA). Legitimate copies always use in-range
     # columns and non-negative ids, so skipping is free.
     if (dst_col < 0) | (dst_col >= block_table_stride_req):
-        _align_guard_trip(debug_ptr, 1)
+        _align_guard_trip(debug_ptr, 1, dst_col)
         return
     if (src_col < 0) | (src_col >= block_table_stride_req):
-        _align_guard_trip(debug_ptr, 2)
+        _align_guard_trip(debug_ptr, 2, dst_col)
         return
 
     # Widen block ids to int64 before they reach `block_id * state_block_stride`
@@ -300,7 +303,7 @@ def _copy_mamba_state_block(
     # and Triton would otherwise do the multiply in int32 and wrap.
     dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
     if dest_block_id < 0:
-        _align_guard_trip(debug_ptr, 4)
+        _align_guard_trip(debug_ptr, 4, dst_col)
         return
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 
@@ -314,7 +317,7 @@ def _copy_mamba_state_block(
         # DS conv layout: state_len is the slide axis; copy per dim row.
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
         if src_block_id < 0:
-            _align_guard_trip(debug_ptr, 5)
+            _align_guard_trip(debug_ptr, 5, dst_col)
             return
         dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
         row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
@@ -368,7 +371,7 @@ def _copy_mamba_state_block(
         #   state[bt[dst_col], :conv_width - token_bias]
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
         if src_block_id < 0:
-            _align_guard_trip(debug_ptr, 5)
+            _align_guard_trip(debug_ptr, 5, dst_col)
             return
         src_block_addr = state_base_addr + src_block_id * state_block_stride
         token_bytes = state_inner_size * state_elem_size
@@ -410,11 +413,11 @@ def _copy_mamba_state_block(
     # SMs filled at small batch.
     src_col_biased = src_col.to(tl.int64) + token_bias.to(tl.int64)
     if (src_col_biased < 0) | (src_col_biased >= block_table_stride_req):
-        _align_guard_trip(debug_ptr, 3)
+        _align_guard_trip(debug_ptr, 3, dst_col)
         return
     actual_src_block_id = tl.load(block_table_base + src_col_biased).to(tl.int64)
     if actual_src_block_id < 0:
-        _align_guard_trip(debug_ptr, 5)
+        _align_guard_trip(debug_ptr, 5, dst_col)
         return
     src_addr = state_base_addr + actual_src_block_id * state_block_stride
     # Use natural block data size (inner_size * elem_size), NOT
@@ -928,13 +931,14 @@ class MambaSpecDecodeGPUContext:
         """
         if self.align_debug_buf is None:
             return
-        total, dst_col, src_col, temporal, dest_id, src_id, _, _ = (
+        total, dst_col, src_col, temporal, dest_id, src_id, dst_max, dst_min = (
             self.align_debug_buf.tolist()
         )
         if total:
             logger.warning(
                 "mamba align %s skipped %d impossible state cop(ies):"
-                " dst_col=%d src_col=%d temporal_col=%d dest_id=%d src_id=%d",
+                " dst_col=%d src_col=%d temporal_col=%d dest_id=%d src_id=%d"
+                " dst_col_range=[%d, %d]",
                 where,
                 total,
                 dst_col,
@@ -942,8 +946,11 @@ class MambaSpecDecodeGPUContext:
                 temporal,
                 dest_id,
                 src_id,
+                dst_min,
+                dst_max,
             )
-            self.align_debug_buf.zero_()
+            # Leave dst_col range accumulators monotone across reads.
+            self.align_debug_buf[:6].zero_()
 
     @classmethod
     def create(
@@ -1007,7 +1014,13 @@ class MambaSpecDecodeGPUContext:
             state_dim_row_stride=torch.zeros(
                 total_states, dtype=torch.int64, device=device
             ),
-            align_debug_buf=torch.zeros(8, dtype=torch.int64, device=device),
+            align_debug_buf=torch.cat(
+                (
+                    torch.zeros(6, dtype=torch.int64, device=device),
+                    # [6]=max dst_col, [7]=min dst_col range sentinels.
+                    torch.tensor([-(2**62), 2**62], dtype=torch.int64, device=device),
+                )
+            ),
             block_size=mamba_spec.block_size,
             num_states=total_states,
             mamba_group_ids=mamba_group_ids,
@@ -1430,6 +1443,17 @@ class MambaSpecDecodeGPUContext:
         )
         if envs.VLLM_MAMBA_ALIGN_DEBUG:
             self.warn_if_align_guard_tripped("postprocess align")
+            valid = idx_mapping[idx_mapping >= 0]
+            if valid.numel():
+                computed = new_num_computed_tokens_gpu[valid]
+                state_idx = state_idx_gpu[valid]
+                logger.info(
+                    "mamba align inputs: num_computed=[%d..%d] state_idx=[%d..%d]",
+                    int(computed.min()),
+                    int(computed.max()),
+                    int(state_idx.min()),
+                    int(state_idx.max()),
+                )
 
 
 @dataclasses.dataclass
