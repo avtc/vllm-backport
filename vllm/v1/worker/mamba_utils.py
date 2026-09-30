@@ -213,28 +213,13 @@ def _reinterpret_u64_as_i64(value: int) -> int:
 
 
 @triton.jit
-def _align_guard_trip(
-    debug_ptr,
-    kind,
-    row,
-    src_col,
-    dst_col,
-    token_bias,
-    bad_id,
-    state_idx,
-):
-    # Record that an align state copy was skipped for impossible inputs
-    # (negative/out-of-range block-table columns or negative block ids);
-    # the first offender's parameters are captured once for diagnosis.
-    tl.atomic_add(debug_ptr + 0, 1)
-    won = tl.atomic_cas(debug_ptr + 1, 0, kind)
-    if won == 0:
-        tl.store(debug_ptr + 2, row)
-        tl.store(debug_ptr + 3, src_col)
-        tl.store(debug_ptr + 4, dst_col)
-        tl.store(debug_ptr + 5, token_bias)
-        tl.store(debug_ptr + 6, bad_id)
-        tl.store(debug_ptr + 7, state_idx)
+def _align_guard_trip(debug_ptr, kind):
+    # Count an align state copy skipped for impossible inputs
+    # (negative/out-of-range block-table columns or negative block ids).
+    # debug layout: [0]=total skips, [1]=dst_col, [2]=src_col,
+    # [3]=temporal src col, [4]=dest block id, [5]=src block id.
+    tl.atomic_add(debug_ptr, 1)
+    tl.atomic_add(debug_ptr + kind, 1)
 
 
 @triton.jit
@@ -255,8 +240,7 @@ def _copy_mamba_state_block(
     # DS conv row metadata. Zero keeps the single-region copy path.
     state_dim_row_count_ptr,
     state_dim_row_stride_ptr,
-    # int64[8] diagnostic register: [0]=skip count, [1]=kind of first skip,
-    # [2..7]=row/src_col/dst_col/token_bias/offending id/state_idx.
+    # int64[8] diagnostic register (see _align_guard_trip).
     debug_ptr,
     tile_idx,
     COPY_BLOCK_SIZE: tl.constexpr,
@@ -305,14 +289,10 @@ def _copy_mamba_state_block(
     # becomes a wild address (IMA). Legitimate copies always use in-range
     # columns and non-negative ids, so skipping is free.
     if (dst_col < 0) | (dst_col >= block_table_stride_req):
-        _align_guard_trip(
-            debug_ptr, 1, bt_row_idx, src_col, dst_col, token_bias, 0, state_idx
-        )
+        _align_guard_trip(debug_ptr, 1)
         return
     if (src_col < 0) | (src_col >= block_table_stride_req):
-        _align_guard_trip(
-            debug_ptr, 2, bt_row_idx, src_col, dst_col, token_bias, 0, state_idx
-        )
+        _align_guard_trip(debug_ptr, 2)
         return
 
     # Widen block ids to int64 before they reach `block_id * state_block_stride`
@@ -320,16 +300,7 @@ def _copy_mamba_state_block(
     # and Triton would otherwise do the multiply in int32 and wrap.
     dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
     if dest_block_id < 0:
-        _align_guard_trip(
-            debug_ptr,
-            4,
-            bt_row_idx,
-            src_col,
-            dst_col,
-            token_bias,
-            dest_block_id,
-            state_idx,
-        )
+        _align_guard_trip(debug_ptr, 4)
         return
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 
@@ -343,16 +314,7 @@ def _copy_mamba_state_block(
         # DS conv layout: state_len is the slide axis; copy per dim row.
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
         if src_block_id < 0:
-            _align_guard_trip(
-                debug_ptr,
-                5,
-                bt_row_idx,
-                src_col,
-                dst_col,
-                token_bias,
-                src_block_id,
-                state_idx,
-            )
+            _align_guard_trip(debug_ptr, 5)
             return
         dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
         row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
@@ -406,16 +368,7 @@ def _copy_mamba_state_block(
         #   state[bt[dst_col], :conv_width - token_bias]
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
         if src_block_id < 0:
-            _align_guard_trip(
-                debug_ptr,
-                5,
-                bt_row_idx,
-                src_col,
-                dst_col,
-                token_bias,
-                src_block_id,
-                state_idx,
-            )
+            _align_guard_trip(debug_ptr, 5)
             return
         src_block_addr = state_base_addr + src_block_id * state_block_stride
         token_bytes = state_inner_size * state_elem_size
@@ -457,22 +410,11 @@ def _copy_mamba_state_block(
     # SMs filled at small batch.
     src_col_biased = src_col.to(tl.int64) + token_bias.to(tl.int64)
     if (src_col_biased < 0) | (src_col_biased >= block_table_stride_req):
-        _align_guard_trip(
-            debug_ptr, 3, bt_row_idx, src_col, dst_col, token_bias, 0, state_idx
-        )
+        _align_guard_trip(debug_ptr, 3)
         return
     actual_src_block_id = tl.load(block_table_base + src_col_biased).to(tl.int64)
     if actual_src_block_id < 0:
-        _align_guard_trip(
-            debug_ptr,
-            5,
-            bt_row_idx,
-            src_col,
-            dst_col,
-            token_bias,
-            actual_src_block_id,
-            state_idx,
-        )
+        _align_guard_trip(debug_ptr, 5)
         return
     src_addr = state_base_addr + actual_src_block_id * state_block_stride
     # Use natural block data size (inner_size * elem_size), NOT
@@ -958,8 +900,8 @@ class MambaSpecDecodeGPUContext:
     # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
     aligned_state_indices: torch.Tensor | None = None
 
-    # int64[8] align-guard diagnostic register: [0]=skip count, [1]=kind,
-    # [2..7]=first offender row/src_col/dst_col/token_bias/id/state_idx.
+    # int64[8] align-guard diagnostic register: [0]=total skips, [1..5]=
+    # per-kind counts (dst col, src col, temporal col, dest id, src id).
     align_debug_buf: torch.Tensor | None = None
 
     # Per-request staging buffers (CPU+GPU mirrors). The runner stages
@@ -980,26 +922,26 @@ class MambaSpecDecodeGPUContext:
         """Sync-read the align-guard register and warn once per trip batch.
 
         Debug-only (VLLM_MAMBA_ALIGN_DEBUG): host sync per launch.
+        Register layout: [0]=total skips, then counts per guard kind -
+        [1]=dst column, [2]=src column, [3]=temporal src column,
+        [4]=dest block id, [5]=src block id.
         """
         if self.align_debug_buf is None:
             return
-        count, kind, row, src_col, dst_col, bias, bad_id, state_idx = (
+        total, dst_col, src_col, temporal, dest_id, src_id, _, _ = (
             self.align_debug_buf.tolist()
         )
-        if count:
+        if total:
             logger.warning(
-                "mamba align %s skipped %d impossible state cop(ies); first:"
-                " kind=%d row=%d src_col=%d dst_col=%d token_bias=%d id=%d"
-                " state_idx=%d",
+                "mamba align %s skipped %d impossible state cop(ies):"
+                " dst_col=%d src_col=%d temporal_col=%d dest_id=%d src_id=%d",
                 where,
-                count,
-                kind,
-                row,
-                src_col,
+                total,
                 dst_col,
-                bias,
-                bad_id,
-                state_idx,
+                src_col,
+                temporal,
+                dest_id,
+                src_id,
             )
             self.align_debug_buf.zero_()
 

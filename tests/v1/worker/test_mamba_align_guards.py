@@ -111,8 +111,7 @@ def test_align_copy_negative_dst_col_skips():
     ctx.run(num_accepted=1, state_idx=0, new_num_computed=0)
     torch.cuda.synchronize()
     assert ctx.align_debug[0].item() >= NUM_STATES
-    assert ctx.align_debug[1].item() == 1
-    assert ctx.align_debug[4].item() == -1  # dst_col
+    assert ctx.align_debug[1].item() >= 1  # dst_col guard kind
 
 
 @requires_cuda
@@ -122,8 +121,7 @@ def test_align_copy_fresh_state_skips():
     ctx.run(num_accepted=1, state_idx=-1, new_num_computed=8)
     torch.cuda.synchronize()
     assert ctx.align_debug[0].item() >= NUM_STATES
-    assert ctx.align_debug[1].item() == 2
-    assert ctx.align_debug[3].item() == -1  # src_col
+    assert ctx.align_debug[2].item() >= 1  # src_col guard kind
 
 
 @requires_cuda
@@ -132,6 +130,5 @@ def test_align_copy_freed_block_id_skips():
     # dst col 1 valid, but the row holds a freed -1 id.
     ctx.run(num_accepted=1, state_idx=0, new_num_computed=8)
     torch.cuda.synchronize()
-    assert ctx.align_debug[0].item() >= 1
-    assert ctx.align_debug[1].item() == 4
-    assert ctx.align_debug[6].item() == -1  # offending id
+    assert ctx.align_debug[0].item() >= NUM_STATES
+    assert ctx.align_debug[5].item() >= 1  # src-id guard kind (temporal+conv)
