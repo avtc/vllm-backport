@@ -206,6 +206,7 @@ if TYPE_CHECKING:
     VLLM_MAMBA_ALIGN_DEBUG: bool = False
     VLLM_PP_SYNC_BROADCAST: bool = False
     VLLM_PP_FAST_META: bool = False
+    VLLM_PP_TIMING_DEBUG: bool = False
     VLLM_EMBED_GATHER_DEBUG: bool = False
     # Fused decode-time MoE block (router + topk + alignment + shared expert
     # + combine in three kernels; routed experts stay on Marlin). Only the
@@ -2491,6 +2492,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HC_FUSED_INT8": lambda: bool(int(os.getenv("VLLM_HC_FUSED_INT8", "1"))),
     "VLLM_PP_DEFER_RECV": lambda: bool(int(os.getenv("VLLM_PP_DEFER_RECV", "1"))),
     "VLLM_PP_FAST_META": lambda: bool(int(os.getenv("VLLM_PP_FAST_META", "0"))),
+    "VLLM_PP_TIMING_DEBUG": lambda: bool(int(os.getenv("VLLM_PP_TIMING_DEBUG", "0"))),
     "VLLM_PP_SYNC_BROADCAST": lambda: bool(
         int(os.getenv("VLLM_PP_SYNC_BROADCAST", "0"))
     ),

@@ -138,6 +138,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+from vllm.v1.worker.gpu.pp_timing import timer as pp_timer
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
     BatchSharder,
@@ -1589,7 +1590,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
-            self.update_pp_decode_requests()
+            with pp_timer.phase("deferred_wave"):
+                self.update_pp_decode_requests()
+            pp_timer.step_done()
             if envs.VLLM_PP_DEBUG_SYNC_DEFERRED:
                 # Debug aid for the PP deferred-postprocess IMA: drain the
                 # deferred wave so a fault inside it surfaces in this call's
@@ -1666,10 +1669,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.observability_config.cudagraph_metrics:
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
             assert batch_req_state is not None
-            input_batch = self.prepare_inputs(
-                scheduler_output, batch_req_state, batch_desc
-            )
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
+            with pp_timer.phase("prepare"):
+                input_batch = self.prepare_inputs(
+                    scheduler_output, batch_req_state, batch_desc
+                )
+                block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1849,6 +1853,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
+        self._fwd_timing = pp_timer.phase("forward")
+        self._fwd_timing.__enter__()
         self.step_timing.forward_start()
 
         # Run model.
@@ -1932,6 +1938,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts=routed_experts,
             cudagraph_stats=cudagraph_stats,
         )
+        self._fwd_timing.__exit__(None, None, None)
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
@@ -1968,7 +1975,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
-            all_decode_next = self.pp_handler.receive(input_batch)
+            with pp_timer.phase("recv_bcast"):
+                all_decode_next = self.pp_handler.receive(input_batch)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)
@@ -1988,9 +1996,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager, hidden_states, input_batch
         )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        with pp_timer.phase("sample"):
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Fence the sampler's producer stream: code between sample() and

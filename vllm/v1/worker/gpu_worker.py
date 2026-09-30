@@ -201,15 +201,20 @@ class DeferredRecvIntermediateTensors(AsyncIntermediateTensors):
         self._recv = recv
 
     def wait_for_comm(self) -> None:
+        from vllm.v1.worker.gpu.pp_timing import timer
+
         if object.__getattribute__(self, "_comm_waited"):
             return
         try:
-            tensor_dict, handles, postprocess = object.__getattribute__(self, "_recv")()
-            assert tensor_dict is not None
-            object.__setattr__(self, "tensors", tensor_dict)
-            object.__setattr__(self, "_comm_handles", handles)
-            object.__setattr__(self, "_comm_postprocess", postprocess)
-            super().wait_for_comm()
+            with timer.phase("recv_wait"):
+                tensor_dict, handles, postprocess = object.__getattribute__(
+                    self, "_recv"
+                )()
+                assert tensor_dict is not None
+                object.__setattr__(self, "tensors", tensor_dict)
+                object.__setattr__(self, "_comm_handles", handles)
+                object.__setattr__(self, "_comm_postprocess", postprocess)
+                super().wait_for_comm()
         except Exception:
             # Any failure (receive, handle wait, postprocess) is one-shot:
             # retrying cannot succeed, and a second attempt from a trailing
@@ -1319,11 +1324,14 @@ class Worker(WorkerBase):
         # Non-blocking send of the intermediate tensors. The metadata handle
         # is reaped lazily by the GroupCoordinator; the device handles are
         # waited at the top of the next step.
-        handles = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+        from vllm.v1.worker.gpu.pp_timing import timer
+
+        with timer.phase("send"):
+            handles = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
         self._pp_send_work = handles[1:]
 
         return None
