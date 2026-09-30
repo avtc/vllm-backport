@@ -7,6 +7,7 @@ from typing import Any, NamedTuple
 
 import torch
 
+from vllm import envs
 from vllm.config import CacheConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -212,6 +213,31 @@ def _reinterpret_u64_as_i64(value: int) -> int:
 
 
 @triton.jit
+def _align_guard_trip(
+    debug_ptr,
+    kind,
+    row,
+    src_col,
+    dst_col,
+    token_bias,
+    bad_id,
+    state_idx,
+):
+    # Record that an align state copy was skipped for impossible inputs
+    # (negative/out-of-range block-table columns or negative block ids);
+    # the first offender's parameters are captured once for diagnosis.
+    tl.atomic_add(debug_ptr + 0, 1)
+    won = tl.atomic_cas(debug_ptr + 1, 0, kind)
+    if won == 0:
+        tl.store(debug_ptr + 2, row)
+        tl.store(debug_ptr + 3, src_col)
+        tl.store(debug_ptr + 4, dst_col)
+        tl.store(debug_ptr + 5, token_bias)
+        tl.store(debug_ptr + 6, bad_id)
+        tl.store(debug_ptr + 7, state_idx)
+
+
+@triton.jit
 def _copy_mamba_state_block(
     state_idx,
     bt_row_idx,
@@ -229,6 +255,9 @@ def _copy_mamba_state_block(
     # DS conv row metadata. Zero keeps the single-region copy path.
     state_dim_row_count_ptr,
     state_dim_row_stride_ptr,
+    # int64[8] diagnostic register: [0]=skip count, [1]=kind of first skip,
+    # [2..7]=row/src_col/dst_col/token_bias/offending id/state_idx.
+    debug_ptr,
     tile_idx,
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
@@ -269,10 +298,39 @@ def _copy_mamba_state_block(
     block_table_typed = group_base_addr.to(tl.pointer_type(tl.int32))
     block_table_base = block_table_typed + bt_row_idx * block_table_stride_req
 
+    # Deferred PP postprocess can observe impossible inputs: a freed slot's
+    # num_computed can collapse to 0 (dst_col -1), a request that never ran a
+    # forward keeps state_idx -1, and freed table rows can hold -1 ids.
+    # Reading the table at such columns yields an arbitrary block id, which
+    # becomes a wild address (IMA). Legitimate copies always use in-range
+    # columns and non-negative ids, so skipping is free.
+    if (dst_col < 0) | (dst_col >= block_table_stride_req):
+        _align_guard_trip(
+            debug_ptr, 1, bt_row_idx, src_col, dst_col, token_bias, 0, state_idx
+        )
+        return
+    if (src_col < 0) | (src_col >= block_table_stride_req):
+        _align_guard_trip(
+            debug_ptr, 2, bt_row_idx, src_col, dst_col, token_bias, 0, state_idx
+        )
+        return
+
     # Widen block ids to int64 before they reach `block_id * state_block_stride`
     # below: state_block_stride can exceed 2**31 bytes for large mamba caches,
     # and Triton would otherwise do the multiply in int32 and wrap.
     dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
+    if dest_block_id < 0:
+        _align_guard_trip(
+            debug_ptr,
+            4,
+            bt_row_idx,
+            src_col,
+            dst_col,
+            token_bias,
+            dest_block_id,
+            state_idx,
+        )
+        return
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 
     is_conv_state = conv_width > 0
@@ -284,6 +342,18 @@ def _copy_mamba_state_block(
             return
         # DS conv layout: state_len is the slide axis; copy per dim row.
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
+        if src_block_id < 0:
+            _align_guard_trip(
+                debug_ptr,
+                5,
+                bt_row_idx,
+                src_col,
+                dst_col,
+                token_bias,
+                src_block_id,
+                state_idx,
+            )
+            return
         dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
         row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
         src_block_addr = state_base_addr + src_block_id * state_block_stride
@@ -335,6 +405,18 @@ def _copy_mamba_state_block(
         #   state[bt[src_col], token_bias:] ->
         #   state[bt[dst_col], :conv_width - token_bias]
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
+        if src_block_id < 0:
+            _align_guard_trip(
+                debug_ptr,
+                5,
+                bt_row_idx,
+                src_col,
+                dst_col,
+                token_bias,
+                src_block_id,
+                state_idx,
+            )
+            return
         src_block_addr = state_base_addr + src_block_id * state_block_stride
         token_bytes = state_inner_size * state_elem_size
         num_dst_tokens = conv_width - token_bias
@@ -373,7 +455,25 @@ def _copy_mamba_state_block(
     # Temporal state: copy state[bt[src_col + token_bias]] -> state[bt[dst_col]]
     # Body u64 range is partitioned across TEMPORAL_TILES CTAs to keep the
     # SMs filled at small batch.
-    actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
+    src_col_biased = src_col.to(tl.int64) + token_bias.to(tl.int64)
+    if (src_col_biased < 0) | (src_col_biased >= block_table_stride_req):
+        _align_guard_trip(
+            debug_ptr, 3, bt_row_idx, src_col, dst_col, token_bias, 0, state_idx
+        )
+        return
+    actual_src_block_id = tl.load(block_table_base + src_col_biased).to(tl.int64)
+    if actual_src_block_id < 0:
+        _align_guard_trip(
+            debug_ptr,
+            5,
+            bt_row_idx,
+            src_col,
+            dst_col,
+            token_bias,
+            actual_src_block_id,
+            state_idx,
+        )
+        return
     src_addr = state_base_addr + actual_src_block_id * state_block_stride
     # Use natural block data size (inner_size * elem_size), NOT
     # state_block_stride which is the page stride and can exceed the
@@ -413,6 +513,8 @@ def postprocess_mamba_fused_kernel(
     # DS conv row metadata. Zero keeps the single-region copy path.
     state_dim_row_count_ptr,  # int32: per-block dim row count for DS conv
     state_dim_row_stride_ptr,  # int64: bytes between rows for DS conv
+    # int64[8] align-guard diagnostic register (see _align_guard_trip).
+    align_debug_ptr,
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
     # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
@@ -529,6 +631,7 @@ def postprocess_mamba_fused_kernel(
         state_group_indices_ptr,
         state_dim_row_count_ptr,
         state_dim_row_stride_ptr,
+        align_debug_ptr,
         tile_idx,
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
@@ -600,6 +703,8 @@ def precopy_mamba_align_fused_kernel(
     state_group_indices_ptr,
     state_dim_row_count_ptr,
     state_dim_row_stride_ptr,
+    # int64[8] align-guard diagnostic register (see _align_guard_trip).
+    align_debug_ptr,
     idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx (-1 to skip)
     num_reqs,
     COPY_BLOCK_SIZE: tl.constexpr,
@@ -661,6 +766,7 @@ def precopy_mamba_align_fused_kernel(
         state_group_indices_ptr,
         state_dim_row_count_ptr,
         state_dim_row_stride_ptr,
+        align_debug_ptr,
         tile_idx,
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
@@ -852,6 +958,10 @@ class MambaSpecDecodeGPUContext:
     # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
     aligned_state_indices: torch.Tensor | None = None
 
+    # int64[8] align-guard diagnostic register: [0]=skip count, [1]=kind,
+    # [2..7]=first offender row/src_col/dst_col/token_bias/id/state_idx.
+    align_debug_buf: torch.Tensor | None = None
+
     # Per-request staging buffers (CPU+GPU mirrors). The runner stages
     # values into the CPU view in ``_prepare_inputs`` and the fused kernel
     # reads the GPU side. These only exist when the postprocess kernel is
@@ -865,6 +975,33 @@ class MambaSpecDecodeGPUContext:
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
+
+    def warn_if_align_guard_tripped(self, where: str) -> None:
+        """Sync-read the align-guard register and warn once per trip batch.
+
+        Debug-only (VLLM_MAMBA_ALIGN_DEBUG): host sync per launch.
+        """
+        if self.align_debug_buf is None:
+            return
+        count, kind, row, src_col, dst_col, bias, bad_id, state_idx = (
+            self.align_debug_buf.tolist()
+        )
+        if count:
+            logger.warning(
+                "mamba align %s skipped %d impossible state cop(ies); first:"
+                " kind=%d row=%d src_col=%d dst_col=%d token_bias=%d id=%d"
+                " state_idx=%d",
+                where,
+                count,
+                kind,
+                row,
+                src_col,
+                dst_col,
+                bias,
+                bad_id,
+                state_idx,
+            )
+            self.align_debug_buf.zero_()
 
     @classmethod
     def create(
@@ -928,6 +1065,7 @@ class MambaSpecDecodeGPUContext:
             state_dim_row_stride=torch.zeros(
                 total_states, dtype=torch.int64, device=device
             ),
+            align_debug_buf=torch.zeros(8, dtype=torch.int64, device=device),
             block_size=mamba_spec.block_size,
             num_states=total_states,
             mamba_group_ids=mamba_group_ids,
@@ -1233,6 +1371,7 @@ class MambaSpecDecodeGPUContext:
             self.state_group_indices,
             self.state_dim_row_count,
             self.state_dim_row_stride,
+            self.align_debug_buf,
             self.num_accepted_tokens_out,
             None,  # idx_mapping: V1 decision arrays are already in req order
             num_reqs,
@@ -1241,6 +1380,8 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
+        if envs.VLLM_MAMBA_ALIGN_DEBUG:
+            self.warn_if_align_guard_tripped("postprocess")
 
     def run_fused_precopy(
         self,
@@ -1279,6 +1420,7 @@ class MambaSpecDecodeGPUContext:
             self.state_group_indices,
             self.state_dim_row_count,
             self.state_dim_row_stride,
+            self.align_debug_buf,
             idx_mapping,
             num_reqs,
             COPY_BLOCK_SIZE=1024,
@@ -1286,6 +1428,8 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=idx_mapping is not None,
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
+        if envs.VLLM_MAMBA_ALIGN_DEBUG:
+            self.warn_if_align_guard_tripped("precopy")
 
     def run_fused_postprocess_align(
         self,
@@ -1331,6 +1475,7 @@ class MambaSpecDecodeGPUContext:
             self.state_group_indices,
             self.state_dim_row_count,
             self.state_dim_row_stride,
+            self.align_debug_buf,
             num_accepted_tokens_gpu,
             idx_mapping,
             num_reqs,
@@ -1341,6 +1486,8 @@ class MambaSpecDecodeGPUContext:
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
+        if envs.VLLM_MAMBA_ALIGN_DEBUG:
+            self.warn_if_align_guard_tripped("postprocess align")
 
 
 @dataclasses.dataclass

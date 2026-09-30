@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     # ranks overlaps the previous rank's GPU work (0 restores the old order).
     VLLM_PP_DEFER_RECV: bool = True
     VLLM_PP_DEBUG_SYNC_DEFERRED: bool = False
+    VLLM_MAMBA_ALIGN_DEBUG: bool = False
     VLLM_EMBED_GATHER_DEBUG: bool = False
     # Fused decode-time MoE block (router + topk + alignment + shared expert
     # + combine in three kernels; routed experts stay on Marlin). Only the
@@ -2487,6 +2488,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_HC_FUSED_INT8": lambda: bool(int(os.getenv("VLLM_HC_FUSED_INT8", "1"))),
     "VLLM_PP_DEFER_RECV": lambda: bool(int(os.getenv("VLLM_PP_DEFER_RECV", "1"))),
+    "VLLM_MAMBA_ALIGN_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_MAMBA_ALIGN_DEBUG", "0"))
+    ),
     "VLLM_PP_DEBUG_SYNC_DEFERRED": lambda: bool(
         int(os.getenv("VLLM_PP_DEBUG_SYNC_DEFERRED", "0"))
     ),
