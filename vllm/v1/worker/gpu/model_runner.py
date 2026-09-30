@@ -1577,6 +1577,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
+            if envs.VLLM_PP_DEBUG_SYNC_DEFERRED:
+                # Debug aid for the PP deferred-postprocess IMA: drain the
+                # deferred wave so a fault inside it surfaces in this call's
+                # traceback instead of an arbitrary later async checkpoint,
+                # and any race with subsequently launched kernels is excluded.
+                torch.cuda.synchronize()
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)

@@ -202,6 +202,7 @@ if TYPE_CHECKING:
     # the intermediate tensors, so host-side input preparation on non-first
     # ranks overlaps the previous rank's GPU work (0 restores the old order).
     VLLM_PP_DEFER_RECV: bool = True
+    VLLM_PP_DEBUG_SYNC_DEFERRED: bool = False
     # Fused decode-time MoE block (router + topk + alignment + shared expert
     # + combine in three kernels; routed experts stay on Marlin). Only the
     # single-GPU MoE layout qualifies - TP/EP fall back automatically.
@@ -2485,6 +2486,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_HC_FUSED_INT8": lambda: bool(int(os.getenv("VLLM_HC_FUSED_INT8", "1"))),
     "VLLM_PP_DEFER_RECV": lambda: bool(int(os.getenv("VLLM_PP_DEFER_RECV", "1"))),
+    "VLLM_PP_DEBUG_SYNC_DEFERRED": lambda: bool(
+        int(os.getenv("VLLM_PP_DEBUG_SYNC_DEFERRED", "0"))
+    ),
     "VLLM_MOE_FUSED_DECODE": lambda: bool(int(os.getenv("VLLM_MOE_FUSED_DECODE", "1"))),
     "VLLM_QSA_FP8_KV": lambda: os.getenv("VLLM_QSA_FP8_KV", ""),
     # Debug logging for --enable-mfu-metrics

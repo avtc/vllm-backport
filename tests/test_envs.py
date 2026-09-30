@@ -642,3 +642,32 @@ class TestCTSharedExpertTPReplicate:
         if hasattr(envs.__getattr__, "cache_clear"):
             envs.__getattr__.cache_clear()
         assert envs.VLLM_CT_SHARED_EXPERT_TP_REPLICATE is False
+
+
+def test_pp_debug_sync_deferred_env():
+    """VLLM_PP_DEBUG_SYNC_DEFERRED gates the post-deferred-wave drain."""
+    import importlib
+    import os
+
+    from vllm import envs
+
+    key = "VLLM_PP_DEBUG_SYNC_DEFERRED"
+    old = os.environ.get(key)
+    try:
+        os.environ[key] = "1"
+        envs.__getattr__.cache_clear() if hasattr(
+            envs.__getattr__, "cache_clear"
+        ) else None
+        assert envs.VLLM_PP_DEBUG_SYNC_DEFERRED is True
+        os.environ[key] = "0"
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+        assert envs.VLLM_PP_DEBUG_SYNC_DEFERRED is False
+    finally:
+        if old is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
+        if hasattr(envs.__getattr__, "cache_clear"):
+            envs.__getattr__.cache_clear()
+    importlib.reload(envs)
