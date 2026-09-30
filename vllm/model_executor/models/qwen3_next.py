@@ -8,6 +8,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -17,6 +18,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
@@ -93,6 +95,9 @@ def _should_use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     )
 
 
+logger = init_logger(__name__)
+
+
 def _should_replicate_misaligned_shared_expert(
     intermediate_size: int,
     tp_size: int,
@@ -108,6 +113,22 @@ def _should_replicate_misaligned_shared_expert(
         return False
 
     if enable_expert_parallel or is_sequence_parallel:
+        return True
+
+    # Escape hatch for group-quantized shared experts that no practical TP
+    # size can shard (e.g. intermediate 640 with group 64: shardable TP
+    # sizes are 1, 2, 5, 10). Replicating costs one full copy
+    # per rank (the same layout EP mode uses) instead of refusing to boot.
+    if envs.VLLM_SHARED_EXPERT_REPLICATE_MISALIGNED:
+        logger.warning(
+            "Replicating the misaligned group-quantized shared expert "
+            "(intermediate %d, TP %d, group %d): each rank carries a full "
+            "copy. Set VLLM_SHARED_EXPERT_REPLICATE_MISALIGNED=0 to restore "
+            "the refusal.",
+            intermediate_size,
+            tp_size,
+            group_size,
+        )
         return True
 
     if remainder != 0:

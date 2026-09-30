@@ -198,6 +198,9 @@ if TYPE_CHECKING:
     # Fused Triton kernels for the pack-quantized INT8 hyper-connection
     # projections at decode batch sizes (0 restores the Marlin path).
     VLLM_HC_FUSED_INT8: bool = True
+    # Replicate a group-quantized shared expert no practical TP size can
+    # shard (full copy per rank, the EP layout) instead of refusing to boot.
+    VLLM_SHARED_EXPERT_REPLICATE_MISALIGNED: bool = False
     # Defer the pipeline-parallel receive until the model runner first reads
     # the intermediate tensors, so host-side input preparation on non-first
     # ranks overlaps the previous rank's GPU work (0 restores the old order).
@@ -2484,6 +2487,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_PLE_PREFETCH_BATCH", "1024")
     ),
     "VLLM_HC_FUSED_INT8": lambda: bool(int(os.getenv("VLLM_HC_FUSED_INT8", "1"))),
+    "VLLM_SHARED_EXPERT_REPLICATE_MISALIGNED": lambda: bool(
+        int(os.getenv("VLLM_SHARED_EXPERT_REPLICATE_MISALIGNED", "0"))
+    ),
     "VLLM_PP_DEFER_RECV": lambda: bool(int(os.getenv("VLLM_PP_DEFER_RECV", "1"))),
     "VLLM_MOE_FUSED_DECODE": lambda: bool(int(os.getenv("VLLM_MOE_FUSED_DECODE", "1"))),
     "VLLM_QSA_FP8_KV": lambda: os.getenv("VLLM_QSA_FP8_KV", ""),
