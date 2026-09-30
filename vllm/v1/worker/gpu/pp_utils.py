@@ -144,8 +144,8 @@ class PPHandler:
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
+        cur = torch.cuda.current_stream(self.device)
         if envs.VLLM_MAMBA_ALIGN_DEBUG:
-            cur = torch.cuda.current_stream(self.device)
             logger.info(
                 "pp consume pre-wait: stream_match=%s event_pending=%s buf=0x%x"
                 " cur=0x%x main=0x%x",
