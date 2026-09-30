@@ -301,6 +301,14 @@ class PPHandler:
         if current_platform.is_xpu():
             self.main_stream.synchronize()
 
+        if envs.VLLM_PP_SYNC_BROADCAST:
+            # Escape hatch / diagnostic: the pad+stack copies below have read
+            # unwritten sampler outputs on the first graph-replayed decode
+            # step (pre-wire probe combined0=garbage while the receiver got
+            # the same bytes). A full device sync orders the copies after
+            # every producer stream regardless of which stream the runner
+            # executes on.
+            torch.cuda.synchronize()
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(torch.cuda.current_stream(self.device))
             send_tokens = torch.nn.functional.pad(
@@ -317,11 +325,19 @@ class PPHandler:
                 # Post-copy, pre-wire content: these .item() reads sync the
                 # broadcast stream past the stack kernel, so they show the
                 # exact bytes NCCL is about to ship.
+                pre_wire = (int(combined[0, 0].item()), int(combined[1, 0].item()))
+                pre_send0 = int(send_tokens[0, 0].item())
+                # Split 'the copy raced its producers' from 'the sources
+                # held garbage': after a full sync the sources must be final.
+                torch.cuda.synchronize()
                 logger.info(
-                    "pp send: combined0=(%d,%d) send0=%d cur=0x%x main=0x%x",
-                    int(combined[0, 0].item()),
-                    int(combined[1, 0].item()),
-                    int(send_tokens[0, 0].item()),
+                    "pp send: combined0=%s send0=%d src_after_sync=(%d,%d,%d)"
+                    " cur=0x%x main=0x%x",
+                    pre_wire,
+                    pre_send0,
+                    int(num_sampled[:1].item()),
+                    int(num_rejected[:1].item()),
+                    int(sampled_token_ids[0, 0].item()),
                     torch.cuda.current_stream(self.device).cuda_stream,
                     self.main_stream.cuda_stream,
                 )
