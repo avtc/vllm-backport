@@ -4,7 +4,10 @@
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
+
+if HAS_TRITON:
+    from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
 
 
 @triton.jit
@@ -132,6 +135,10 @@ def _qsa_pre_indexer_kernel(
     CACHE_HAS_ROPE_POS: tl.constexpr,
     MROPE_H: tl.constexpr,
     MROPE_W: tl.constexpr,
+    # SM86 Triton cannot compile fp8e4nv pointer types: the state cache,
+    # compressed cache and q output arrive as uint8 views and rows are
+    # decoded/encoded in-register (bit-exact with native converts).
+    CACHE_FP8: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     # K work occupies the first programs; the remaining programs tile Q. This
@@ -184,14 +191,24 @@ def _qsa_pre_indexer_kernel(
             MROPE_H,
             MROPE_W,
         )
-        tl.store(
-            q_out_ptr
-            + tokens[:, None, None] * q_out_stride_token
-            + heads[None, :, None] * q_out_stride_head
-            + dims[None, None, :],
-            y,
-            mask=mask,
-        )
+        if CACHE_FP8:
+            tl.store(
+                q_out_ptr
+                + tokens[:, None, None] * q_out_stride_token
+                + heads[None, :, None] * q_out_stride_head
+                + dims[None, None, :],
+                _encode_fp8_u8(y.to(tl.float32), False),
+                mask=mask,
+            )
+        else:
+            tl.store(
+                q_out_ptr
+                + tokens[:, None, None] * q_out_stride_token
+                + heads[None, :, None] * q_out_stride_head
+                + dims[None, None, :],
+                y,
+                mask=mask,
+            )
 
     if pid < num_k_work:
         # One work item owns one completed compression group. Work item zero
@@ -250,19 +267,40 @@ def _qsa_pre_indexer_kernel(
                 + safe_state_block * state_cache_stride_block
                 + (source_positions % STATE_SIZE)[:, None] * state_cache_stride_token
             )
-            # Only the first completed group can cross the chunk boundary. Select
-            # historical rows from the ring without issuing two masked loads.
-            source_base = tl.where(source_in_chunk[:, None], current_base, cached_base)
-            # Pointer selection obscures alignment from Triton's analysis.
-            source_base = tl.multiple_of(source_base, (8, 8))
             source_valid = tl.where(
                 source_in_chunk, source_tokens_valid, state_block_valid
             )
-            source = tl.load(
-                source_base + dims[None, :],
-                mask=valid & source_valid[:, None],
-                other=0.0,
-            ).to(tl.float32)
+            if CACHE_FP8:
+                # The state ring is a uint8 view; select values, not the
+                # differently-typed pointers.
+                cur = tl.load(
+                    current_base + dims[None, :],
+                    mask=valid & source_in_chunk[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                cached = _decode_fp8_f32(
+                    tl.load(
+                        cached_base + dims[None, :],
+                        mask=valid & (~source_in_chunk)[:, None],
+                        other=0,
+                    ),
+                    False,
+                )
+                source = tl.where(source_in_chunk[:, None], cur, cached)
+            else:
+                # Only the first completed group can cross the chunk boundary.
+                # Select historical rows from the ring without issuing two
+                # masked loads.
+                source_base = tl.where(
+                    source_in_chunk[:, None], current_base, cached_base
+                )
+                # Pointer selection obscures alignment from Triton's analysis.
+                source_base = tl.multiple_of(source_base, (8, 8))
+                source = tl.load(
+                    source_base + dims[None, :],
+                    mask=valid & source_valid[:, None],
+                    other=0.0,
+                ).to(tl.float32)
             # Match the unfused path's BF16 pooled tensor before RMSNorm.
             pooled = (
                 (tl.sum(source, axis=0) / COMPRESS_RATIO).to(tl.bfloat16).to(tl.float32)
@@ -334,14 +372,25 @@ def _qsa_pre_indexer_kernel(
             )
             compressed_block = (compressed_slot // COMP_PAGE_SIZE).to(tl.int64)
             compressed_row = compressed_slot % COMP_PAGE_SIZE
-            tl.store(
-                compressed_cache_ptr
-                + compressed_block * compressed_cache_stride_block
-                + compressed_row * compressed_cache_stride_token
-                + dims,
-                tl.reshape(y, (D,)),
-                mask=valid,
-            )
+            y_flat = tl.reshape(y, (D,))
+            if CACHE_FP8:
+                tl.store(
+                    compressed_cache_ptr
+                    + compressed_block * compressed_cache_stride_block
+                    + compressed_row * compressed_cache_stride_token
+                    + dims,
+                    _encode_fp8_u8(y_flat.to(tl.float32), False),
+                    mask=valid,
+                )
+            else:
+                tl.store(
+                    compressed_cache_ptr
+                    + compressed_block * compressed_cache_stride_block
+                    + compressed_row * compressed_cache_stride_token
+                    + dims,
+                    y_flat,
+                    mask=valid,
+                )
 
         if work_in_request == 0:
             # This CTA may have just read historical rows from the circular buffer.
@@ -369,7 +418,14 @@ def _qsa_pre_indexer_kernel(
                     mask=valid_slot,
                     other=0.0,
                 )
-                tl.store(state_row + dims, k, mask=valid_slot)
+                if CACHE_FP8:
+                    tl.store(
+                        state_row + dims,
+                        _encode_fp8_u8(k.to(tl.float32), False),
+                        mask=valid_slot,
+                    )
+                else:
+                    tl.store(state_row + dims, k, mask=valid_slot)
                 if CACHE_HAS_ROPE_POS:
                     pos_t = tl.load(
                         pos_ptr + tl.maximum(token, 0) * pos_stride_token,
@@ -457,6 +513,15 @@ def qsa_pre_indexer(
         TILE_T_Q, TILE_H_Q = 2, 4
     num_k_work = k_work_metadata.shape[0]
     num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
+    # SM86-safe fp8: Triton below SM89 cannot compile fp8e4nv pointers, so the
+    # indexer-side caches and output arrive as uint8 views and rows are
+    # decoded/encoded in-register (bit-exact with the native converts).
+    cache_fp8 = state_cache.dtype == torch.float8_e4m3fn
+    if cache_fp8:
+        assert q_out.dtype == compressed_cache.dtype == torch.float8_e4m3fn
+        state_cache = state_cache.view(torch.uint8)
+        compressed_cache = compressed_cache.view(torch.uint8)
+        q_out = q_out.view(torch.uint8)
     _qsa_pre_indexer_kernel[(num_k_work + num_q_work,)](
         q,
         q.stride(0),
@@ -501,6 +566,7 @@ def qsa_pre_indexer(
         CACHE_HAS_ROPE_POS=cache_has_rope_pos,
         MROPE_H=section[1],
         MROPE_W=section[2],
+        CACHE_FP8=cache_fp8,
         num_warps=1,
     )
 
