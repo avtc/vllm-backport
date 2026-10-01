@@ -281,3 +281,17 @@ def test_splitk_smem_decision_recorded_at_warmup(monkeypatch):
 
     with pytest.raises(OutOfResources):
         _record_splitk_smem_overflow(cfg, 101376, always_overflow)
+
+
+def test_splitk_launch_error_classifier():
+    """Both smem-overflow shapes demote; unrelated errors propagate."""
+    from triton.runtime.errors import OutOfResources
+
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import _is_splitk_launch_smem_error
+
+    assert _is_splitk_launch_smem_error(OutOfResources(106496, 101376, "shared memory"))
+    assert _is_splitk_launch_smem_error(
+        RuntimeError("Triton Error [CUDA]: out of memory")
+    )
+    assert not _is_splitk_launch_smem_error(RuntimeError("invalid device pointer"))
+    assert not _is_splitk_launch_smem_error(ValueError("bad shape"))

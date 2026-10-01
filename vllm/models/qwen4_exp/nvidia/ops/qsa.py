@@ -59,6 +59,18 @@ def _record_splitk_smem_overflow(
     )
 
 
+def _is_splitk_launch_smem_error(exc: BaseException) -> bool:
+    """Whether a failed splitk launch is a shared-memory overflow.
+
+    Triton reports the compiled-metadata overflow as OutOfResources, but a
+    runtime-specialized binary that only overflows at cuLaunchKernel
+    surfaces as a CUDA out-of-memory RuntimeError instead.
+    """
+    if isinstance(exc, OutOfResources):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
 def _is_fp8_kv_storage(dtype: torch.dtype) -> bool:
     """vLLM stores fp8 KV cache entries as uint8 storage bytes."""
     return dtype in (torch.float8_e4m3fn, torch.uint8)
@@ -774,34 +786,17 @@ def qsa_sparse_paged_attention(
         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width
     )
 
-    # Split=1 writes output directly and compiles out all workspace accesses.
-    if num_splits == 1:
-        partial_output = out
-        partial_lse = out
-    else:
-        # FP32 partials preserve accuracy when merging independently normalized
-        # splits.
-        partial_output = torch.empty(
-            (num_splits, *q.shape), dtype=torch.float32, device=q.device
-        )
-        partial_lse = torch.empty(
-            (num_splits, q.shape[0], q.shape[1]),
-            dtype=torch.float32,
-            device=q.device,
-        )
-
-    partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
-
-    def _launch_splitk(num_stages: int):
-        _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
+    def _launch_splitk(num_stages: int, bn: int, tiles: int, splits: int, po, pl):
+        grid = (q.shape[0], k_cache.shape[2], splits)
+        _qsa_sparse_paged_gqa_splitk_kernel[grid](
             q,
             k_ptr,
             v_ptr,
             logical_indices,
             block_table,
             token_to_req,
-            partial_output,
-            partial_lse,
+            po,
+            pl,
             out,
             q.stride(0),
             q.stride(1),
@@ -826,30 +821,75 @@ def qsa_sparse_paged_attention(
             GROUP_SIZE=group_size,
             HEAD_DIM=q.shape[2],
             NUM_QUERY_HEADS=q.shape[1],
-            NUM_SPLITS=num_splits,
-            NUM_TILES=num_tiles,
+            NUM_SPLITS=splits,
+            NUM_TILES=tiles,
             BLOCK_M=block_m,
-            BLOCK_N=block_n,
+            BLOCK_N=bn,
             KV_FP8=kv_fp8,
             num_warps=partial_warps,
             num_stages=num_stages,
         )
 
-    _launch_splitk(_splitk_num_stages((block_n, partial_warps, num_tiles, num_splits)))
-    if num_splits == 1:
+    def _attempt(stages: int, bn: int):
+        tiles = triton.cdiv(selection_width, bn)
+        splits = min(num_splits, tiles)
+        if splits == 1:
+            po, pl = out, out
+        else:
+            # FP32 partials preserve accuracy when merging independently
+            # normalized splits.
+            po = torch.empty((splits, *q.shape), dtype=torch.float32, device=q.device)
+            pl = torch.empty(
+                (splits, q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device
+            )
+        _launch_splitk(stages, bn, tiles, splits, po, pl)
+        return po, pl, splits
+
+    # Runtime-specialized binaries can need more shared memory than the
+    # warmup-compiled variants (real stride/specialization keys), and the
+    # overflow surfaces either as Triton's OutOfResources or as a CUDA
+    # out-of-memory at cuLaunchKernel. Start from the warmup-measured
+    # stage count, then demote pipeline stages and finally halve the
+    # tile width.
+    stages0 = _splitk_num_stages((block_n, partial_warps, num_tiles, num_splits))
+    attempts = [(stages0, block_n)]
+    if stages0 > 1:
+        attempts.append((stages0 - 1, block_n))
+    attempts.append((1, max(16, block_n // 2)))
+    po = pl = None
+    used_splits = num_splits
+    last: BaseException | None = None
+    for stages, bn in dict.fromkeys(attempts):
+        try:
+            po, pl, used_splits = _attempt(stages, bn)
+            last = None
+            break
+        except (OutOfResources, RuntimeError) as exc:
+            if not _is_splitk_launch_smem_error(exc):
+                raise
+            last = exc
+            logger.info_once(
+                "QSA splitk launch exceeded shared memory"
+                " (num_stages=%d, BLOCK_N=%d); demoting",
+                stages,
+                bn,
+            )
+    if last is not None:
+        raise last
+    if used_splits == 1:
         return out
 
     _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
-        partial_output,
-        partial_lse,
+        po,
+        pl,
         out,
         out.stride(0),
         out.stride(1),
         q.shape[0],
         HEAD_DIM=q.shape[2],
         NUM_QUERY_HEADS=q.shape[1],
-        NUM_SPLITS=num_splits,
-        BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+        NUM_SPLITS=used_splits,
+        BLOCK_SPLITS=triton.next_power_of_2(used_splits),
         num_warps=2,
         num_stages=1,
     )
