@@ -59,11 +59,38 @@ def _record_splitk_smem_overflow(
     )
 
 
+# Persistent gather workspace: layers run sequentially on one stream, so a
+# single shared K/V pair serves all of them; a stable buffer is also
+# cudagraph-replay-safe. The cap keeps it small enough for the tightest
+# rank's free headroom during capture (~tens of MiB at high
+# gpu-memory-utilization).
+_GATHER_WS_TARGET_BYTES = 32 * 1024 * 1024
+_GATHER_WS: dict[
+    tuple[int, int, int, torch.device], tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _get_gather_workspace(
+    rows: int, topk: int, num_kv_heads: int, head_dim: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (topk, num_kv_heads, head_dim, device)
+    ws = _GATHER_WS.get(key)
+    if ws is None or ws[0].shape[0] < rows:
+        k_ws = torch.empty(
+            (rows, topk, num_kv_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        _GATHER_WS[key] = (k_ws, torch.empty_like(k_ws))
+        ws = _GATHER_WS[key]
+    return ws[0][:rows], ws[1][:rows]
+
+
 def _gather_row_chunk(topk: int, num_kv_heads: int, head_dim: int) -> int:
     """Query rows per gather+attention chunk, keeping the bf16 workspace
-    (K and V, [rows, topk, heads, dim]) under ~256 MiB."""
+    (K and V, [rows, topk, heads, dim]) under the shared-buffer cap."""
     row_bytes = 2 * topk * num_kv_heads * head_dim * 2
-    return max(1, (256 * 1024 * 1024) // max(row_bytes, 1))
+    return max(1, _GATHER_WS_TARGET_BYTES // max(row_bytes, 1))
 
 
 def _is_splitk_launch_smem_error(exc: BaseException) -> bool:
@@ -663,10 +690,7 @@ def qsa_gather_dequant_workspace(
     device = k_cache.device
     kv_fp8 = _is_fp8_kv_storage(k_cache.dtype)
 
-    k_ws = torch.empty(
-        (rows, topk, num_kv_heads, head_dim), dtype=torch.bfloat16, device=device
-    )  # noqa: E501
-    v_ws = torch.empty_like(k_ws)
+    k_ws, v_ws = _get_gather_workspace(rows, topk, num_kv_heads, head_dim, device)
 
     _qsa_gather_dequant_kv_kernel[(rows, num_kv_heads)](
         k_cache.view(torch.uint8) if kv_fp8 else k_cache,
