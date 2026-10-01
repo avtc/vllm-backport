@@ -295,3 +295,15 @@ def test_splitk_launch_error_classifier():
     )
     assert not _is_splitk_launch_smem_error(RuntimeError("invalid device pointer"))
     assert not _is_splitk_launch_smem_error(ValueError("bad shape"))
+
+
+def test_gather_row_chunk_bounds_workspace():
+    """~2k-wide selections, 4 kv heads, 128 head dim: ~4 MiB/row, so the
+    chunk lands around 64 rows and never below 1."""
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import _gather_row_chunk
+
+    chunk = _gather_row_chunk(2048, 4, 128)
+    row_bytes = 2 * 2048 * 4 * 128 * 2
+    assert 1 <= chunk <= 256 * 1024 * 1024 // row_bytes + 1
+    assert chunk * row_bytes <= 256 * 1024 * 1024 + row_bytes
+    assert _gather_row_chunk(1, 1, 16) >= 1

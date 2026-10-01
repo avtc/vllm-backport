@@ -205,31 +205,43 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             k_scale = layer._k_scale
             v_scale = layer._v_scale
             if mode == "gather":
-                (
-                    key_cache,
-                    value_cache,
-                    logical_indices,
-                    block_table,
-                    token_to_req,
-                ) = qsa_gather_dequant_workspace(
-                    key_cache,
-                    value_cache,
-                    logical_indices,
-                    block_table,
-                    token_to_req,
-                    k_scale,
-                    v_scale,
+                # The bf16 workspace costs ~topk*heads*dim*4 bytes per query
+                # row (~4 MiB at topk 2k): prefill-sized batches would need
+                # GiB. Chunk gather+attention over rows to bound the peak.
+                from .ops.qsa import _gather_row_chunk
+
+                chunk = _gather_row_chunk(
+                    logical_indices.shape[1] - 1,
+                    key_cache.shape[2],
+                    key_cache.shape[3],
                 )
-                qsa_sparse_paged_attention(
-                    query[:num_tokens],
-                    key_cache,
-                    value_cache,
-                    logical_indices,
-                    block_table,
-                    token_to_req,
-                    use_prefill_config,
-                    output[:num_tokens],
-                )
+                for start in range(0, num_tokens, chunk):
+                    stop = min(start + chunk, num_tokens)
+                    (
+                        key_cache,
+                        value_cache,
+                        packed,
+                        block_table,
+                        token_to_req,
+                    ) = qsa_gather_dequant_workspace(
+                        key_cache,
+                        value_cache,
+                        logical_indices[start:stop],
+                        block_table,
+                        token_to_req[start:stop],
+                        k_scale,
+                        v_scale,
+                    )
+                    qsa_sparse_paged_attention(
+                        query[start:stop],
+                        key_cache,
+                        value_cache,
+                        packed,
+                        block_table,
+                        token_to_req,
+                        use_prefill_config,
+                        output[start:stop],
+                    )
                 return output
             qsa_sparse_paged_attention(
                 query[:num_tokens],

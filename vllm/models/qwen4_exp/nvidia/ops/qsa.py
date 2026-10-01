@@ -59,6 +59,13 @@ def _record_splitk_smem_overflow(
     )
 
 
+def _gather_row_chunk(topk: int, num_kv_heads: int, head_dim: int) -> int:
+    """Query rows per gather+attention chunk, keeping the bf16 workspace
+    (K and V, [rows, topk, heads, dim]) under ~256 MiB."""
+    row_bytes = 2 * topk * num_kv_heads * head_dim * 2
+    return max(1, (256 * 1024 * 1024) // max(row_bytes, 1))
+
+
 def _is_splitk_launch_smem_error(exc: BaseException) -> bool:
     """Whether a failed splitk launch is a shared-memory overflow.
 
