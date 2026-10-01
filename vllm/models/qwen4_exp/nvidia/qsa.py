@@ -414,6 +414,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             AttentionType.DECODER,
             None,
         )
+        # The mask only exists to bypass the parent's init-time device
+        # check; do_kv_cache_update stores through self.kv_cache_dtype, so
+        # the impl must carry the real dtype for the quantizing write.
+        self.impl.kv_cache_dtype = self.kv_cache_dtype
         self.indexer = QSAIndexer(
             vllm_config=vllm_config,
             config=config,
