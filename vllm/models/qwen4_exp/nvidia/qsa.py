@@ -72,6 +72,12 @@ def _qsa_fp8_kv_mode() -> str:
     return mode
 
 
+def _qsa_use_gather(mode: str, use_prefill_config: bool) -> bool:
+    """gather-mode workspace is a prefill-shaped path; decode reads fp8
+    rows directly in-kernel (single pass, no bf16 round-trip)."""
+    return mode == "gather" and use_prefill_config
+
+
 def _qsa_impl_cache_dtype(kv_cache_dtype: str) -> str:
     """The cache dtype string to hand to the FlashAttention parent impl."""
     if kv_cache_dtype in ("fp8", "fp8_e4m3") and _qsa_fp8_kv_mode():
@@ -204,7 +210,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             mode = _qsa_fp8_kv_mode()
             k_scale = layer._k_scale
             v_scale = layer._v_scale
-            if mode == "gather":
+            if _qsa_use_gather(mode, use_prefill_config):
+                # Gather is a prefill-shaped read path: it materializes the
+                # selection into a bf16 workspace (topk rows read twice)
+                # which wide prefill batches amortize but per-step decode
+                # pays in full - decode steps take the in-kernel path.
                 # The bf16 workspace costs ~topk*heads*dim*4 bytes per query
                 # row (~4 MiB at topk 2k): prefill-sized batches would need
                 # GiB. Chunk gather+attention over rows to bound the peak.

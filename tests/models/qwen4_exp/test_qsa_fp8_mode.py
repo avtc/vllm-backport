@@ -307,3 +307,13 @@ def test_gather_row_chunk_bounds_workspace():
     assert 1 <= chunk <= 32 * 1024 * 1024 // row_bytes + 1
     assert chunk * row_bytes <= 32 * 1024 * 1024 + row_bytes
     assert _gather_row_chunk(1, 1, 16) >= 1
+
+
+def test_gather_mode_routes_decode_to_in_kernel_path():
+    """gather = prefill-only workspace; decode steps must use the direct
+    in-kernel decode path (topk rows read once, no bf16 round-trip)."""
+    from vllm.models.qwen4_exp.nvidia.qsa import _qsa_use_gather
+
+    assert _qsa_use_gather("gather", use_prefill_config=True) is True
+    assert _qsa_use_gather("gather", use_prefill_config=False) is False
+    assert _qsa_use_gather("decode", use_prefill_config=True) is False
