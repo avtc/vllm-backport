@@ -565,66 +565,71 @@ def _qsa_gather_dequant_kv_kernel(
     valid_count = tl.load(indices_ptr + row * stride_indices_row + TOPK)
     count = tl.minimum(tl.maximum(valid_count, 0), TOPK)
 
-    columns = tl.arange(0, BLOCK_T)
     dims = tl.arange(0, HEAD_DIM)
-    logical_token = tl.load(
-        indices_ptr + row * stride_indices_row + columns,
-        mask=columns < count,
-        other=-1,
-    )
-    safe_token = tl.maximum(logical_token, 0)
-    logical_page = safe_token // PAGE_SIZE
-    page_offset = safe_token % PAGE_SIZE
-    valid = (
-        (request >= 0)
-        & (request < num_requests)
-        & (logical_token >= 0)
-        & (logical_page < PAGE_TABLE_WIDTH)
-    )
-    physical_page = tl.load(
-        block_table_ptr
-        + safe_request * stride_table_req
-        + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
-        mask=valid,
-        other=-1,
-    )
-    valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
-    safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-    store_mask = (columns < count)[None, :]
-
     k_dequant = tl.load(k_scale_ptr)
     v_dequant = tl.load(v_scale_ptr)
 
-    keys = tl.load(
-        k_cache_ptr
-        + safe_page[None, :] * stride_k_block
-        + page_offset[None, :] * stride_k_token
-        + kv_head * stride_k_head
-        + dims[:, None],
-        mask=valid[None, :],
-        other=0,
-    )
-    values = tl.load(
-        v_cache_ptr
-        + safe_page[None, :] * stride_v_block
-        + page_offset[None, :] * stride_v_token
-        + kv_head * stride_v_head
-        + dims[:, None],
-        mask=valid[None, :],
-        other=0,
-    )
-    if KV_FP8:
-        keys = (_decode_fp8_f32(keys, False) * k_dequant).to(tl.bfloat16)
-        values = (_decode_fp8_f32(values, False) * v_dequant).to(tl.bfloat16)
+    # Tile over the selection width: materializing the whole
+    # [HEAD_DIM, TOPK] slab at once (TOPK ~2k) explodes registers/shared
+    # memory. Fixed-width chunks keep the tile bounded.
+    TILES: tl.constexpr = (TOPK + BLOCK_T - 1) // BLOCK_T
+    for t in range(TILES):
+        columns = t * BLOCK_T + tl.arange(0, BLOCK_T)
+        logical_token = tl.load(
+            indices_ptr + row * stride_indices_row + columns,
+            mask=columns < count,
+            other=-1,
+        )
+        safe_token = tl.maximum(logical_token, 0)
+        logical_page = safe_token // PAGE_SIZE
+        page_offset = safe_token % PAGE_SIZE
+        valid = (
+            (request >= 0)
+            & (request < num_requests)
+            & (logical_token >= 0)
+            & (logical_page < PAGE_TABLE_WIDTH)
+        )
+        physical_page = tl.load(
+            block_table_ptr
+            + safe_request * stride_table_req
+            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+            mask=valid,
+            other=-1,
+        )
+        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+        safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+        store_mask = (columns < count)[None, :]
 
-    ws_base = (
-        row * stride_ws_row
-        + columns[None, :] * stride_ws_col
-        + kv_head * stride_ws_head
-        + dims[:, None]
-    )
-    tl.store(k_ws_ptr + ws_base, keys, mask=store_mask)
-    tl.store(v_ws_ptr + ws_base, values, mask=store_mask)
+        keys = tl.load(
+            k_cache_ptr
+            + safe_page[None, :] * stride_k_block
+            + page_offset[None, :] * stride_k_token
+            + kv_head * stride_k_head
+            + dims[:, None],
+            mask=valid[None, :],
+            other=0,
+        )
+        values = tl.load(
+            v_cache_ptr
+            + safe_page[None, :] * stride_v_block
+            + page_offset[None, :] * stride_v_token
+            + kv_head * stride_v_head
+            + dims[:, None],
+            mask=valid[None, :],
+            other=0,
+        )
+        if KV_FP8:
+            keys = (_decode_fp8_f32(keys, False) * k_dequant).to(tl.bfloat16)
+            values = (_decode_fp8_f32(values, False) * v_dequant).to(tl.bfloat16)
+
+        ws_base = (
+            row * stride_ws_row
+            + columns[None, :] * stride_ws_col
+            + kv_head * stride_ws_head
+            + dims[:, None]
+        )
+        tl.store(k_ws_ptr + ws_base, keys, mask=store_mask)
+        tl.store(v_ws_ptr + ws_base, values, mask=store_mask)
 
 
 def qsa_gather_dequant_workspace(
@@ -684,7 +689,7 @@ def qsa_gather_dequant_workspace(
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
         HEAD_DIM=head_dim,
-        BLOCK_T=triton.next_power_of_2(topk),
+        BLOCK_T=64,
         KV_FP8=kv_fp8,
     )
 
