@@ -16,12 +16,12 @@ if HAS_TRITON:
     from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
 
 
-@triton.jit(do_not_specialize=["num_rows", "num_requests"])
 def _is_fp8_kv_storage(dtype: torch.dtype) -> bool:
     """vLLM stores fp8 KV cache entries as uint8 storage bytes."""
     return dtype in (torch.float8_e4m3fn, torch.uint8)
 
 
+@triton.jit(do_not_specialize=["num_rows", "num_requests"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
