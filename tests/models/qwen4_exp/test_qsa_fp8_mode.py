@@ -234,3 +234,13 @@ def test_sparse_attention_fp8_decode_matches_dequantized_reference():
             p = torch.softmax(scores, dim=-1)
             ref[r, h] = p @ v_ref[r, :, kv]
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def test_fp8_kv_detection_covers_uint8_storage():
+    """--kv-cache-dtype fp8 allocates uint8 storage, not float8 tensors."""
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import _is_fp8_kv_storage
+
+    assert _is_fp8_kv_storage(torch.uint8)
+    assert _is_fp8_kv_storage(torch.float8_e4m3fn)
+    assert not _is_fp8_kv_storage(torch.bfloat16)
+    assert not _is_fp8_kv_storage(torch.float16)

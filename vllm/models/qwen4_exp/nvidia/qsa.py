@@ -189,7 +189,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        fp8_kv = key_cache.dtype == torch.float8_e4m3fn
+        from .ops.qsa import _is_fp8_kv_storage
+
+        fp8_kv = _is_fp8_kv_storage(key_cache.dtype)
         if (key_cache.dtype != torch.bfloat16 and not fp8_kv) or (
             query.dtype != torch.bfloat16
         ):

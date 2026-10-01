@@ -17,6 +17,11 @@ if HAS_TRITON:
 
 
 @triton.jit(do_not_specialize=["num_rows", "num_requests"])
+def _is_fp8_kv_storage(dtype: torch.dtype) -> bool:
+    """vLLM stores fp8 KV cache entries as uint8 storage bytes."""
+    return dtype in (torch.float8_e4m3fn, torch.uint8)
+
+
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -589,7 +594,7 @@ def qsa_gather_dequant_workspace(
     num_kv_heads = k_cache.shape[2]
     head_dim = k_cache.shape[3]
     device = k_cache.device
-    kv_fp8 = k_cache.dtype == torch.float8_e4m3fn
+    kv_fp8 = _is_fp8_kv_storage(k_cache.dtype)
 
     k_ws = torch.empty(
         (rows, topk, num_kv_heads, head_dim), dtype=torch.bfloat16, device=device
@@ -689,7 +694,7 @@ def qsa_sparse_paged_attention(
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     assert q.dtype == torch.bfloat16
     if kv_fp8:
-        assert k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
+        assert _is_fp8_kv_storage(k_cache.dtype) and k_cache.dtype == v_cache.dtype
         assert k_scale is not None and v_scale is not None
         k_ptr = k_cache.view(torch.uint8)
         v_ptr = v_cache.view(torch.uint8)
@@ -911,7 +916,7 @@ def warmup_qsa_sparse_paged_attention(
             NUM_TILES=num_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            KV_FP8=kv_cache.dtype == torch.float8_e4m3fn,
+            KV_FP8=_is_fp8_kv_storage(kv_cache.dtype),
             num_warps=warps,
             num_stages=2,
             grid=(num_rows, num_kv_heads, num_splits),
