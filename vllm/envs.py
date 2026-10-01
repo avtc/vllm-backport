@@ -215,6 +215,7 @@ if TYPE_CHECKING:
     # QSA fp8 main-KV read path: "" (bf16 only), "decode" (in-kernel e4m3
     # decode) or "gather" (bf16 workspace pre-pass) for A/B comparison.
     VLLM_QSA_FP8_KV: str = ""
+    VLLM_QWEN4EXP_LAYER_PROBE: int = 0
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -2507,6 +2508,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MOE_FUSED_DECODE": lambda: bool(int(os.getenv("VLLM_MOE_FUSED_DECODE", "1"))),
     "VLLM_QSA_FP8_KV": lambda: os.getenv("VLLM_QSA_FP8_KV", ""),
+    "VLLM_QWEN4EXP_LAYER_PROBE": lambda: int(
+        os.getenv("VLLM_QWEN4EXP_LAYER_PROBE", "0")
+    ),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))

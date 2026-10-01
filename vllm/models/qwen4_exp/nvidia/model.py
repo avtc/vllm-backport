@@ -161,6 +161,54 @@ logger = init_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Env-gated decode-correctness probe (VLLM_QWEN4EXP_LAYER_PROBE=N): every
+# real decoder-layer forward, record absmax + non-finite count for the layer's
+# stage tensors; log the first divergence (any non-finite value, or absmax
+# >20x the first-seen baseline) plus a periodic line every N steps. The probe
+# host-syncs, so it must run eager (--enforce-eager); it skips cudagraph
+# capture and costs nothing when the env is unset.
+
+
+def _q4e_probe(tag: str, t: torch.Tensor, state: dict) -> None:
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+    f = t.detach().float()
+    if f.numel() == 0:
+        return
+    absmax = float(f.abs().amax())
+    nonfinite = int((~torch.isfinite(f)).sum())
+    base = state.get("base")
+    if base is None:
+        state["base"] = absmax
+        logger.info("[Q4E-PROBE] baseline %s absmax=%.3e", tag, absmax)
+        return
+    ratio = absmax / max(base, 1.0e-6)
+    diverged = nonfinite > 0 or ratio > 20.0
+    if diverged:
+        if tag not in state["logged"]:
+            state["logged"].add(tag)
+            logger.info(
+                "[Q4E-PROBE] DIVERGED %s absmax=%.3e (base %.3e, x%.1f) nonfinite=%d",
+                tag,
+                absmax,
+                base,
+                ratio,
+                nonfinite,
+            )
+    elif state["step"] % _Q4E_PROBE_INTERVAL == 0:
+        logger.info(
+            "[Q4E-PROBE] step=%d %s absmax=%.3e nonfinite=%d",
+            state["step"],
+            tag,
+            absmax,
+            nonfinite,
+        )
+
+
+_Q4E_PROBE_INTERVAL = envs.VLLM_QWEN4EXP_LAYER_PROBE
+_Q4E_PROBE = _Q4E_PROBE_INTERVAL > 0
+
+
 # Decode-time MoE block (up to _MOE_DECODE_MAX_TOKENS tokens)
 # ---------------------------------------------------------------------------
 #
@@ -1131,6 +1179,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.config = config
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        self._probe_state: dict = {"step": 0, "logged": set()}
         if vllm_config.parallel_config.use_sequence_parallel_moe:
             raise NotImplementedError(
                 "Qwen4Exp HC does not support sequence-parallel MoE"
@@ -1230,6 +1279,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if prev_block_output is None:
             assert prev_injection is None
+        probe_state = self._probe_state if _Q4E_PROBE else None
+        if probe_state is not None:
+            probe_state["step"] += 1
         attn_hc = self.attn_hyper_connection
         if self.ple is not None:
             # PLE adds directly to the multi-stream state, so pending HC state
@@ -1248,6 +1300,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 query_start_loc,
                 ngram_context,
             )
+            if probe_state is not None:
+                _q4e_probe(f"L{self.layer_idx}.ple_add", hidden_states, probe_state)
 
         # Fuse a pending combine with this HC module's mix when possible.
         if prev_block_output is not None:
@@ -1267,11 +1321,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
 
+        if probe_state is not None:
+            _q4e_probe(f"L{self.layer_idx}.attn_out", attn_out, probe_state)
         mlp_hc = self.mlp_hyper_connection
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
             hidden_states, attn_out, injection
         )
         mlp_out = self.mlp(block_input)
+        if probe_state is not None:
+            _q4e_probe(f"L{self.layer_idx}.mlp_out", mlp_out, probe_state)
+            _q4e_probe(f"L{self.layer_idx}.residual", hidden_states, probe_state)
         return hidden_states, mlp_out, injection
 
 
