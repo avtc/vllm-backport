@@ -72,6 +72,22 @@ def _qsa_fp8_kv_mode() -> str:
     return mode
 
 
+def _qsa_fp8_cache_allowed(kv_cache_dtype: str, torch_dtype: torch.dtype) -> bool:
+    """BF16 always allowed; e4m3 only with an explicit read-path mode.
+
+    --kv-cache-dtype fp8 resolves to uint8 storage (fp8 bytes ride in a
+    uint8 tensor), so both dtype spellings must pass the check.
+    """
+    if torch_dtype == torch.bfloat16:
+        return True
+    if kv_cache_dtype in ("fp8", "fp8_e4m3") and torch_dtype in (
+        torch.uint8,
+        torch.float8_e4m3fn,
+    ):
+        return bool(_qsa_fp8_kv_mode())
+    return False
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -360,10 +376,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != torch.bfloat16 and not (
-            self.kv_cache_torch_dtype == torch.float8_e4m3fn and _qsa_fp8_kv_mode()
-        ):
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
+        if not _qsa_fp8_cache_allowed(self.kv_cache_dtype, self.kv_cache_torch_dtype):
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires BF16 cache storage; fp8_e4m3 is"
+                " supported with VLLM_QSA_FP8_KV=decode or =gather"
+            )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
