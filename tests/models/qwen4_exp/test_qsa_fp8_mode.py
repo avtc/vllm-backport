@@ -304,6 +304,6 @@ def test_gather_row_chunk_bounds_workspace():
 
     chunk = _gather_row_chunk(2048, 4, 128)
     row_bytes = 2 * 2048 * 4 * 128 * 2
-    assert 1 <= chunk <= 256 * 1024 * 1024 // row_bytes + 1
-    assert chunk * row_bytes <= 256 * 1024 * 1024 + row_bytes
+    assert 1 <= chunk <= 32 * 1024 * 1024 // row_bytes + 1
+    assert chunk * row_bytes <= 32 * 1024 * 1024 + row_bytes
     assert _gather_row_chunk(1, 1, 16) >= 1
