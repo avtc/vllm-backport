@@ -72,6 +72,13 @@ def _qsa_fp8_kv_mode() -> str:
     return mode
 
 
+def _qsa_impl_cache_dtype(kv_cache_dtype: str) -> str:
+    """The cache dtype string to hand to the FlashAttention parent impl."""
+    if kv_cache_dtype in ("fp8", "fp8_e4m3") and _qsa_fp8_kv_mode():
+        return "auto"
+    return kv_cache_dtype
+
+
 def _qsa_fp8_cache_allowed(kv_cache_dtype: str, torch_dtype: torch.dtype) -> bool:
     """BF16 always allowed; e4m3 only with an explicit read-path mode.
 
@@ -386,6 +393,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         set_default_quant_scales(self, register_buffer=True)
 
         self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
+        # FA's own paged attention never runs for QSA (the Triton sparse
+        # kernel consumes the manager pages directly), so mask an fp8
+        # cache dtype as "auto" to keep the parent's device-capability
+        # check from rejecting it on Ampere. Runtime dispatch keys off the
+        # actual cache tensor dtype, and the outer guard above already
+        # validated the fp8 read-path mode.
+        impl_cache_dtype = _qsa_impl_cache_dtype(self.kv_cache_dtype)
         self.impl = Qwen4ExpQSAFlashAttentionImpl(
             self.num_heads,
             self.head_dim,
@@ -393,7 +407,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.num_kv_heads,
             None,
             None,
-            self.kv_cache_dtype,
+            impl_cache_dtype,
             None,
             AttentionType.DECODER,
             None,
