@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_scalar_specialization_rep,
@@ -13,7 +14,29 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 if HAS_TRITON:
+    from triton.runtime.errors import OutOfResources
+
     from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
+
+logger = init_logger(__name__)
+
+
+def _launch_splitk_with_smem_fallback(launch):
+    """Run launch(num_stages); retry with 1 stage on shared-memory exhaustion.
+
+    The fp8 decode path materializes extra bf16 tiles and can push a
+    prefilled config past the ~100 KB SM86 per-block limit; one fewer
+    pipeline stage halves the staging. SMEM is only validated at launch,
+    so warmup cannot pre-filter the config.
+    """
+    try:
+        return launch(2)
+    except OutOfResources:
+        logger.info_once(
+            "QSA splitk kernel exceeded shared memory at num_stages=2;"
+            " retrying with num_stages=1"
+        )
+        return launch(1)
 
 
 def _is_fp8_kv_storage(dtype: torch.dtype) -> bool:
@@ -748,47 +771,51 @@ def qsa_sparse_paged_attention(
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
-    _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
-        q,
-        k_ptr,
-        v_ptr,
-        logical_indices,
-        block_table,
-        token_to_req,
-        partial_output,
-        partial_lse,
-        out,
-        q.stride(0),
-        q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
-        logical_indices.stride(0),
-        block_table.stride(0),
-        out.stride(0),
-        out.stride(1),
-        k_scale,
-        v_scale,
-        q.shape[0],
-        k_cache.shape[0],
-        block_table.shape[0],
-        TOPK=selection_width,
-        PAGE_SIZE=k_cache.shape[1],
-        PAGE_TABLE_WIDTH=block_table.shape[1],
-        GROUP_SIZE=group_size,
-        HEAD_DIM=q.shape[2],
-        NUM_QUERY_HEADS=q.shape[1],
-        NUM_SPLITS=num_splits,
-        NUM_TILES=num_tiles,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        KV_FP8=kv_fp8,
-        num_warps=partial_warps,
-        num_stages=2,
-    )
+
+    def _launch_splitk(num_stages: int):
+        _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
+            q,
+            k_ptr,
+            v_ptr,
+            logical_indices,
+            block_table,
+            token_to_req,
+            partial_output,
+            partial_lse,
+            out,
+            q.stride(0),
+            q.stride(1),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            logical_indices.stride(0),
+            block_table.stride(0),
+            out.stride(0),
+            out.stride(1),
+            k_scale,
+            v_scale,
+            q.shape[0],
+            k_cache.shape[0],
+            block_table.shape[0],
+            TOPK=selection_width,
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=block_table.shape[1],
+            GROUP_SIZE=group_size,
+            HEAD_DIM=q.shape[2],
+            NUM_QUERY_HEADS=q.shape[1],
+            NUM_SPLITS=num_splits,
+            NUM_TILES=num_tiles,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            KV_FP8=kv_fp8,
+            num_warps=partial_warps,
+            num_stages=num_stages,
+        )
+
+    _launch_splitk_with_smem_fallback(_launch_splitk)
     if num_splits == 1:
         return out
 

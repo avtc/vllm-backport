@@ -244,3 +244,31 @@ def test_fp8_kv_detection_covers_uint8_storage():
     assert _is_fp8_kv_storage(torch.float8_e4m3fn)
     assert not _is_fp8_kv_storage(torch.bfloat16)
     assert not _is_fp8_kv_storage(torch.float16)
+
+
+def test_splitk_smem_fallback_retries_with_one_stage(monkeypatch):
+    """A config that exceeds shared memory at two pipeline stages must be
+    retried at one stage, and the exhausted error must propagate if both
+    fail."""
+    from triton.runtime.errors import OutOfResources
+
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import _launch_splitk_with_smem_fallback
+
+    calls = []
+
+    def launch(num_stages: int):
+        calls.append(num_stages)
+        if num_stages == 2:
+            raise OutOfResources(106496, 101376, "shared memory")
+
+    _launch_splitk_with_smem_fallback(launch)
+    assert calls == [2, 1]
+
+    def always_exhausted(num_stages: int):
+        calls.append(num_stages)
+        raise OutOfResources(106496, 101376, "shared memory")
+
+    import pytest
+
+    with pytest.raises(OutOfResources):
+        _launch_splitk_with_smem_fallback(always_exhausted)
