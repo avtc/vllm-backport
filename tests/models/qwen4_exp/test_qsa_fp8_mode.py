@@ -317,3 +317,28 @@ def test_gather_mode_routes_decode_to_in_kernel_path():
     assert _qsa_use_gather("gather", use_prefill_config=True) is True
     assert _qsa_use_gather("gather", use_prefill_config=False) is False
     assert _qsa_use_gather("decode", use_prefill_config=True) is False
+
+
+def test_gather_row_chunk_uses_free_memory(monkeypatch):
+    """Chunk target follows free VRAM between the 32 MiB floor and the
+    256 MiB ceiling."""
+    import vllm.models.qwen4_exp.nvidia.ops.qsa as ops_qsa
+
+    row_bytes = 2 * 2048 * 4 * 128 * 2
+
+    class FakeMem:
+        @staticmethod
+        def mem_get_info():
+            return (512 * 1024 * 1024, 0)
+
+    monkeypatch.setattr(ops_qsa.torch.cuda, "mem_get_info", FakeMem.mem_get_info)
+    chunk = ops_qsa._gather_row_chunk(2048, 4, 128)
+    assert chunk * row_bytes <= 256 * 1024 * 1024
+    assert chunk > 32 * 1024 * 1024 // row_bytes
+
+    monkeypatch.setattr(
+        ops_qsa.torch.cuda,
+        "mem_get_info",
+        lambda: (8 * 1024 * 1024, 0),
+    )
+    assert ops_qsa._gather_row_chunk(2048, 4, 128) >= 1

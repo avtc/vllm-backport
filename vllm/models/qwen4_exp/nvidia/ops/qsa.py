@@ -87,10 +87,17 @@ def _get_gather_workspace(
 
 
 def _gather_row_chunk(topk: int, num_kv_heads: int, head_dim: int) -> int:
-    """Query rows per gather+attention chunk, keeping the bf16 workspace
-    (K and V, [rows, topk, heads, dim]) under the shared-buffer cap."""
+    """Query rows per gather+attention chunk.
+
+    Small chunks waste prefill throughput (~2x at 16-row chunks vs 128),
+    but the workspace must fit the tightest rank's free headroom during
+    graph capture. Size the target from actually-free device memory,
+    clamped to [32 MiB, 256 MiB].
+    """
     row_bytes = 2 * topk * num_kv_heads * head_dim * 2
-    return max(1, _GATHER_WS_TARGET_BYTES // max(row_bytes, 1))
+    free = torch.cuda.mem_get_info()[0]
+    target = min(256 * 1024 * 1024, max(_GATHER_WS_TARGET_BYTES, free // 2))
+    return max(1, int(target) // max(row_bytes, 1))
 
 
 def _is_splitk_launch_smem_error(exc: BaseException) -> bool:
