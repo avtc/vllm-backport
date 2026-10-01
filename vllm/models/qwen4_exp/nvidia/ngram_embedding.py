@@ -1066,7 +1066,11 @@ def _convert_bf16_file_to_fp8(
     Per-tensor scale = absmax/448 (matches _quantize_table_to_fp8); reads
     in bounded chunks so peak host memory stays small.
     """
-    src = np.memmap(path, mode="r", shape=(num_embeddings, embedding_dim))
+    # bf16 bytes ride in a uint16 mapping and are bit-reinterpreted through
+    # torch (numpy has no bfloat16).
+    src = np.memmap(
+        path, mode="r", dtype=np.uint16, shape=(num_embeddings, embedding_dim)
+    )
     dst = np.memmap(
         path + ".fp8", dtype=np.int8, mode="w+", shape=(num_embeddings, embedding_dim)
     )
@@ -1074,11 +1078,16 @@ def _convert_bf16_file_to_fp8(
     absmax = 0.0
     for start in range(0, num_embeddings, chunk_rows):
         stop = min(start + chunk_rows, num_embeddings)
-        absmax = max(absmax, float(np.abs(src[start:stop]).max()))
+        block = torch.from_numpy(np.ascontiguousarray(src[start:stop])).view(
+            torch.bfloat16
+        )
+        absmax = max(absmax, float(block.abs().amax().float()))
     scale = max(absmax / 448.0, 1.0e-12)
     for start in range(0, num_embeddings, chunk_rows):
         stop = min(start + chunk_rows, num_embeddings)
-        block = torch.from_numpy(np.ascontiguousarray(src[start:stop]))
+        block = torch.from_numpy(np.ascontiguousarray(src[start:stop])).view(
+            torch.bfloat16
+        )
         quantized = block.to(torch.float32).div(scale).to(torch.float8_e4m3fn)
         dst[start:stop] = quantized.view(torch.int8).numpy()
     dst.flush()
