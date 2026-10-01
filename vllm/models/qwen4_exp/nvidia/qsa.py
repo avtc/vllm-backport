@@ -217,13 +217,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 )
                 for start in range(0, num_tokens, chunk):
                     stop = min(start + chunk, num_tokens)
-                    (
-                        key_cache,
-                        value_cache,
-                        packed,
-                        block_table,
-                        token_to_req,
-                    ) = qsa_gather_dequant_workspace(
+                    # Do not shadow the loop inputs: every chunk gathers
+                    # from the real cache and the real request block table.
+                    k_ws, v_ws, packed, synth_bt, ws_t2r = qsa_gather_dequant_workspace(
                         key_cache,
                         value_cache,
                         logical_indices[start:stop],
@@ -234,11 +230,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     )
                     qsa_sparse_paged_attention(
                         query[start:stop],
-                        key_cache,
-                        value_cache,
+                        k_ws,
+                        v_ws,
                         packed,
-                        block_table,
-                        token_to_req,
+                        synth_bt,
+                        ws_t2r,
                         use_prefill_config,
                         output[start:stop],
                     )
