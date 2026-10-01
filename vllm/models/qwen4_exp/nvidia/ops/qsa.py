@@ -21,22 +21,42 @@ if HAS_TRITON:
 logger = init_logger(__name__)
 
 
-def _launch_splitk_with_smem_fallback(launch):
-    """Run launch(num_stages); retry with 1 stage on shared-memory exhaustion.
+# Configs whose two-stage variant exceeds the device shared-memory limit,
+# measured on the compiled kernel during warmup: (block_n, warps, tiles,
+# splits) -> num_stages. The dispatcher only ever picks warmed configs, so
+# the runtime launch needs no exception path.
+_SPLITK_STAGES_OVERRIDE: dict[tuple[int, int, int, int], int] = {}
+
+
+def _splitk_num_stages(config: tuple[int, int, int, int]) -> int:
+    return _SPLITK_STAGES_OVERRIDE.get(config, 2)
+
+
+def _record_splitk_smem_overflow(
+    config: tuple[int, int, int, int], max_shared: int, recompile
+) -> None:
+    """Validate a compiled splitk config's shared memory; fall back to one
+    pipeline stage when it exceeds the device limit.
 
     The fp8 decode path materializes extra bf16 tiles and can push a
-    prefilled config past the ~100 KB SM86 per-block limit; one fewer
-    pipeline stage halves the staging. SMEM is only validated at launch,
-    so warmup cannot pre-filter the config.
+    prefill config past the ~100 KB SM86 per-block limit. Shared memory is
+    a compile-time constant, so the check is deterministic: warmup compiles
+    the two-stage variant, reads kernel.metadata.shared, and records the
+    override before any real launch.
     """
-    try:
-        return launch(2)
-    except OutOfResources:
-        logger.info_once(
-            "QSA splitk kernel exceeded shared memory at num_stages=2;"
-            " retrying with num_stages=1"
-        )
-        return launch(1)
+    compiled = recompile(num_stages=2)
+    if compiled.metadata.shared <= max_shared:
+        return
+    compiled = recompile(num_stages=1)
+    if compiled.metadata.shared > max_shared:
+        raise OutOfResources(compiled.metadata.shared, max_shared, "shared memory")
+    _SPLITK_STAGES_OVERRIDE[config] = 1
+    logger.info_once(
+        "QSA splitk config %s exceeds shared memory at num_stages=2"
+        " (limit %d); pinned to num_stages=1",
+        config,
+        max_shared,
+    )
 
 
 def _is_fp8_kv_storage(dtype: torch.dtype) -> bool:
@@ -815,7 +835,7 @@ def qsa_sparse_paged_attention(
             num_stages=num_stages,
         )
 
-    _launch_splitk_with_smem_fallback(_launch_splitk)
+    _launch_splitk(_splitk_num_stages((block_n, partial_warps, num_tiles, num_splits)))
     if num_splits == 1:
         return out
 
@@ -893,6 +913,12 @@ def warmup_qsa_sparse_paged_attention(
     row_stride = num_query_heads * head_dim
     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
 
+    from triton.runtime.driver import driver
+
+    max_shared = driver.active.utils.get_device_properties(q_ptr.device.index)[
+        "max_shared_mem"
+    ]
+
     warmed = []
     for block_n, warps, num_tiles, num_splits in sorted(profiles):
         if num_splits == 1:
@@ -906,48 +932,62 @@ def warmup_qsa_sparse_paged_attention(
             partial_lse_ptr = TritonWarmupTensor(
                 torch.float32, shape=(num_splits, num_rows, num_query_heads)
             )
-        _qsa_sparse_paged_gqa_splitk_kernel.warmup(
-            q_ptr,
-            k_cache_ptr,
-            v_cache_ptr,
-            indices_ptr,
-            block_table_ptr,
-            token_to_req_ptr,
-            partial_output_ptr,
-            partial_lse_ptr,
-            output_ptr,
-            row_stride,
-            head_stride,
-            key_cache.stride(0),
-            key_cache.stride(1),
-            key_cache.stride(2),
-            value_cache.stride(0),
-            value_cache.stride(1),
-            value_cache.stride(2),
-            selection_width + 1,
-            block_table.stride(0),
-            row_stride,
-            head_stride,
-            k_scale_ptr,
-            v_scale_ptr,
-            num_rows,
-            num_cache_blocks,
-            num_requests,
-            TOPK=selection_width,
-            PAGE_SIZE=key_cache.shape[1],
-            PAGE_TABLE_WIDTH=block_table.shape[1],
-            GROUP_SIZE=group_size,
-            HEAD_DIM=head_dim,
-            NUM_QUERY_HEADS=num_query_heads,
-            NUM_SPLITS=num_splits,
-            NUM_TILES=num_tiles,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            KV_FP8=_is_fp8_kv_storage(kv_cache.dtype),
-            num_warps=warps,
-            num_stages=2,
-            grid=(num_rows, num_kv_heads, num_splits),
-        )
+        config = (block_n, warps, num_tiles, num_splits)
+
+        def _recompile_splitk(
+            num_stages: int,
+            *,
+            _bn=block_n,
+            _w=warps,
+            _nt=num_tiles,
+            _ns=num_splits,
+            _po=partial_output_ptr,
+            _pl=partial_lse_ptr,
+        ):
+            return _qsa_sparse_paged_gqa_splitk_kernel.warmup(
+                q_ptr,
+                k_cache_ptr,
+                v_cache_ptr,
+                indices_ptr,
+                block_table_ptr,
+                token_to_req_ptr,
+                _po,
+                _pl,
+                output_ptr,
+                row_stride,
+                head_stride,
+                key_cache.stride(0),
+                key_cache.stride(1),
+                key_cache.stride(2),
+                value_cache.stride(0),
+                value_cache.stride(1),
+                value_cache.stride(2),
+                selection_width + 1,
+                block_table.stride(0),
+                row_stride,
+                head_stride,
+                k_scale_ptr,
+                v_scale_ptr,
+                num_rows,
+                num_cache_blocks,
+                num_requests,
+                TOPK=selection_width,
+                PAGE_SIZE=key_cache.shape[1],
+                PAGE_TABLE_WIDTH=block_table.shape[1],
+                GROUP_SIZE=group_size,
+                HEAD_DIM=head_dim,
+                NUM_QUERY_HEADS=num_query_heads,
+                NUM_SPLITS=_ns,
+                NUM_TILES=_nt,
+                BLOCK_M=block_m,
+                BLOCK_N=_bn,
+                KV_FP8=_is_fp8_kv_storage(kv_cache.dtype),
+                num_warps=_w,
+                num_stages=num_stages,
+                grid=(num_rows, num_kv_heads, _ns),
+            )
+
+        _record_splitk_smem_overflow(config, max_shared, _recompile_splitk)
         if num_splits > 1:
             _qsa_merge_splitk_kernel.warmup(
                 partial_output_ptr,

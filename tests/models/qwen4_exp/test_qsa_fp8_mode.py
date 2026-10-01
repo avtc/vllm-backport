@@ -246,29 +246,38 @@ def test_fp8_kv_detection_covers_uint8_storage():
     assert not _is_fp8_kv_storage(torch.float16)
 
 
-def test_splitk_smem_fallback_retries_with_one_stage(monkeypatch):
-    """A config that exceeds shared memory at two pipeline stages must be
-    retried at one stage, and the exhausted error must propagate if both
-    fail."""
+def test_splitk_smem_decision_recorded_at_warmup(monkeypatch):
+    """A config whose two-stage compiled variant exceeds the device shared
+    memory gets pinned to one stage in the decision table; a fitting one
+    stays at two; an always-overflowing config raises."""
     from triton.runtime.errors import OutOfResources
 
-    from vllm.models.qwen4_exp.nvidia.ops.qsa import _launch_splitk_with_smem_fallback
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+        _SPLITK_STAGES_OVERRIDE,
+        _record_splitk_smem_overflow,
+        _splitk_num_stages,
+    )
 
-    calls = []
+    _SPLITK_STAGES_OVERRIDE.clear()
+    cfg = (32, 1, 4, 1)
 
-    def launch(num_stages: int):
-        calls.append(num_stages)
-        if num_stages == 2:
-            raise OutOfResources(106496, 101376, "shared memory")
+    class FakeCompiled:
+        def __init__(self, shared: int):
+            self.metadata = type("M", (), {"shared": shared})()
 
-    _launch_splitk_with_smem_fallback(launch)
-    assert calls == [2, 1]
+    def recompile(num_stages: int):
+        # Two stages overflow SM86's 101376-byte limit; one stage fits.
+        return FakeCompiled(106496 if num_stages == 2 else 65536)
 
-    def always_exhausted(num_stages: int):
-        calls.append(num_stages)
-        raise OutOfResources(106496, 101376, "shared memory")
+    _record_splitk_smem_overflow(cfg, 101376, recompile)
+    assert _splitk_num_stages(cfg) == 1
+    assert _splitk_num_stages((64, 2, 2, 2)) == 2
+    _SPLITK_STAGES_OVERRIDE.clear()
+
+    def always_overflow(num_stages: int):
+        return FakeCompiled(106496)
 
     import pytest
 
     with pytest.raises(OutOfResources):
-        _launch_splitk_with_smem_fallback(always_exhausted)
+        _record_splitk_smem_overflow(cfg, 101376, always_overflow)
