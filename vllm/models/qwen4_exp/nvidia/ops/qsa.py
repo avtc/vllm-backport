@@ -955,7 +955,7 @@ def warmup_qsa_sparse_paged_attention(
 
     from triton.runtime.driver import driver
 
-    max_shared = driver.active.utils.get_device_properties(q_ptr.device.index)[
+    max_shared = driver.active.utils.get_device_properties(torch.cuda.current_device())[
         "max_shared_mem"
     ]
 
