@@ -448,3 +448,45 @@ def test_mmap_table_path_creates_missing_directory(tmp_path):
         path = ne._mmap_table_path()
     assert path == f"{target}.rank3"
     assert os.path.isdir(os.path.dirname(path))  # created on demand
+
+
+def test_bf16_file_converts_to_fp8_sidecar(tmp_path, monkeypatch):
+    """STORE_FP8 with a prebuilt bf16 table must produce the .fp8 sidecar
+    in place (finalize skips prebuilt tables, so the env was a no-op)."""
+    import numpy as np
+    import torch
+
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+        _bf16_mmap_is_valid,
+        _convert_bf16_file_to_fp8,
+        _read_mmap_marker,
+        _write_mmap_marker,
+    )
+
+    rows, dim = 512, 64
+    table = torch.randn(rows, dim, dtype=torch.bfloat16) * 8.0
+    path = str(tmp_path / "ple.rank0")
+    with open(path, "wb") as f:
+        f.write(table.view(torch.uint16).numpy().tobytes())
+    _write_mmap_marker(
+        path,
+        {
+            "num_embeddings": rows,
+            "embedding_dim": dim,
+            "dtype": str(torch.bfloat16),
+            "model": "m",
+        },
+    )
+    nbytes = rows * dim * 2
+    assert _bf16_mmap_is_valid(path, rows, dim, torch.bfloat16, nbytes)
+    assert not _bf16_mmap_is_valid(path, rows, dim, torch.float32, nbytes)
+
+    _convert_bf16_file_to_fp8(path, rows, dim, "m")
+
+    marker = _read_mmap_marker(path + ".fp8")
+    assert marker["dtype"] == str(torch.float8_e4m3fn)
+    assert marker["model"] == "m"
+    scale = marker["scale"]
+    quantized = (table.float() / scale).to(torch.float8_e4m3fn)
+    got = np.memmap(path + ".fp8", dtype=np.int8, mode="r", shape=(rows, dim))
+    assert np.array_equal(got, quantized.view(torch.int8).numpy())

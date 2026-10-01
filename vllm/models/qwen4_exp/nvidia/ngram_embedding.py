@@ -1041,6 +1041,67 @@ def _mmap_marker_path(table_path: str) -> str:
     return table_path + ".meta.json"
 
 
+def _bf16_mmap_is_valid(
+    path: str, num_embeddings: int, embedding_dim: int, dtype: torch.dtype, nbytes: int
+) -> bool:
+    marker = _read_mmap_marker(path)
+    return (
+        marker is not None
+        and marker.get("num_embeddings") == num_embeddings
+        and marker.get("embedding_dim") == embedding_dim
+        and marker.get("dtype") == str(dtype)
+        and os.path.exists(path)
+        and os.path.getsize(path) == nbytes
+    )
+
+
+def _convert_bf16_file_to_fp8(
+    path: str,
+    num_embeddings: int,
+    embedding_dim: int,
+    model_ref: str,
+) -> None:
+    """Quantize a validated bf16 table file into the .fp8 sidecar.
+
+    Per-tensor scale = absmax/448 (matches _quantize_table_to_fp8); reads
+    in bounded chunks so peak host memory stays small.
+    """
+    src = np.memmap(path, mode="r", shape=(num_embeddings, embedding_dim))
+    dst = np.memmap(
+        path + ".fp8", dtype=np.int8, mode="w+", shape=(num_embeddings, embedding_dim)
+    )
+    chunk_rows = max(1, (1 << 20) // max(1, embedding_dim))
+    absmax = 0.0
+    for start in range(0, num_embeddings, chunk_rows):
+        stop = min(start + chunk_rows, num_embeddings)
+        absmax = max(absmax, float(np.abs(src[start:stop]).max()))
+    scale = max(absmax / 448.0, 1.0e-12)
+    for start in range(0, num_embeddings, chunk_rows):
+        stop = min(start + chunk_rows, num_embeddings)
+        block = torch.from_numpy(np.ascontiguousarray(src[start:stop]))
+        quantized = block.to(torch.float32).div(scale).to(torch.float8_e4m3fn)
+        dst[start:stop] = quantized.view(torch.int8).numpy()
+    dst.flush()
+    del src, dst
+    _write_mmap_marker(
+        path + ".fp8",
+        {
+            "num_embeddings": int(num_embeddings),
+            "embedding_dim": int(embedding_dim),
+            "dtype": str(torch.float8_e4m3fn),
+            "model": model_ref,
+            "scale": scale,
+        },
+    )
+    logger.info(
+        "PLE mmap table converted to fp8 storage at %s.fp8 (scale=%.3e,"
+        " %.2f GiB); next boots map it directly",
+        path,
+        scale,
+        num_embeddings * embedding_dim / (1 << 30),
+    )
+
+
 def _read_mmap_marker(table_path: str) -> dict | None:
     try:
         with open(_mmap_marker_path(table_path)) as f:
@@ -1213,11 +1274,28 @@ class Qwen4ExpPLEMmapHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         itemsize = torch.empty((), dtype=dtype).element_size()
         nbytes = num_embeddings * embedding_dim * itemsize
         fp8_path = path + ".fp8"
-        fp8_marker = (
-            _read_mmap_marker(fp8_path)
-            if envs.VLLM_PLE_MMAP_STORE_FP8 and not envs.VLLM_PLE_MMAP_REBUILD
-            else None
-        )
+        if envs.VLLM_PLE_MMAP_STORE_FP8 and not envs.VLLM_PLE_MMAP_REBUILD:
+            fp8_marker = _read_mmap_marker(fp8_path)
+            if fp8_marker is None and _bf16_mmap_is_valid(
+                path, num_embeddings, embedding_dim, dtype, nbytes
+            ):
+                # STORE_FP8 with a prebuilt bf16 table never wrote the
+                # sidecar (finalize skips prebuilt tables): convert in
+                # place once - reads the mapped bf16, no model reload.
+                logger.info(
+                    "PLE mmap table: converting prebuilt bf16 file %s to"
+                    " fp8 storage in place (one-time write)",
+                    path,
+                )
+                _convert_bf16_file_to_fp8(
+                    path,
+                    num_embeddings,
+                    embedding_dim,
+                    self._vllm_cfg.model_config.model,
+                )
+                fp8_marker = _read_mmap_marker(fp8_path)
+        else:
+            fp8_marker = None
         if (
             fp8_marker is not None
             and fp8_marker.get("num_embeddings") == num_embeddings
