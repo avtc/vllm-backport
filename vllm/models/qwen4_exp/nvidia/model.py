@@ -808,6 +808,10 @@ def _int6_planes_group_size(linear: nn.Module) -> int | None:
 
     Checked for every projection before any scheme swap (both or neither).
     """
+    if not envs.VLLM_QWEN4EXP_INT6_PLANES:
+        # Escape hatch: force the generic WNA16 dequant (A/B the int6 plane
+        # kernels for correctness isolation without touching the checkpoint).
+        return None
     scheme = getattr(linear, "scheme", None)
     if scheme is None or type(scheme).__name__ != "CompressedTensorsWNA16":
         return None

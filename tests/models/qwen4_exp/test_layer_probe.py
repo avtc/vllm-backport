@@ -46,3 +46,28 @@ def test_probe_interval_logging():
     finally:
         lg.removeHandler(handler)
     assert any("step=64" in m for m in records)
+
+
+def test_int6_planes_env_escape(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.nvidia import model as q4e_model
+
+    class CompressedTensorsWNA16:
+        pass
+
+    linear = SimpleNamespace(
+        scheme=SimpleNamespace(
+            __class__=CompressedTensorsWNA16,
+            num_bits=6,
+            symmetric=True,
+            group_size=64,
+        ),
+        input_size_per_partition=2560,
+        output_size_per_partition=512,
+    )
+    linear.scheme.__class__ = CompressedTensorsWNA16
+    monkeypatch.setenv("VLLM_QWEN4EXP_INT6_PLANES", "1")
+    assert q4e_model._int6_planes_group_size(linear) == 64
+    monkeypatch.setenv("VLLM_QWEN4EXP_INT6_PLANES", "0")
+    assert q4e_model._int6_planes_group_size(linear) is None
