@@ -1405,6 +1405,7 @@ def test_qsa_decode_full_heads_many_distinct_pages(num_rows: int) -> None:
         logical_indices,
         block_table,
         token_to_req,
+        use_prefill_config=False,
     )
     expected = _qsa_sparse_paged_attention_reference(
         q,
