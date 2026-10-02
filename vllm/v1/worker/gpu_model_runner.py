@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import collections
 import functools
 import gc
 import itertools
+import statistics
 import threading
 import time
 from collections import defaultdict
@@ -3726,13 +3728,21 @@ class GPUModelRunner(
                 top1 = float(logp.exp().max())
                 absmax = float(row.abs().amax())
             step = self._q4e_monitor_step = getattr(self, "_q4e_monitor_step", 0) + 1
-            if step % envs.VLLM_QWEN4EXP_LOGITS_MONITOR == 0 or entropy > 8.0:
+            hist = getattr(self, "_q4e_monitor_hist", None)
+            if hist is None:
+                hist = self._q4e_monitor_hist = collections.deque(maxlen=256)
+            hist.append(entropy)
+            # Outlier vs the rolling median catches brief single-step
+            # anomalies (a corruption event) between periodic lines.
+            outlier = len(hist) >= 32 and abs(entropy - statistics.median(hist)) > 1.0
+            if step % envs.VLLM_QWEN4EXP_LOGITS_MONITOR == 0 or outlier:
                 logger.info(
-                    "[Q4E-LOGITS] step=%d entropy=%.3f top1=%.3f absmax=%.2e",
+                    "[Q4E-LOGITS] step=%d entropy=%.3f top1=%.3f absmax=%.2e%s",
                     step,
                     entropy,
                     top1,
                     absmax,
+                    " OUTLIER" if outlier else "",
                 )
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             if self.use_async_scheduling:
