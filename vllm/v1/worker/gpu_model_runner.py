@@ -3671,6 +3671,34 @@ class GPUModelRunner(
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> SamplerOutput:
+        # Full-speed decode drift trace (outside cudagraph capture; _sample
+        # runs on every step, unlike the bookkeeping path): per-step entropy
+        # / top-1 / absmax for row 0. Silent drift shows as a gradual
+        # excursion long before text quality visibly collapses.
+        if envs.VLLM_QWEN4EXP_LOGITS_MONITOR and logits is not None:
+            with torch.inference_mode():
+                row = logits[0].detach().float()
+                logp = torch.log_softmax(row, dim=-1)
+                entropy = float(-(logp.exp() * logp).sum())
+                top1 = float(logp.exp().max())
+                absmax = float(row.abs().amax())
+            step = self._q4e_monitor_step = getattr(self, "_q4e_monitor_step", 0) + 1
+            hist = getattr(self, "_q4e_monitor_hist", None)
+            if hist is None:
+                hist = self._q4e_monitor_hist = collections.deque(maxlen=256)
+            hist.append(entropy)
+            # Outlier vs the rolling median catches brief single-step
+            # anomalies (a corruption event) between periodic lines.
+            outlier = len(hist) >= 32 and abs(entropy - statistics.median(hist)) > 1.0
+            if step % envs.VLLM_QWEN4EXP_LOGITS_MONITOR == 0 or outlier:
+                logger.info(
+                    "[Q4E-LOGITS] step=%d entropy=%.3f top1=%.3f absmax=%.2e%s",
+                    step,
+                    entropy,
+                    top1,
+                    absmax,
+                    " OUTLIER" if outlier else "",
+                )
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
@@ -3716,34 +3744,6 @@ class GPUModelRunner(
     ]:
         num_nans: torch.Tensor | None = None
         num_nans_in_logits: dict[str, int] = {}
-        if envs.VLLM_QWEN4EXP_LOGITS_MONITOR and logits is not None:
-            # Full-speed decode drift trace (outside cudagraph capture):
-            # per-step entropy / top-1 prob / absmax for row 0. Silent
-            # drift shows as a gradual entropy/magnitude excursion long
-            # before text quality visibly collapses.
-            with torch.inference_mode():
-                row = logits[0].detach().float()
-                logp = torch.log_softmax(row, dim=-1)
-                entropy = float(-(logp.exp() * logp).sum())
-                top1 = float(logp.exp().max())
-                absmax = float(row.abs().amax())
-            step = self._q4e_monitor_step = getattr(self, "_q4e_monitor_step", 0) + 1
-            hist = getattr(self, "_q4e_monitor_hist", None)
-            if hist is None:
-                hist = self._q4e_monitor_hist = collections.deque(maxlen=256)
-            hist.append(entropy)
-            # Outlier vs the rolling median catches brief single-step
-            # anomalies (a corruption event) between periodic lines.
-            outlier = len(hist) >= 32 and abs(entropy - statistics.median(hist)) > 1.0
-            if step % envs.VLLM_QWEN4EXP_LOGITS_MONITOR == 0 or outlier:
-                logger.info(
-                    "[Q4E-LOGITS] step=%d entropy=%.3f top1=%.3f absmax=%.2e%s",
-                    step,
-                    entropy,
-                    top1,
-                    absmax,
-                    " OUTLIER" if outlier else "",
-                )
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             if self.use_async_scheduling:
                 # Keep the counts on device; they ride the async output copy
