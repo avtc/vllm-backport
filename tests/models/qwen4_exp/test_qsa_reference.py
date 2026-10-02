@@ -1315,3 +1315,104 @@ def test_qsa_streaming_compression_and_compressor_state_store_match_reference() 
                 rope_cache[block, position % 4, 0],
                 position_row(request, position).to("cuda"),
             )
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("num_rows", [1, 3])
+def test_qsa_decode_full_heads_many_distinct_pages(num_rows: int) -> None:
+    """pp4-tp1 decode shape with selections spread over hundreds of
+    DISTINCT pages (plus duplicate-page hits), unlike tp1_r1 above whose
+    512 selections revisit the same 64 pages. Long-form generation rots at
+    pp4 (all heads per rank) while tp8+EP (3 q / 1 kv per rank) stays
+    coherent; this exercises the block-table walk at high fan-out."""
+    torch.manual_seed(7)
+    head_dim = 256
+    num_query_heads = 24
+    num_kv_heads = 2
+    page_size = 64
+    num_requests = 2 if num_rows > 1 else 1
+    num_pages_per_request = 400  # context = 400 * 64 - 1 = 25,599 tokens
+    num_cache_blocks = num_requests * num_pages_per_request
+    indexer_budget = 2048
+    indexer_compress_ratio = 4
+    selection_width = indexer_budget + indexer_compress_ratio - 1
+
+    q = torch.randn(
+        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv_cache = torch.randn(
+        num_cache_blocks,
+        page_size,
+        num_kv_heads,
+        2 * head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
+    block_table = (
+        torch.randperm(num_cache_blocks, device="cuda")
+        .reshape(num_requests, num_pages_per_request)
+        .to(torch.int32)
+    )
+    rows_per_request = math.ceil(num_rows / num_requests)
+    row_indices = torch.arange(num_rows, device="cuda", dtype=torch.int32)
+    token_to_req = row_indices // rows_per_request
+    request_row_counts = torch.full(
+        (num_requests,), rows_per_request, device="cuda", dtype=torch.int32
+    )
+    request_row_counts[-1] = num_rows - rows_per_request * (num_requests - 1)
+
+    context_length = num_pages_per_request * page_size - 1
+    context_lengths = torch.full(
+        (num_requests,), context_length, device="cuda", dtype=torch.int32
+    )
+    block_topk = indexer_budget // indexer_compress_ratio
+    compressed_blocks_per_page = page_size // indexer_compress_ratio
+    selection = torch.arange(block_topk, device="cuda")
+    selected_pages = selection % num_pages_per_request
+    selected_offsets = selection // num_pages_per_request
+    row_shifts = 2 * row_indices.unsqueeze(1)
+    selected_offsets = (selected_offsets + row_shifts) % compressed_blocks_per_page
+    block_indices = (selected_pages * compressed_blocks_per_page + selected_offsets).to(
+        torch.int32
+    )
+    rows_within_request = row_indices % rows_per_request
+    query_positions = (
+        context_lengths[token_to_req.long()]
+        - request_row_counts[token_to_req.long()]
+        + rows_within_request
+    ).to(torch.int64)
+    visible_blocks = torch.minimum(
+        (query_positions + 1) // indexer_compress_ratio,
+        context_lengths.index_select(0, token_to_req.long()) // indexer_compress_ratio,
+    ).to(torch.int32)
+    logical_indices = torch.empty(
+        (num_rows, selection_width + 1), device="cuda", dtype=torch.int32
+    )
+    qsa_indexer_ops.expand_qsa_block_indices(
+        block_indices,
+        query_positions,
+        visible_blocks,
+        indexer_compress_ratio,
+        indexer_budget,
+        logical_indices,
+    )
+
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+    )
+    expected = _qsa_sparse_paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices[:, :selection_width],
+        block_table,
+        token_to_req,
+        q.shape[-1] ** -0.5,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
