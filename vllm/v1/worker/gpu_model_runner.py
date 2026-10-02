@@ -3714,6 +3714,26 @@ class GPUModelRunner(
     ]:
         num_nans: torch.Tensor | None = None
         num_nans_in_logits: dict[str, int] = {}
+        if envs.VLLM_QWEN4EXP_LOGITS_MONITOR and logits is not None:
+            # Full-speed decode drift trace (outside cudagraph capture):
+            # per-step entropy / top-1 prob / absmax for row 0. Silent
+            # drift shows as a gradual entropy/magnitude excursion long
+            # before text quality visibly collapses.
+            with torch.inference_mode():
+                row = logits[0].detach().float()
+                logp = torch.log_softmax(row, dim=-1)
+                entropy = float(-(logp.exp() * logp).sum())
+                top1 = float(logp.exp().max())
+                absmax = float(row.abs().amax())
+            step = self._q4e_monitor_step = getattr(self, "_q4e_monitor_step", 0) + 1
+            if step % envs.VLLM_QWEN4EXP_LOGITS_MONITOR == 0 or entropy > 8.0:
+                logger.info(
+                    "[Q4E-LOGITS] step=%d entropy=%.3f top1=%.3f absmax=%.2e",
+                    step,
+                    entropy,
+                    top1,
+                    absmax,
+                )
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             if self.use_async_scheduling:
                 # Keep the counts on device; they ride the async output copy

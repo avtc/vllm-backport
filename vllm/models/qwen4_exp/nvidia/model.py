@@ -178,24 +178,27 @@ def _q4e_probe(tag: str, t: torch.Tensor, state: dict) -> None:
     absmax = float(f.abs().amax())
     nonfinite = int((~torch.isfinite(f)).sum())
     base = state.get("base")
-    if base is None:
+    if base is None or base == 0.0:
+        # Warmup/dummy forwards produce all-zero tensors; the baseline must
+        # come from the first real (nonzero) activation.
+        if absmax == 0.0:
+            return
         state["base"] = absmax
         logger.info("[Q4E-PROBE] baseline %s absmax=%.3e", tag, absmax)
         return
     ratio = absmax / max(base, 1.0e-6)
     diverged = nonfinite > 0 or ratio > 20.0
-    if diverged:
-        if tag not in state["logged"]:
-            state["logged"].add(tag)
-            logger.info(
-                "[Q4E-PROBE] DIVERGED %s absmax=%.3e (base %.3e, x%.1f) nonfinite=%d",
-                tag,
-                absmax,
-                base,
-                ratio,
-                nonfinite,
-            )
-    elif state["step"] % _Q4E_PROBE_INTERVAL == 0:
+    if diverged and tag not in state["logged"]:
+        state["logged"].add(tag)
+        logger.info(
+            "[Q4E-PROBE] DIVERGED %s absmax=%.3e (base %.3e, x%.1f) nonfinite=%d",
+            tag,
+            absmax,
+            base,
+            ratio,
+            nonfinite,
+        )
+    if state["step"] % _Q4E_PROBE_INTERVAL == 0:
         logger.info(
             "[Q4E-PROBE] step=%d %s absmax=%.3e nonfinite=%d",
             state["step"],

@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     VLLM_QSA_FP8_KV: str = ""
     VLLM_QWEN4EXP_LAYER_PROBE: int = 0
     VLLM_QWEN4EXP_INT6_PLANES: int = 1
+    VLLM_QWEN4EXP_LOGITS_MONITOR: int = 0
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -2514,6 +2515,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_QWEN4EXP_INT6_PLANES": lambda: int(
         os.getenv("VLLM_QWEN4EXP_INT6_PLANES", "1")
+    ),
+    "VLLM_QWEN4EXP_LOGITS_MONITOR": lambda: int(
+        os.getenv("VLLM_QWEN4EXP_LOGITS_MONITOR", "0")
     ),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
