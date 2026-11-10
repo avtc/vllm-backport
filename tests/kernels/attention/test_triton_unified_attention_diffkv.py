@@ -886,6 +886,71 @@ def test_prefill_cuda_hook_prefill_shaped_only() -> None:
         assert not impl._use_prefill_cuda(1024, 8, 192, 128)  # verify × wide batch
 
 
+def test_prefill_cuda_loader_abi_keyed_cache_and_failure_latch(
+    caplog, tmp_path, monkeypatch
+) -> None:
+    """Loader regressions (CPU-safe, fake cpp_extension.load):
+    1. the JIT build dir must live under envs.VLLM_CACHE_ROOT and be keyed
+       by CUDA + torch ABI — two venvs sharing one $HOME (cu12.8 + cu13.4)
+       must not reuse each other's .so (wrong-ABI torch extension segfaults
+       on first launch);
+    2. a failed build must latch: retried loads re-raise without
+       re-running ninja/import on every prefill batch.
+    """
+    import logging
+    import os
+
+    import vllm.v1.attention.ops.prefill_attn_cuda as pac
+    from vllm import envs
+
+    cache_root = str(tmp_path / "vllm-cache")
+    monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", cache_root)
+    monkeypatch.setattr(torch.version, "cuda", "12.8")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 6))
+
+    calls: list[str] = []
+
+    def fake_load(*, name, sources, build_directory, **kwargs):
+        calls.append(build_directory)
+        if len(calls) == 1:
+            raise RuntimeError("nvcc exploded")
+        return object()
+
+    import torch.utils.cpp_extension as _cppext
+
+    monkeypatch.setattr(_cppext, "load", fake_load)
+
+    pac._load_ext.cache_clear()
+    monkeypatch.setattr(pac, "_LOAD_ERR", None)
+    try:
+        with caplog.at_level(logging.WARNING, logger=pac.__name__):
+            with pytest.raises(RuntimeError, match="nvcc exploded"):
+                pac._load_ext()
+            # latched: same error surfaced again without a second build
+            with pytest.raises(RuntimeError, match="nvcc exploded"):
+                pac._load_ext()
+        assert len(calls) == 1, "failure must not re-run the build"
+        assert any("JIT build failed" in r.message for r in caplog.records)
+
+        abi_dir = calls[0]
+        assert abi_dir == os.path.join(
+            cache_root, f"prefill_attn_sm86-cu128-{torch.__version__}"
+        )
+
+        # simulate the other venv (cu13.4): different ABI -> different dir
+        pac._load_ext.cache_clear()
+        monkeypatch.setattr(pac, "_LOAD_ERR", None)
+        monkeypatch.setattr(torch.version, "cuda", "13.4")
+        pac._load_ext()
+        assert len(calls) == 2
+        assert calls[1] != abi_dir
+        assert calls[1] == os.path.join(
+            cache_root, f"prefill_attn_sm86-cu134-{torch.__version__}"
+        )
+    finally:
+        pac._load_ext.cache_clear()
+
+
 @pytest.mark.parametrize("sinks_zero", [True, False])
 @torch.inference_mode()
 def test_prefill_cuda_failure_falls_back_to_triton(

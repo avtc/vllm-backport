@@ -9,7 +9,8 @@ VLLM_DIFFKV_PREFILL_CUDA=1 (full-attention layers only; the 39 SWA layers
 and all decode/verify paths keep the Triton kernels).
 
 The extension JIT-compiles on first use (~1 min, cached under
-~/.cache/vllm/prefill_attn_sm86) so no vLLM rebuild is needed.
+$VLLM_CACHE_ROOT/prefill_attn_sm86-<cuda>-<torch>, keyed by ABI so
+coexisting venvs don't fight over one .so) so no vLLM rebuild is needed.
 """
 
 import os
@@ -41,30 +42,60 @@ def prefill_cuda_enabled() -> bool:
     return _PREFILL_CUDA_ENV
 
 
+# Latched load failure: lru_cache only caches successes, so without this
+# every qualifying prefill batch would re-run the ninja build + import.
+_LOAD_ERR: Exception | None = None
+
+
 @lru_cache(maxsize=1)
 def _load_ext():
     """JIT-compile the extension (cached on disk after the first build)."""
+    global _LOAD_ERR
+    if _LOAD_ERR is not None:
+        raise _LOAD_ERR
     from torch.utils.cpp_extension import load
 
     src = os.path.join(os.path.dirname(__file__), "csrc", "prefill_attn_sm86.cu")
-    cache = os.path.expanduser(
-        os.path.join("~", ".cache", "vllm", "prefill_attn_sm86")
+    # Key the build dir by CUDA + torch ABI: two venvs sharing one $HOME
+    # (e.g. cu12.8 and cu13.4 builds) would otherwise fight over a single
+    # arch-keyed .so, and loading the other env's build segfaults on first
+    # launch (torch extensions are ABI-bound to the toolkit + libtorch).
+    from vllm import envs
+
+    cu_ver = torch.version.cuda
+    cu_tag = f"cu{cu_ver.replace('.', '')}" if cu_ver else "cpu"
+    cache = os.path.join(
+        envs.VLLM_CACHE_ROOT, f"prefill_attn_sm86-{cu_tag}-{torch.__version__}"
     )
     os.makedirs(cache, exist_ok=True)
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}"
-    ext = load(
-        name=f"prefill_attn_sm86_{arch}",
-        sources=[src],
-        extra_cuda_cflags=[
-            "-O3",
-            f"-gencode=arch=compute_{arch},code=sm_{arch}",
-            "--use_fast_math",
-        ],
-        extra_cflags=["-O3"],
-        build_directory=cache,
-        verbose=False,
-    )
+    try:
+        ext = load(
+            name=f"prefill_attn_sm86_{arch}",
+            sources=[src],
+            extra_cuda_cflags=[
+                "-O3",
+                f"-gencode=arch=compute_{arch},code=sm_{arch}",
+                "--use_fast_math",
+            ],
+            extra_cflags=["-O3"],
+            build_directory=cache,
+            verbose=False,
+        )
+    except Exception as e:
+        # Surface the real build error once per process — the DiffKV
+        # backend's fallback warning only carries the exception summary,
+        # which hides the actual ninja/nvcc failure.
+        _LOAD_ERR = e
+        logger.warning(
+            "prefill_attn_sm86 JIT build failed (%s: %s); retries disabled "
+            "for this process, Triton fallback stays active",
+            type(e).__name__,
+            e,
+            exc_info=True,
+        )
+        raise
     logger.info_once("JIT-compiled prefill_attn_sm86 (sm%s)", arch)
     return ext
 
