@@ -213,6 +213,34 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
         return None
 
+    def add_target_prefix_aliases(self, orig_to_new_prefix: dict[str, str]) -> None:
+        """Alias checkpoint-name targets/ignore entries into vLLM module names.
+
+        Targets use checkpoint (HF) parameter names. When the vLLM module
+        tree renames those parameters (e.g. a VL wrapper nesting the text
+        backbone under an extra module level), exact-name targets stop
+        matching and the affected layers silently build unquantized. For
+        every non-regex target and ignore entry starting with a known
+        checkpoint prefix, add a copy translated to the vLLM name.
+        """
+
+        def alias(name: str) -> str | None:
+            if name.startswith("re:"):
+                return None
+            for orig, new in orig_to_new_prefix.items():
+                if name.startswith(orig):
+                    return new + name[len(orig) :]
+            return None
+
+        for target in list(self.target_scheme_map):
+            aliased = alias(target)
+            if aliased is not None and aliased not in self.target_scheme_map:
+                self.target_scheme_map[aliased] = self.target_scheme_map[target]
+        for ignored in list(self.ignore):
+            aliased = alias(ignored)
+            if aliased is not None and aliased not in self.ignore:
+                self.ignore.append(aliased)
+
     def _add_fused_moe_to_target_scheme_map(self):  # XXXXXXXXXXXXXXXXXXXXXX
         """
         Helper function to update target_scheme_map

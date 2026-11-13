@@ -104,6 +104,59 @@ def _compressed_tensors_actorder_config(actorder):
     }
 
 
+def _mixed_prefix_quant_config() -> CompressedTensorsConfig:
+    """Mirrors community AutoRound exports whose targets keep the HF VL
+    checkpoint prefix (``model.language_model.*``) that this repo's Qwen3.5
+    module tree renames."""
+    return CompressedTensorsConfig.from_config(
+        {
+            "format": "pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "targets": [
+                        "model.language_model.layers.0.self_attn.q_proj",
+                        "re:.*embed_tokens",
+                    ],
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "int",
+                        "strategy": "group",
+                        "group_size": 128,
+                        "symmetric": True,
+                        "dynamic": False,
+                    },
+                }
+            },
+            "ignore": ["model.language_model.layers.0.linear_attn.norm"],
+        }
+    )
+
+
+def test_compressed_tensors_target_prefix_aliases():
+    quant_config = _mixed_prefix_quant_config()
+
+    quant_config.add_target_prefix_aliases({"model.language_model.": "model."})
+
+    aliased = "model.layers.0.self_attn.q_proj"
+    original = "model.language_model.layers.0.self_attn.q_proj"
+    assert aliased in quant_config.target_scheme_map
+    assert (
+        quant_config.target_scheme_map[aliased]
+        is quant_config.target_scheme_map[original]
+    )
+    # regex targets already match vLLM names and must be left alone
+    assert "re:.*embed_tokens" in quant_config.target_scheme_map
+    assert "model.layers.0.linear_attn.norm" in quant_config.ignore
+    assert "model.language_model.layers.0.linear_attn.norm" in quant_config.ignore
+
+    # aliasing is idempotent
+    num_targets = len(quant_config.target_scheme_map)
+    num_ignore = len(quant_config.ignore)
+    quant_config.add_target_prefix_aliases({"model.language_model.": "model."})
+    assert len(quant_config.target_scheme_map) == num_targets
+    assert len(quant_config.ignore) == num_ignore
+
+
 @pytest.mark.parametrize(
     "actorder", [ActivationOrdering.GROUP, ActivationOrdering.DYNAMIC, True]
 )

@@ -245,6 +245,8 @@ class Qwen3_5Model(Qwen3NextModel):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):
@@ -335,6 +337,24 @@ class Qwen3_5ForCausalLMBase(
                 "please use '--mamba-cache-mode=align' instead"
             )
         self.quant_config = vllm_config.quant_config
+        if (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "compressed-tensors"
+        ):
+            # Quant targets name layers by their checkpoint (HF) names
+            # ("model.language_model.*"). The loader renames them through the
+            # model's weight mapper (to "model.*" for text-only checkpoints,
+            # or to the VL wrapper's relative "language_model.model.*"), while
+            # this backbone is constructed at "<prefix>.model.*". Alias both
+            # forms onto the construction names so the scheme lookup finds
+            # the quantized layers.
+            prefix_dot = maybe_prefix(prefix, "model") + "."
+            self.quant_config.add_target_prefix_aliases(
+                {
+                    "model.language_model.": prefix_dot,
+                    "language_model.model.": prefix_dot,
+                }
+            )
 
         super().__init__()
         self.config = config
